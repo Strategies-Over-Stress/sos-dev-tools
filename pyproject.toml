@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sos-dev-tools"
+version = "0.1.0"
+description = "Jira ticket management and Git feature branch lifecycle automation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Rich Lee", email = "rich@strategiesoverstress.com"}]
+
+# Zero external dependencies — Python stdlib only
+dependencies = []
+
+[project.scripts]
+sos-jira = "sos_dev_tools.jira_cli:main"
+sos-feature = "sos_dev_tools.feature_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
