@@ -19,17 +19,13 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .env import load_env
-from .jira_api import api, md_to_adf, get_project_key, get_base_url
-
-
-ISSUE_TYPES = {"task": "10122", "epic": "10123", "subtask": "10124"}
-TRANSITIONS = {"TO DO": "11", "IN PROGRESS": "21", "IN REVIEW": "2", "DONE": "31"}
+from .jira_api import api, md_to_adf, get_project_key, get_base_url, get_issue_type_id, transition_ticket
 
 
 def cmd_create(args):
     fields = {
         "project": {"key": get_project_key()},
-        "issuetype": {"id": ISSUE_TYPES[args.type]},
+        "issuetype": {"id": get_issue_type_id(args.type)},
         "summary": args.summary,
     }
     desc_text = Path(args.file).read_text() if args.file else args.description
@@ -61,11 +57,8 @@ def cmd_edit(args):
 def cmd_move(args):
     ticket = args.ticket.upper()
     status = args.status.upper()
-    if status not in TRANSITIONS:
-        print(f"Error: unknown status. Valid: {', '.join(TRANSITIONS)}", file=sys.stderr)
-        sys.exit(1)
-    api("POST", f"/issue/{ticket}/transitions", {"transition": {"id": TRANSITIONS[status]}})
-    print(f"{ticket} → {status}")
+    if transition_ticket(ticket, status):
+        print(f"{ticket} → {status}")
 
 
 def cmd_view(args):
@@ -141,7 +134,7 @@ def main():
     p.add_argument("--summary", "-s", required=True)
     p.add_argument("--description", "-d", default=None)
     p.add_argument("--file", "-f", default=None)
-    p.add_argument("--type", "-t", default="task", choices=ISSUE_TYPES.keys())
+    p.add_argument("--type", "-t", default="task")
     p.add_argument("--parent", "-p", default=None)
 
     p = sub.add_parser("edit")

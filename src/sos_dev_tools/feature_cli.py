@@ -18,11 +18,7 @@ import sys
 from pathlib import Path
 
 from .env import load_env
-from .jira_api import api, md_to_adf, get_project_key, get_base_url
-
-
-ISSUE_TYPES = {"task": "10122", "epic": "10123", "subtask": "10124"}
-TRANSITIONS = {"TO DO": "11", "IN PROGRESS": "21", "IN REVIEW": "2", "DONE": "31"}
+from .jira_api import api, md_to_adf, get_project_key, get_base_url, get_issue_type_id, transition_ticket
 
 
 def git(*args):
@@ -67,9 +63,7 @@ def slugify(text):
 
 
 def transition(ticket_key, status):
-    status = status.upper()
-    if status in TRANSITIONS:
-        api("POST", f"/issue/{ticket_key}/transitions", {"transition": {"id": TRANSITIONS[status]}})
+    transition_ticket(ticket_key, status)
 
 
 def cmd_create(args):
@@ -77,7 +71,7 @@ def cmd_create(args):
 
     fields = {
         "project": {"key": get_project_key()},
-        "issuetype": {"id": ISSUE_TYPES[args.type]},
+        "issuetype": {"id": get_issue_type_id(args.type)},
         "summary": args.summary,
     }
     if desc_text:
@@ -171,7 +165,7 @@ def main():
     p.add_argument("summary")
     p.add_argument("-d", "--description", default=None)
     p.add_argument("-f", "--file", default=None)
-    p.add_argument("-t", "--type", default="task", choices=ISSUE_TYPES.keys())
+    p.add_argument("-t", "--type", default="task")
     p.add_argument("-p", "--parent", default=None)
 
     p = sub.add_parser("start")

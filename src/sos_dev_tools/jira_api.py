@@ -48,6 +48,143 @@ def get_base_url():
 
 
 # ---------------------------------------------------------------------------
+# Auto-discovery — issue types and transitions from the Jira API
+# ---------------------------------------------------------------------------
+
+_issue_type_cache: dict | None = None
+_transition_cache: dict | None = None
+
+
+def get_issue_types() -> dict[str, str]:
+    """Discover issue type name → id mapping for the current project.
+
+    Checks .env overrides first (JIRA_ISSUE_TYPE_TASK=10122 etc.),
+    then falls back to the Jira API.
+    """
+    global _issue_type_cache
+    if _issue_type_cache is not None:
+        return _issue_type_cache
+
+    # Check .env overrides
+    env_types = {}
+    for name in ("task", "epic", "subtask", "story", "bug"):
+        env_key = f"JIRA_ISSUE_TYPE_{name.upper()}"
+        val = os.environ.get(env_key)
+        if val:
+            env_types[name] = val
+    if env_types:
+        _issue_type_cache = env_types
+        return _issue_type_cache
+
+    # Auto-discover from Jira API
+    pk = get_project_key()
+    try:
+        data = api("GET", f"/project/{pk}/statuses")
+        types = {}
+        for issuetype in data:
+            name = issuetype["name"].lower().replace(" ", "")
+            types[name] = issuetype["id"] if "id" in issuetype else str(issuetype.get("id", ""))
+
+        # Also try createmeta for more reliable type IDs
+        meta = api("GET", f"/issue/createmeta?projectKeys={pk}&expand=projects.issuetypes")
+        for project in meta.get("projects", []):
+            for it in project.get("issuetypes", []):
+                name = it["name"].lower().replace(" ", "")
+                types[name] = str(it["id"])
+
+        _issue_type_cache = types
+        return _issue_type_cache
+    except SystemExit:
+        # Fallback if API fails (e.g., createmeta deprecated)
+        # Try just the project endpoint
+        pass
+
+    # Last resort: try to get types from /issuetype
+    try:
+        all_types = api("GET", "/issuetype")
+        types = {}
+        for it in all_types:
+            name = it["name"].lower().replace(" ", "")
+            types[name] = str(it["id"])
+        _issue_type_cache = types
+        return _issue_type_cache
+    except SystemExit:
+        print("Error: could not discover issue types. Set JIRA_ISSUE_TYPE_TASK etc. in .env", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_issue_type_id(name: str) -> str:
+    """Get the issue type ID for a given name (task, epic, subtask, etc.)."""
+    types = get_issue_types()
+    if name in types:
+        return types[name]
+    # Try fuzzy match
+    for key, val in types.items():
+        if name in key or key in name:
+            return val
+    available = ", ".join(types.keys())
+    print(f"Error: issue type '{name}' not found. Available: {available}", file=sys.stderr)
+    sys.exit(1)
+
+
+def get_transitions(ticket_key: str) -> dict[str, str]:
+    """Discover available transitions for a ticket. Returns name → id mapping."""
+    global _transition_cache
+    if _transition_cache is not None:
+        return _transition_cache
+
+    # Check .env overrides
+    env_transitions = {}
+    for name, env_key in [
+        ("TO DO", "JIRA_TRANSITION_TODO"),
+        ("IN PROGRESS", "JIRA_TRANSITION_IN_PROGRESS"),
+        ("IN REVIEW", "JIRA_TRANSITION_IN_REVIEW"),
+        ("DONE", "JIRA_TRANSITION_DONE"),
+    ]:
+        val = os.environ.get(env_key)
+        if val:
+            env_transitions[name] = val
+    if env_transitions:
+        _transition_cache = env_transitions
+        return _transition_cache
+
+    # Auto-discover from Jira API
+    data = api("GET", f"/issue/{ticket_key}/transitions")
+    transitions = {}
+    for t in data.get("transitions", []):
+        name = t["to"]["name"].upper()
+        transitions[name] = str(t["id"])
+        # Also store the transition name itself for flexibility
+        t_name = t["name"].upper()
+        if t_name not in transitions:
+            transitions[t_name] = str(t["id"])
+
+    _transition_cache = transitions
+    return _transition_cache
+
+
+def transition_ticket(ticket_key: str, status: str) -> bool:
+    """Transition a ticket to a new status. Returns True if successful."""
+    status = status.upper()
+    transitions = get_transitions(ticket_key)
+
+    # Exact match
+    if status in transitions:
+        api("POST", f"/issue/{ticket_key}/transitions", {"transition": {"id": transitions[status]}})
+        return True
+
+    # Fuzzy match
+    for name, tid in transitions.items():
+        if status in name or name in status:
+            api("POST", f"/issue/{ticket_key}/transitions", {"transition": {"id": tid}})
+            return True
+
+    available = ", ".join(f'"{k}"' for k in transitions.keys())
+    print(f"Error: status '{status}' not found. Available: {available}", file=sys.stderr)
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Markdown → ADF converter
 # ---------------------------------------------------------------------------
 

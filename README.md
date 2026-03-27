@@ -47,10 +47,24 @@ sos-jira move RICH-5 DONE  → manual after merge
 Place a `.env` file in your project root (or any parent directory):
 
 ```env
+# Required
 JIRA_BASE_URL=https://your-org.atlassian.net
 JIRA_EMAIL=you@example.com
 JIRA_API_TOKEN=your-token
 JIRA_PROJECT_KEY=PROJ
 ```
 
-The CLI walks up from your current directory to find the nearest `.env`.
+Issue types and workflow transitions are **auto-discovered** from your Jira project — no manual ID mapping needed. If auto-discovery doesn't work for your setup, you can override with:
+
+```env
+# Optional overrides (only if auto-discovery fails)
+JIRA_ISSUE_TYPE_TASK=10122
+JIRA_ISSUE_TYPE_EPIC=10123
+JIRA_ISSUE_TYPE_SUBTASK=10124
+JIRA_TRANSITION_TODO=11
+JIRA_TRANSITION_IN_PROGRESS=21
+JIRA_TRANSITION_IN_REVIEW=2
+JIRA_TRANSITION_DONE=31
+```
+
+The CLI walks up from your current directory to find the nearest `.env`, so each project can have its own Jira config.
