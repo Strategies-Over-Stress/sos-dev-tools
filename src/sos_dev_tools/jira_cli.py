@@ -134,7 +134,7 @@ def main():
     p.add_argument("--summary", "-s", required=True)
     p.add_argument("--description", "-d", default=None)
     p.add_argument("--file", "-f", default=None)
-    p.add_argument("--type", "-t", default="task")
+    p.add_argument("--type", "-t", default="task", type=str.lower)
     p.add_argument("--parent", "-p", default=None)
 
     p = sub.add_parser("edit")

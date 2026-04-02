@@ -165,7 +165,7 @@ def main():
     p.add_argument("summary")
     p.add_argument("-d", "--description", default=None)
     p.add_argument("-f", "--file", default=None)
-    p.add_argument("-t", "--type", default="task")
+    p.add_argument("-t", "--type", default="task", type=str.lower)
     p.add_argument("-p", "--parent", default=None)
 
     p = sub.add_parser("start")

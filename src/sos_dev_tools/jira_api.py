@@ -5,6 +5,8 @@ import json
 import os
 import re
 import sys
+import time
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -53,13 +55,54 @@ def get_base_url():
 
 _issue_type_cache: dict | None = None
 _transition_cache: dict | None = None
+_CACHE_TTL = 86400  # 24 hours
+
+
+def _cache_file() -> Path:
+    """Cache file lives next to the nearest .env (project root)."""
+    from .env import find_env
+    env_path = find_env()
+    if env_path:
+        return env_path.parent / ".jira-cache.json"
+    return Path.cwd() / ".jira-cache.json"
+
+
+def _load_disk_cache() -> dict | None:
+    """Load cached issue types from disk if fresh. Returns dict or None."""
+    path = _cache_file()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        base_url = os.environ.get("JIRA_BASE_URL", "")
+        entry = data.get(base_url)
+        if not entry:
+            return None
+        if time.time() - entry.get("ts", 0) > _CACHE_TTL:
+            return None
+        return entry["types"]
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+
+def _save_disk_cache(types: dict) -> None:
+    """Persist issue types to disk, keyed by Jira instance URL."""
+    path = _cache_file()
+    base_url = os.environ.get("JIRA_BASE_URL", "")
+    data = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            pass
+    data[base_url] = {"types": types, "ts": time.time()}
+    path.write_text(json.dumps(data, indent=2))
 
 
 def get_issue_types() -> dict[str, str]:
     """Discover issue type name → id mapping for the current project.
 
-    Checks .env overrides first (JIRA_ISSUE_TYPE_TASK=10122 etc.),
-    then falls back to the Jira API.
+    Priority: env overrides → disk cache → Jira API.
     """
     global _issue_type_cache
     if _issue_type_cache is not None:
@@ -74,6 +117,12 @@ def get_issue_types() -> dict[str, str]:
             env_types[name] = val
     if env_types:
         _issue_type_cache = env_types
+        return _issue_type_cache
+
+    # Check disk cache
+    cached = _load_disk_cache()
+    if cached:
+        _issue_type_cache = cached
         return _issue_type_cache
 
     # Auto-discover from Jira API
@@ -93,10 +142,9 @@ def get_issue_types() -> dict[str, str]:
                 types[name] = str(it["id"])
 
         _issue_type_cache = types
+        _save_disk_cache(types)
         return _issue_type_cache
     except SystemExit:
-        # Fallback if API fails (e.g., createmeta deprecated)
-        # Try just the project endpoint
         pass
 
     # Last resort: try to get types from /issuetype
@@ -107,6 +155,7 @@ def get_issue_types() -> dict[str, str]:
             name = it["name"].lower().replace(" ", "")
             types[name] = str(it["id"])
         _issue_type_cache = types
+        _save_disk_cache(types)
         return _issue_type_cache
     except SystemExit:
         print("Error: could not discover issue types. Set JIRA_ISSUE_TYPE_TASK etc. in .env", file=sys.stderr)
@@ -114,7 +163,8 @@ def get_issue_types() -> dict[str, str]:
 
 
 def get_issue_type_id(name: str) -> str:
-    """Get the issue type ID for a given name (task, epic, subtask, etc.)."""
+    """Get the issue type ID for a given name (case-insensitive)."""
+    name = name.lower().replace(" ", "")
     types = get_issue_types()
     if name in types:
         return types[name]
@@ -122,7 +172,7 @@ def get_issue_type_id(name: str) -> str:
     for key, val in types.items():
         if name in key or key in name:
             return val
-    available = ", ".join(types.keys())
+    available = ", ".join(sorted(types.keys()))
     print(f"Error: issue type '{name}' not found. Available: {available}", file=sys.stderr)
     sys.exit(1)
 
