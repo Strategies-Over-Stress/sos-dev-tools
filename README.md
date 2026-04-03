@@ -15,18 +15,23 @@ pip install git+https://github.com/Strategies-Over-Stress/sos-dev-tools.git
 ```bash
 sos-jira create -s "Add checkout optimization"
 sos-jira create -s "Title" -d "## Description with **markdown**"
+sos-jira create -P DHW -s "Fix hero section"   # target a specific project
 sos-jira edit RICH-1 -s "New title"
 sos-jira move RICH-1 "IN PROGRESS"
 sos-jira view RICH-1
 sos-jira list --status "To Do"
+sos-jira list -P DHW                            # list issues in another project
 sos-jira comment RICH-1 "## Update"
 sos-jira delete RICH-3
 ```
+
+All commands accept `--project` / `-P` to override the `JIRA_PROJECT_KEY` env var for that invocation.
 
 ### sos-feature
 
 ```bash
 sos-feature create "Add risk reversal to contact section"
+sos-feature create -P DHW "Fix hero section"    # create in a specific project
 sos-feature start 5          # shorthand for RICH-5
 sos-feature switch 3
 sos-feature pr

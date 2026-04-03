@@ -15,10 +15,11 @@ import os
 import re
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 from .env import load_env
-from .jira_api import api, md_to_adf, get_project_key, get_base_url, get_issue_type_id, transition_ticket
+from .jira_api import api, md_to_adf, get_project_key, set_project_key, get_base_url, get_issue_type_id, transition_ticket
 
 
 def git(*args):
@@ -139,6 +140,27 @@ def cmd_pr(args):
     print(f"{ticket_key} → IN REVIEW")
 
 
+def branch_exists(name):
+    """Check if a local branch exists."""
+    result = subprocess.run(
+        ["git", "branch", "--list", name], capture_output=True, text=True
+    )
+    return bool(result.stdout.strip())
+
+
+def cmd_start_iteration(args):
+    branch = args.branch
+
+    if not branch_exists(branch):
+        git("branch", branch, "main")
+        print(f"Created branch: {branch} (from main)")
+
+    iteration = args.iteration or uuid.uuid4().hex[:8]
+    iter_branch = f"{branch}-{iteration}"
+    git("checkout", "-b", iter_branch, branch)
+    print(f"Created iteration branch: {iter_branch}")
+
+
 def cmd_status(args):
     branch = current_branch()
     ticket_key = ticket_from_branch(branch)
@@ -161,27 +183,41 @@ def main():
     parser = argparse.ArgumentParser(description="sos-feature — Git + Jira lifecycle")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("create")
+    # Shared --project flag
+    proj = argparse.ArgumentParser(add_help=False)
+    proj.add_argument("--project", "-P", default=None,
+                      help="Jira project key (overrides JIRA_PROJECT_KEY env var)")
+
+    p = sub.add_parser("create", parents=[proj])
     p.add_argument("summary")
     p.add_argument("-d", "--description", default=None)
     p.add_argument("-f", "--file", default=None)
     p.add_argument("-t", "--type", default="task", type=str.lower)
     p.add_argument("-p", "--parent", default=None)
 
-    p = sub.add_parser("start")
+    p = sub.add_parser("start", parents=[proj])
     p.add_argument("ticket")
 
-    p = sub.add_parser("switch")
+    p = sub.add_parser("switch", parents=[proj])
     p.add_argument("ticket")
 
-    p = sub.add_parser("pr")
+    p = sub.add_parser("pr", parents=[proj])
     p.add_argument("--title", default=None)
     p.add_argument("--body", default=None)
 
-    sub.add_parser("status")
+    p = sub.add_parser("start-iteration", parents=[proj])
+    p.add_argument("branch")
+    p.add_argument("iteration", nargs="?", default=None)
+
+    sub.add_parser("status", parents=[proj])
 
     args = parser.parse_args()
-    {"create": cmd_create, "start": cmd_start, "switch": cmd_switch, "pr": cmd_pr, "status": cmd_status}[args.command](args)
+
+    # Apply project override before dispatching
+    if getattr(args, "project", None):
+        set_project_key(args.project)
+
+    {"create": cmd_create, "start": cmd_start, "switch": cmd_switch, "pr": cmd_pr, "start-iteration": cmd_start_iteration, "status": cmd_status}[args.command](args)
 
 
 if __name__ == "__main__":

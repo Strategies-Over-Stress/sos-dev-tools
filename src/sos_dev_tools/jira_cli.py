@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .env import load_env
-from .jira_api import api, md_to_adf, get_project_key, get_base_url, get_issue_type_id, transition_ticket, create_project
+from .jira_api import api, md_to_adf, get_project_key, set_project_key, get_base_url, get_issue_type_id, transition_ticket, create_project
 
 
 def cmd_create(args):
@@ -94,6 +94,10 @@ def cmd_view(args):
 
 def cmd_list(args):
     pk = get_project_key()
+
+    # Validate project exists — api() exits on 404
+    api("GET", f"/project/{pk}")
+
     jql_parts = [f"project = {pk}"]
     if args.status:
         jql_parts.append(f'status = "{args.status}"')
@@ -125,6 +129,90 @@ def cmd_delete(args):
     print(f"Deleted {ticket}")
 
 
+def cmd_sync(args):
+    file_path = Path(args.file)
+    if not file_path.exists():
+        print(f"Error: file not found: {file_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        operations = json.loads(file_path.read_text())
+    except json.JSONDecodeError as e:
+        print(f"Error: invalid JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not isinstance(operations, list):
+        print("Error: JSON must be an array of operations", file=sys.stderr)
+        sys.exit(1)
+
+    total = len(operations)
+    succeeded = []
+    failed = []
+
+    for i, op in enumerate(operations):
+        action = op.get("action", "")
+        try:
+            if action == "create":
+                fields = {
+                    "project": {"key": op.get("project", get_project_key())},
+                    "issuetype": {"id": get_issue_type_id(op.get("type", "task"))},
+                    "summary": op["summary"],
+                }
+                if op.get("description"):
+                    fields["description"] = md_to_adf(op["description"])
+                if op.get("parent"):
+                    fields["parent"] = {"key": op["parent"]}
+                result = api("POST", "/issue", {"fields": fields})
+                succeeded.append(f"create {result['key']}")
+
+            elif action == "update":
+                ticket = op["ticket"].upper()
+                fields = {}
+                if "summary" in op:
+                    fields["summary"] = op["summary"]
+                if "description" in op:
+                    fields["description"] = md_to_adf(op["description"])
+                if not fields:
+                    failed.append((f"update {ticket}", "no fields to update"))
+                    continue
+                api("PUT", f"/issue/{ticket}", {"fields": fields})
+                succeeded.append(f"update {ticket}")
+
+            elif action == "delete":
+                ticket = op["ticket"].upper()
+                api("DELETE", f"/issue/{ticket}")
+                succeeded.append(f"delete {ticket}")
+
+            elif action == "create-project":
+                result = create_project(
+                    key=op["key"],
+                    name=op["name"],
+                    project_type=op.get("type", "software"),
+                    template=op.get("template", "scrum"),
+                )
+                succeeded.append(f"create-project {result.get('key', op['key'].upper())}")
+
+            else:
+                failed.append((f"op #{i + 1}", f"unknown action '{action}'"))
+
+        except SystemExit:
+            label = op.get("ticket", op.get("key", op.get("summary", f"op #{i + 1}")))
+            failed.append((f"{action} {label}", "API error (see above)"))
+        except KeyError as e:
+            failed.append((f"op #{i + 1}", f"missing field {e}"))
+
+    ok = len(succeeded)
+    print(f"\n{ok}/{total} operations completed successfully")
+
+    if failed:
+        print(f"\nSucceeded ({ok}):")
+        for s in succeeded:
+            print(f"  {s}")
+        print(f"\nFailed ({len(failed)}):")
+        for label, reason in failed:
+            print(f"  {label} -- {reason}")
+
+
 def cmd_create_project(args):
     result = create_project(
         key=args.key,
@@ -143,36 +231,44 @@ def main():
     parser = argparse.ArgumentParser(description="sos-jira — Jira ticket management")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("create")
+    # Shared --project flag for all subcommands that operate within a project
+    proj = argparse.ArgumentParser(add_help=False)
+    proj.add_argument("--project", "-P", default=None,
+                      help="Jira project key (overrides JIRA_PROJECT_KEY env var)")
+
+    p = sub.add_parser("create", parents=[proj])
     p.add_argument("--summary", "-s", required=True)
     p.add_argument("--description", "-d", default=None)
     p.add_argument("--file", "-f", default=None)
     p.add_argument("--type", "-t", default="task", type=str.lower)
     p.add_argument("--parent", "-p", default=None)
 
-    p = sub.add_parser("edit")
+    p = sub.add_parser("edit", parents=[proj])
     p.add_argument("ticket")
     p.add_argument("--summary", "-s", default=None)
     p.add_argument("--description", "-d", default=None)
     p.add_argument("--file", "-f", default=None)
 
-    p = sub.add_parser("move")
+    p = sub.add_parser("move", parents=[proj])
     p.add_argument("ticket")
     p.add_argument("status")
 
-    p = sub.add_parser("view")
+    p = sub.add_parser("view", parents=[proj])
     p.add_argument("ticket")
 
-    p = sub.add_parser("list")
+    p = sub.add_parser("list", parents=[proj])
     p.add_argument("--status", default=None)
     p.add_argument("--type", default=None)
 
-    p = sub.add_parser("comment")
+    p = sub.add_parser("comment", parents=[proj])
     p.add_argument("ticket")
     p.add_argument("text")
 
-    p = sub.add_parser("delete")
+    p = sub.add_parser("delete", parents=[proj])
     p.add_argument("ticket")
+
+    p = sub.add_parser("sync", parents=[proj])
+    p.add_argument("file", help="Path to JSON file with operations array")
 
     p = sub.add_parser("create-project")
     p.add_argument("--key", "-k", required=True, help="Project key (e.g. PILOT) — uppercase, 2-10 chars")
@@ -181,10 +277,15 @@ def main():
     p.add_argument("--template", default="scrum", choices=["scrum", "kanban", "basic"])
 
     args = parser.parse_args()
+
+    # Apply project override before dispatching
+    if getattr(args, "project", None):
+        set_project_key(args.project)
+
     {
         "create": cmd_create, "edit": cmd_edit, "move": cmd_move,
         "view": cmd_view, "list": cmd_list, "comment": cmd_comment,
-        "delete": cmd_delete, "create-project": cmd_create_project,
+        "delete": cmd_delete, "sync": cmd_sync, "create-project": cmd_create_project,
     }[args.command](args)
 
 

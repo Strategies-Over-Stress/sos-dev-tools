@@ -79,7 +79,7 @@ class TestGetIssueTypeId(unittest.TestCase):
     """get_issue_type_id should be case-insensitive and handle fuzzy matches."""
 
     def setUp(self):
-        jira_api._issue_type_cache = None
+        jira_api._issue_type_cache = {}
 
     @patch.object(jira_api, "_load_disk_cache", return_value=None)
     @patch.object(jira_api, "_save_disk_cache")
@@ -123,7 +123,7 @@ class TestIssueTypeDiscovery(unittest.TestCase):
     """get_issue_types should discover types from API and normalize names."""
 
     def setUp(self):
-        jira_api._issue_type_cache = None
+        jira_api._issue_type_cache = {}
 
     @patch.object(jira_api, "_load_disk_cache", return_value=None)
     @patch.object(jira_api, "_save_disk_cache")
@@ -178,7 +178,7 @@ class TestDiskCache(unittest.TestCase):
     """Disk cache should persist types per-instance and respect TTL."""
 
     def setUp(self):
-        jira_api._issue_type_cache = None
+        jira_api._issue_type_cache = {}
         self._tmpdir = tempfile.mkdtemp()
         self._cache_path = Path(self._tmpdir) / ".jira-cache.json"
         # Patch _cache_file to return our temp path
@@ -205,21 +205,24 @@ class TestDiskCache(unittest.TestCase):
         jira_api._save_disk_cache(types)
         # Backdate the timestamp
         data = json.loads(self._cache_path.read_text())
-        data["https://test.atlassian.net"]["ts"] = time.time() - jira_api._CACHE_TTL - 1
+        cache_key = jira_api._cache_key()
+        data[cache_key]["ts"] = time.time() - jira_api._CACHE_TTL - 1
         self._cache_path.write_text(json.dumps(data))
         self.assertIsNone(jira_api._load_disk_cache())
 
     def test_multiple_instances_coexist(self):
         with patch.dict(os.environ, {"JIRA_BASE_URL": "https://a.atlassian.net"}):
+            key_a = jira_api._cache_key()
             jira_api._save_disk_cache({"task": "10001"})
         with patch.dict(os.environ, {"JIRA_BASE_URL": "https://b.atlassian.net"}):
+            key_b = jira_api._cache_key()
             jira_api._save_disk_cache({"task": "20001", "story": "20004"})
 
         data = json.loads(self._cache_path.read_text())
-        self.assertIn("https://a.atlassian.net", data)
-        self.assertIn("https://b.atlassian.net", data)
-        self.assertEqual(data["https://a.atlassian.net"]["types"]["task"], "10001")
-        self.assertEqual(data["https://b.atlassian.net"]["types"]["task"], "20001")
+        self.assertIn(key_a, data)
+        self.assertIn(key_b, data)
+        self.assertEqual(data[key_a]["types"]["task"], "10001")
+        self.assertEqual(data[key_b]["types"]["task"], "20001")
 
     def test_corrupted_file_returns_none(self):
         self._cache_path.write_text("not json{{{")
@@ -247,7 +250,7 @@ class TestTransitionTicket(unittest.TestCase):
     """transition_ticket should discover transitions and match case-insensitively."""
 
     def setUp(self):
-        jira_api._transition_cache = None
+        jira_api._transition_cache = {}
 
     @patch.object(jira_api, "api")
     def test_transition_calls_api(self, mock_api):
@@ -266,7 +269,7 @@ class TestTransitionTicket(unittest.TestCase):
 
     @patch.object(jira_api, "api", return_value=FAKE_TRANSITIONS_RESPONSE)
     def test_invalid_transition_returns_false(self, mock_api):
-        jira_api._transition_cache = None
+        jira_api._transition_cache = {}
         result = jira_api.transition_ticket("RICH-1", "INVALID")
         self.assertFalse(result)
 

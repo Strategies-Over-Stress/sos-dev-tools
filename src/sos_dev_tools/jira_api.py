@@ -45,6 +45,11 @@ def get_project_key():
     return os.environ.get("JIRA_PROJECT_KEY", "RICH")
 
 
+def set_project_key(key: str):
+    """Override the project key for this session."""
+    os.environ["JIRA_PROJECT_KEY"] = key.upper()
+
+
 def create_project(key, name, project_type="software", template="scrum"):
     """Create a new Jira project.
 
@@ -55,7 +60,7 @@ def create_project(key, name, project_type="software", template="scrum"):
         template: "scrum", "kanban", or "basic"
     """
     # Get the current user's account ID to set as lead
-    myself = api("GET", "/../myself")  # /rest/api/3/../myself = /rest/api/2/myself workaround
+    myself = api("GET", "/myself")
     lead_account_id = myself.get("accountId", "")
 
     # Map template to Jira's project template key
@@ -93,8 +98,8 @@ def get_base_url():
 # Auto-discovery — issue types and transitions from the Jira API
 # ---------------------------------------------------------------------------
 
-_issue_type_cache: dict | None = None
-_transition_cache: dict | None = None
+_issue_type_cache: dict[str, dict[str, str]] = {}   # project_key → {type_name → id}
+_transition_cache: dict[str, dict[str, str]] = {}   # ticket_key → {status_name → id}
 _CACHE_TTL = 86400  # 24 hours
 
 
@@ -107,6 +112,12 @@ def _cache_file() -> Path:
     return Path.cwd() / ".jira-cache.json"
 
 
+def _cache_key() -> str:
+    """Cache key combines instance URL and project key so each project has its own entry."""
+    base_url = os.environ.get("JIRA_BASE_URL", "")
+    return f"{base_url}:{get_project_key()}"
+
+
 def _load_disk_cache() -> dict | None:
     """Load cached issue types from disk if fresh. Returns dict or None."""
     path = _cache_file()
@@ -114,8 +125,7 @@ def _load_disk_cache() -> dict | None:
         return None
     try:
         data = json.loads(path.read_text())
-        base_url = os.environ.get("JIRA_BASE_URL", "")
-        entry = data.get(base_url)
+        entry = data.get(_cache_key())
         if not entry:
             return None
         if time.time() - entry.get("ts", 0) > _CACHE_TTL:
@@ -126,27 +136,28 @@ def _load_disk_cache() -> dict | None:
 
 
 def _save_disk_cache(types: dict) -> None:
-    """Persist issue types to disk, keyed by Jira instance URL."""
+    """Persist issue types to disk, keyed by Jira instance URL + project key."""
     path = _cache_file()
-    base_url = os.environ.get("JIRA_BASE_URL", "")
     data = {}
     if path.exists():
         try:
             data = json.loads(path.read_text())
         except json.JSONDecodeError:
             pass
-    data[base_url] = {"types": types, "ts": time.time()}
+    data[_cache_key()] = {"types": types, "ts": time.time()}
     path.write_text(json.dumps(data, indent=2))
 
 
 def get_issue_types() -> dict[str, str]:
     """Discover issue type name → id mapping for the current project.
 
-    Priority: env overrides → disk cache → Jira API.
+    Priority: env overrides → in-memory cache → disk cache → Jira API.
     """
-    global _issue_type_cache
-    if _issue_type_cache is not None:
-        return _issue_type_cache
+    pk = get_project_key()
+
+    # Check in-memory cache (keyed by project)
+    if pk in _issue_type_cache:
+        return _issue_type_cache[pk]
 
     # Check .env overrides
     env_types = {}
@@ -156,17 +167,16 @@ def get_issue_types() -> dict[str, str]:
         if val:
             env_types[name] = val
     if env_types:
-        _issue_type_cache = env_types
-        return _issue_type_cache
+        _issue_type_cache[pk] = env_types
+        return env_types
 
     # Check disk cache
     cached = _load_disk_cache()
     if cached:
-        _issue_type_cache = cached
-        return _issue_type_cache
+        _issue_type_cache[pk] = cached
+        return cached
 
     # Auto-discover from Jira API
-    pk = get_project_key()
     try:
         data = api("GET", f"/project/{pk}/statuses")
         types = {}
@@ -181,9 +191,9 @@ def get_issue_types() -> dict[str, str]:
                 name = it["name"].lower().replace(" ", "")
                 types[name] = str(it["id"])
 
-        _issue_type_cache = types
+        _issue_type_cache[pk] = types
         _save_disk_cache(types)
-        return _issue_type_cache
+        return types
     except SystemExit:
         pass
 
@@ -194,9 +204,9 @@ def get_issue_types() -> dict[str, str]:
         for it in all_types:
             name = it["name"].lower().replace(" ", "")
             types[name] = str(it["id"])
-        _issue_type_cache = types
+        _issue_type_cache[pk] = types
         _save_disk_cache(types)
-        return _issue_type_cache
+        return types
     except SystemExit:
         print("Error: could not discover issue types. Set JIRA_ISSUE_TYPE_TASK etc. in .env", file=sys.stderr)
         sys.exit(1)
@@ -219,9 +229,9 @@ def get_issue_type_id(name: str) -> str:
 
 def get_transitions(ticket_key: str) -> dict[str, str]:
     """Discover available transitions for a ticket. Returns name → id mapping."""
-    global _transition_cache
-    if _transition_cache is not None:
-        return _transition_cache
+    # Check in-memory cache (keyed by ticket)
+    if ticket_key in _transition_cache:
+        return _transition_cache[ticket_key]
 
     # Check .env overrides
     env_transitions = {}
@@ -235,8 +245,8 @@ def get_transitions(ticket_key: str) -> dict[str, str]:
         if val:
             env_transitions[name] = val
     if env_transitions:
-        _transition_cache = env_transitions
-        return _transition_cache
+        _transition_cache[ticket_key] = env_transitions
+        return env_transitions
 
     # Auto-discover from Jira API
     data = api("GET", f"/issue/{ticket_key}/transitions")
@@ -249,8 +259,8 @@ def get_transitions(ticket_key: str) -> dict[str, str]:
         if t_name not in transitions:
             transitions[t_name] = str(t["id"])
 
-    _transition_cache = transitions
-    return _transition_cache
+    _transition_cache[ticket_key] = transitions
+    return transitions
 
 
 def transition_ticket(ticket_key: str, status: str) -> bool:
