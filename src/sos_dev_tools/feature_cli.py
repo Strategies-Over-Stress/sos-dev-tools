@@ -157,8 +157,13 @@ def cmd_start_iteration(args):
 
     iteration = args.iteration or uuid.uuid4().hex[:8]
     iter_branch = f"{branch}-{iteration}"
-    git("checkout", "-b", iter_branch, branch)
-    print(f"Created iteration branch: {iter_branch}")
+
+    if branch_exists(iter_branch):
+        git("checkout", iter_branch)
+        print(f"Checked out {iter_branch}")
+    else:
+        git("checkout", "-b", iter_branch, branch)
+        print(f"Created iteration branch: {iter_branch}")
 
 
 def cmd_status(args):
