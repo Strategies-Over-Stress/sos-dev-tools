@@ -45,6 +45,46 @@ def get_project_key():
     return os.environ.get("JIRA_PROJECT_KEY", "RICH")
 
 
+def create_project(key, name, project_type="software", template="scrum"):
+    """Create a new Jira project.
+
+    Args:
+        key: Project key (e.g. "PILOT") — uppercase, 2-10 chars
+        name: Project name (e.g. "Pilot Development")
+        project_type: "software", "business", or "service_desk"
+        template: "scrum", "kanban", or "basic"
+    """
+    # Get the current user's account ID to set as lead
+    myself = api("GET", "/../myself")  # /rest/api/3/../myself = /rest/api/2/myself workaround
+    lead_account_id = myself.get("accountId", "")
+
+    # Map template to Jira's project template key
+    template_keys = {
+        "scrum": "com.pyxis.greenhopper.jira:gh-simplified-scrum-classic",
+        "kanban": "com.pyxis.greenhopper.jira:gh-simplified-kanban-classic",
+        "basic": "com.pyxis.greenhopper.jira:gh-simplified-basic",
+    }
+    template_key = template_keys.get(template, template_keys["scrum"])
+
+    # Map project type
+    type_keys = {
+        "software": "software",
+        "business": "business",
+        "service_desk": "service_desk",
+    }
+
+    data = {
+        "key": key.upper(),
+        "name": name,
+        "projectTypeKey": type_keys.get(project_type, "software"),
+        "projectTemplateKey": template_key,
+        "leadAccountId": lead_account_id,
+    }
+
+    result = api("POST", "/project", data)
+    return result
+
+
 def get_base_url():
     return os.environ.get("JIRA_BASE_URL", "")
 

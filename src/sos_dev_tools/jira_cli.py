@@ -9,6 +9,7 @@ Usage:
     sos-jira list [--status "To Do"] [--type task]
     sos-jira comment TICKET "text"
     sos-jira delete TICKET
+    sos-jira create-project -k KEY -n "Name" [-t software|business|service_desk] [--template scrum|kanban|basic]
 """
 
 import argparse
@@ -19,7 +20,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .env import load_env
-from .jira_api import api, md_to_adf, get_project_key, get_base_url, get_issue_type_id, transition_ticket
+from .jira_api import api, md_to_adf, get_project_key, get_base_url, get_issue_type_id, transition_ticket, create_project
 
 
 def cmd_create(args):
@@ -124,6 +125,18 @@ def cmd_delete(args):
     print(f"Deleted {ticket}")
 
 
+def cmd_create_project(args):
+    result = create_project(
+        key=args.key,
+        name=args.name,
+        project_type=args.type,
+        template=args.template,
+    )
+    project_id = result.get("id", "")
+    key = result.get("key", args.key.upper())
+    print(f"Created project {key} (id: {project_id}) — {get_base_url()}/projects/{key}")
+
+
 def main():
     load_env()
 
@@ -161,11 +174,17 @@ def main():
     p = sub.add_parser("delete")
     p.add_argument("ticket")
 
+    p = sub.add_parser("create-project")
+    p.add_argument("--key", "-k", required=True, help="Project key (e.g. PILOT) — uppercase, 2-10 chars")
+    p.add_argument("--name", "-n", required=True, help="Project name (e.g. Pilot Development)")
+    p.add_argument("--type", "-t", default="software", choices=["software", "business", "service_desk"])
+    p.add_argument("--template", default="scrum", choices=["scrum", "kanban", "basic"])
+
     args = parser.parse_args()
     {
         "create": cmd_create, "edit": cmd_edit, "move": cmd_move,
         "view": cmd_view, "list": cmd_list, "comment": cmd_comment,
-        "delete": cmd_delete,
+        "delete": cmd_delete, "create-project": cmd_create_project,
     }[args.command](args)
 
 
