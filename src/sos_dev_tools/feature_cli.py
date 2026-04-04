@@ -166,6 +166,47 @@ def cmd_start_iteration(args):
         print(f"Created iteration branch: {iter_branch}")
 
 
+def cmd_merge_iteration(args):
+    """Merge current iteration branch into its parent branch."""
+    branch = current_branch()
+
+    # Find the parent: try all prefixes of the branch name split by '-'
+    # e.g. feature/CRM-2-handle-incorrect-login -> parent is feature/CRM-2
+    parts = branch.split("-")
+    parent = None
+    for i in range(len(parts) - 1, 0, -1):
+        candidate = "-".join(parts[:i])
+        if branch_exists(candidate):
+            parent = candidate
+            break
+
+    if not parent:
+        print(f"Error: cannot determine parent branch for '{branch}'", file=sys.stderr)
+        print("Make sure the parent branch exists locally.", file=sys.stderr)
+        sys.exit(1)
+
+    if branch == parent:
+        print(f"Error: already on parent branch '{parent}'", file=sys.stderr)
+        sys.exit(1)
+
+    # Check for uncommitted changes (ignore untracked files)
+    result = subprocess.run(["git", "diff", "--quiet", "HEAD"], capture_output=True, text=True)
+    if result.returncode != 0:
+        print("Error: uncommitted changes. Commit or stash before merging.", file=sys.stderr)
+        sys.exit(1)
+
+    # Check there are commits to merge
+    log = git("log", "--oneline", f"{parent}..{branch}")
+    if not log:
+        print(f"Nothing to merge — {branch} has no new commits over {parent}.")
+        sys.exit(0)
+
+    git("checkout", parent)
+    git("merge", "--no-ff", branch, "-m", f"Merge {branch} into {parent}")
+    print(f"Merged {branch} → {parent}")
+    print(f"Now on {parent}")
+
+
 def cmd_status(args):
     branch = current_branch()
     ticket_key = ticket_from_branch(branch)
@@ -214,6 +255,8 @@ def main():
     p.add_argument("branch")
     p.add_argument("iteration", nargs="?", default=None)
 
+    sub.add_parser("merge-iteration", parents=[proj])
+
     sub.add_parser("status", parents=[proj])
 
     args = parser.parse_args()
@@ -222,7 +265,7 @@ def main():
     if getattr(args, "project", None):
         set_project_key(args.project)
 
-    {"create": cmd_create, "start": cmd_start, "switch": cmd_switch, "pr": cmd_pr, "start-iteration": cmd_start_iteration, "status": cmd_status}[args.command](args)
+    {"create": cmd_create, "start": cmd_start, "switch": cmd_switch, "pr": cmd_pr, "start-iteration": cmd_start_iteration, "merge-iteration": cmd_merge_iteration, "status": cmd_status}[args.command](args)
 
 
 if __name__ == "__main__":

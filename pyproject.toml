@@ -17,6 +17,7 @@ dependencies = []
 [project.scripts]
 sos-jira = "sos_dev_tools.jira_cli:main"
 sos-feature = "sos_dev_tools.feature_cli:main"
+sos-pm = "sos_dev_tools.pm_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
