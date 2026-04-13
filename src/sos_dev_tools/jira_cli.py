@@ -9,6 +9,7 @@ Usage:
     sos-jira list [--status "To Do"] [--type task]
     sos-jira comment TICKET "text"
     sos-jira delete TICKET
+    sos-jira sync ops.json
     sos-jira create-project -k KEY -n "Name" [-t software|business|service_desk] [--template scrum|kanban|basic]
 """
 
@@ -267,8 +268,83 @@ def main():
     p = sub.add_parser("delete", parents=[proj])
     p.add_argument("ticket")
 
-    p = sub.add_parser("sync", parents=[proj])
-    p.add_argument("file", help="Path to JSON file with operations array")
+    sync_epilog = """\
+JSON schema — the file must contain an array of operation objects. Each object
+must have an "action" field; other fields depend on the action.
+
+Supported actions:
+
+  create            Create a new issue.
+    summary         (required) Issue title.
+    type            (optional) "task" | "epic" | "story" | "bug" | "subtask".
+                    Defaults to "task".
+    description     (optional) Markdown; auto-converted to Atlassian Document
+                    Format. Headings, bold, code, bullet/ordered lists supported.
+    parent          (optional) Parent ticket key (e.g. "PROJ-1"). Used for
+                    epic linking or subtask parents.
+    project         (optional) Project key override. Defaults to --project/-P
+                    or $JIRA_PROJECT_KEY.
+
+  update            Update an existing issue.
+    ticket          (required) Ticket key to update.
+    summary         (optional) New title.
+    description     (optional) New description (Markdown → ADF).
+
+  delete            Delete an existing issue.
+    ticket          (required) Ticket key to delete.
+
+  create-project    Provision a new Jira project.
+    key             (required) Project key (uppercase, 2-10 chars).
+    name            (required) Human-readable project name.
+    type            (optional) "software" | "business" | "service_desk".
+                    Defaults to "software".
+    template        (optional) "scrum" | "kanban" | "basic".
+                    Defaults to "scrum".
+
+Example ops.json:
+
+  [
+    {
+      "action": "create",
+      "type": "epic",
+      "summary": "Q2 platform work",
+      "description": "# Goals\\n\\n- Ship X\\n- Retire Y"
+    },
+    {
+      "action": "create",
+      "type": "task",
+      "parent": "PROJ-1",
+      "summary": "Extract shared Reveal component",
+      "description": "Move the scroll-reveal wrapper into @sos/ui."
+    },
+    {
+      "action": "update",
+      "ticket": "PROJ-42",
+      "summary": "Refined title"
+    },
+    {
+      "action": "delete",
+      "ticket": "PROJ-99"
+    }
+  ]
+
+The command processes operations in order, continuing past individual failures
+and reporting a summary at the end (succeeded vs. failed). A non-existent file,
+malformed JSON, or a non-array root is a hard failure before any API calls.
+"""
+    p = sub.add_parser(
+        "sync",
+        parents=[proj],
+        help="Batch create/update/delete tickets from a JSON operations file",
+        description=(
+            "Batch-apply Jira ticket operations (create, update, delete, "
+            "create-project) from a JSON file. Designed for bulk backlog "
+            "authoring and programmatic ticket generation."
+        ),
+        epilog=sync_epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("file", help="Path to JSON file containing an array of operation objects (see below)")
 
     p = sub.add_parser("create-project")
     p.add_argument("--key", "-k", required=True, help="Project key (e.g. PILOT) — uppercase, 2-10 chars")
