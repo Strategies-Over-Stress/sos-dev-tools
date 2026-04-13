@@ -6,6 +6,8 @@ Usage:
     sos-feature start TICKET
     sos-feature switch TICKET
     sos-feature pr [--title "..."] [--body "..."]
+    sos-feature start-iteration BRANCH [ITERATION] [--base BASE_BRANCH]
+    sos-feature merge-iteration
     sos-feature status
 """
 
@@ -150,10 +152,18 @@ def branch_exists(name):
 
 def cmd_start_iteration(args):
     branch = args.branch
+    base = args.base
 
     if not branch_exists(branch):
-        git("branch", branch, "main")
-        print(f"Created branch: {branch} (from main)")
+        if not branch_exists(base):
+            print(
+                f"Error: base branch '{base}' does not exist locally. "
+                f"Fetch it or pass a different --base.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        git("branch", branch, base)
+        print(f"Created branch: {branch} (from {base})")
 
     iteration = args.iteration or uuid.uuid4().hex[:8]
     iter_branch = f"{branch}-{iteration}"
@@ -251,9 +261,25 @@ def main():
     p.add_argument("--title", default=None)
     p.add_argument("--body", default=None)
 
-    p = sub.add_parser("start-iteration", parents=[proj])
-    p.add_argument("branch")
-    p.add_argument("iteration", nargs="?", default=None)
+    p = sub.add_parser(
+        "start-iteration",
+        parents=[proj],
+        help="Create a feature branch (if missing) and an iteration branch under it",
+        description=(
+            "Create a long-lived feature branch off a configurable base "
+            "(default: main), then create or resume an iteration branch "
+            "under it. The iteration branch is always named "
+            "'<branch>-<iteration>'."
+        ),
+    )
+    p.add_argument("branch", help="Feature branch name, e.g. 'feature/PROJ-123' or 'sosui/SOSUI-4'")
+    p.add_argument("iteration", nargs="?", default=None, help="Iteration suffix (default: random 8-char hex)")
+    p.add_argument(
+        "--base",
+        "-b",
+        default="main",
+        help="Base branch to create the feature branch from when it doesn't already exist (default: main)",
+    )
 
     sub.add_parser("merge-iteration", parents=[proj])
 
