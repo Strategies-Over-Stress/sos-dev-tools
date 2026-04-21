@@ -527,20 +527,27 @@ def _fanout(tickets, base, pause_after):
 
     if ok:
         print()
-        print("Runner tmux sessions:")
-        for t, session, log in ok:
-            print(f"  ✓ {t:<12}  tmux attach -t {session}")
-            print(f"                tail -f {log}")
-    if err:
+        print(f"Started {len(ok)} ticket(s). Each runs 5 phases in its own tmux tree.")
         print()
+        for t, session, log in ok:
+            print(f"  {t}")
+            print(f"    runner log:   tail -f {log}")
+            print(f"    runner tmux:  tmux attach -t {session}  (sparse — orchestrator only)")
+            print(f"    ── leaf agents (the actually-live sessions) ──")
+            print(f"    dev agent:    tmux attach -t pm-{t}                (during Work 1)")
+            print(f"    reviewer:     tmux attach -t flow-{t}-review       (during Review)")
+            print(f"    fix agent:    tmux attach -t flow-{t}-work2        (during Work 2)")
+            print(f"    re-QA agent:  tmux attach -t flow-{t}-work3        (during Re-QA, if any)")
+            print()
+    if err:
         print("Skipped / failed:")
         for t, _, msg in err:
             print(f"  ✗ {t:<12}  {msg}", file=sys.stderr)
+        print()
 
-    print()
     print(
-        f"{len(ok)} ticket(s) running. "
-        f"`sos-flow-dev status` for all · `sos-inbox list` for live cards"
+        f"{len(ok)} running. Monitor: `sos-flow-dev status` · `tmux ls` · "
+        f"sidebar at http://localhost:3030  (Ctrl+B D to detach from any tmux)"
     )
 
     if err and not ok:
