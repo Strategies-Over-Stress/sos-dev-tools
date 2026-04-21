@@ -148,19 +148,32 @@ class TestSessionState(SessionBase):
         self.assertIsNone(fd.session_get("NOPE-999"))
 
 
-class TestPostCardSilentOnMissing(unittest.TestCase):
-    """post_card must no-op silently when sos-inbox itself is missing."""
+class TestPostCardErrorHandling(unittest.TestCase):
+    """post_card: crash-proof, but surface real errors to stderr."""
 
     @patch.object(fd.subprocess, "run", side_effect=FileNotFoundError("sos-inbox"))
-    def test_no_inbox_binary_doesnt_crash(self, mock_run):
-        result = fd.post_card("info", "title", ticket="FOO-1")
+    def test_missing_binary_warns_and_continues(self, mock_run):
+        with patch.object(fd.sys, "stderr") as mock_err:
+            result = fd.post_card("info", "title", ticket="FOO-1")
         self.assertEqual(result, "")
+        # Warning written to stderr
+        written = "".join(
+            (c.args[0] if c.args else "") for c in mock_err.write.call_args_list)
+        self.assertIn("sos-inbox not on PATH", written)
 
-    @patch.object(fd.subprocess, "run",
-                  side_effect=subprocess.CalledProcessError(1, "sos-inbox"))
-    def test_inbox_error_doesnt_crash(self, mock_run):
-        result = fd.post_card("info", "title", ticket="FOO-1")
+    @patch.object(fd.subprocess, "run")
+    def test_http_failure_surfaces_stderr_message(self, mock_run):
+        err = subprocess.CalledProcessError(1, ["sos-inbox", "info"])
+        err.stderr = "HTTP 400 — malformed actions JSON"
+        mock_run.side_effect = err
+        with patch.object(fd.sys, "stderr") as mock_err:
+            result = fd.post_card("info", "title", ticket="FOO-1")
         self.assertEqual(result, "")
+        written = "".join(
+            (c.args[0] if c.args else "") for c in mock_err.write.call_args_list)
+        # Both the exit code and the stderr detail surfaced
+        self.assertIn("failed", written)
+        self.assertIn("HTTP 400", written)
 
 
 class TestCmdStartHappyPath(SessionBase):
@@ -881,6 +894,37 @@ class TestPreviewCommand(SessionBase):
         sessions = fd.session_get("FOO-1", "preview_sessions")
         self.assertEqual(sessions["app"], "preview-FOO-1-app")
         self.assertEqual(sessions["storybook"], "preview-FOO-1-storybook")
+
+    def test_post_preview_card_excludes_errored_services(self):
+        """A service with a warning (e.g. port-wait timeout) must NOT get an
+        'Open' button — the port may not be answering."""
+        results = [
+            {"name": "app",       "session": "preview-X-app",
+             "url": "http://localhost:3000", "error": None},
+            {"name": "storybook", "session": "preview-X-storybook",
+             "url": "http://localhost:6006",
+             "error": "warning: port 6006 didn't respond in 60s"},
+        ]
+        with patch.object(fd, "post_card") as mock_post:
+            fd._post_preview_card("X-1", results)
+        mock_post.assert_called_once()
+        call = mock_post.call_args
+        actions = call.kwargs.get("actions") or []
+        open_labels = [a["label"] for a in actions if a["kind"] == "openUrl"]
+        self.assertIn("Open app", open_labels)
+        self.assertNotIn("Open storybook", open_labels)
+
+    def test_post_preview_card_all_errored_posts_nothing(self):
+        """If every service failed or warned, don't post a misleading card."""
+        results = [
+            {"name": "app", "session": "preview-X-app",
+             "url": "http://localhost:3000", "error": "port didn't respond"},
+            {"name": "storybook", "session": None, "url": None,
+             "error": "cwd not found"},
+        ]
+        with patch.object(fd, "post_card") as mock_post:
+            fd._post_preview_card("X-1", results)
+        mock_post.assert_not_called()
 
     def test_stop_preview_all(self):
         fd.session_set("FOO-1",

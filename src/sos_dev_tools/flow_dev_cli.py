@@ -71,7 +71,14 @@ def run_capture(cmd, **kw):
 
 
 def post_card(kind, title, ticket=None, url=None, ctx=None, actions=None):
-    """Post an info/action card via sos-inbox; return card id (or '' on error)."""
+    """Post an info/action card via sos-inbox; return card id (or '' on error).
+
+    Network-unreachable failures (server down) silently no-op — sos-inbox
+    already returns 0 in that case so nothing to catch here. But sos-inbox
+    exits non-zero on *real* failures (validation errors, HTTP 4xx/5xx,
+    malformed actions JSON) — surface those to stderr rather than swallowing
+    silently, so users notice when cards fail to post for real reasons.
+    """
     cmd = ["sos-inbox", kind, title]
     if ticket: cmd += ["--ticket", ticket]
     if url:    cmd += ["--url", url]
@@ -79,10 +86,16 @@ def post_card(kind, title, ticket=None, url=None, ctx=None, actions=None):
     if actions: cmd += ["--actions", json.dumps(actions)]
     try:
         return run_capture(cmd)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        # A missing sidebar never blocks the flow — sos-inbox already
-        # silent-no-ops on unreachable; this catches the case where
-        # sos-inbox itself isn't installed.
+    except FileNotFoundError:
+        # sos-inbox not installed — keep the flow going but warn once.
+        print("post_card: sos-inbox not on PATH — cards won't post",
+              file=sys.stderr)
+        return ""
+    except subprocess.CalledProcessError as e:
+        stderr = (getattr(e, "stderr", None) or "").strip()
+        detail = f" — {stderr}" if stderr else ""
+        print(f"post_card: sos-inbox {kind} failed (exit {e.returncode}){detail}",
+              file=sys.stderr)
         return ""
 
 
@@ -1051,8 +1064,17 @@ def _stop_preview_for(ticket, service_names=None):
 
 
 def _post_preview_card(ticket, results):
-    """Post one info card summarizing all services that started for this ticket."""
-    running = [r for r in results if r["session"] and r["url"]]
+    """Post one info card summarizing services that started CLEANLY.
+
+    Deliberately skips services with a non-None `error` — that field holds
+    either a hard failure (session=None) or a soft warning (e.g. "port
+    didn't respond in 60s"). Posting an "Open preview" button pointing at a
+    port that isn't actually answering is worse than no card at all. The
+    warning has already been printed to stderr by the caller.
+
+    If NO service started cleanly for this ticket, no card is posted.
+    """
+    running = [r for r in results if r["session"] and r["url"] and not r["error"]]
     if not running:
         return
     primary = running[0]["url"]
