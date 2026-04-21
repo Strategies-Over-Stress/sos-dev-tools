@@ -36,6 +36,11 @@ import tempfile
 from pathlib import Path
 
 STATE_DIR = Path(os.environ.get("GHOSTTY_MINI_STATE", str(Path.home() / ".ghostty-mini")))
+
+
+def _global_config_path():
+    # Computed each call so tests can monkey-patch STATE_DIR.
+    return STATE_DIR / "config.json"
 PM_START_SKILL = Path(os.environ.get(
     "SOS_FLOW_DEV_PM_START",
     str(Path.home() / ".claude" / "commands" / "pm-start.md"),
@@ -203,37 +208,43 @@ def _blocker_for(ticket):
     return BLOCKER_CONTRACT.replace("<TICKET>", ticket)
 
 
-def worktree_alloc_prompt(ticket, cwd, hint_base=None):
-    """Phase-0 subagent: decide where to do the work, write the answer to a file."""
+def worktree_alloc_prompt(ticket, source_repo, hint_base=None):
+    """Phase-0 subagent: decide where to do the work, write the answer to a file.
+
+    `source_repo` is the resolved main git checkout — do not rely on CWD to
+    find it. The operator may have invoked this from inside a worktree or
+    from an unrelated directory; the orchestrator has already figured it out.
+    """
     base_hint = (
-        f"The user passed `--base {hint_base}` — use that as the parent branch "
-        f"unless you find a strong reason not to.\n"
+        f"The base branch is `{hint_base}` (resolved from --base flag or "
+        f"~/.ghostty-mini/config.json `default_base_branch`). Use it.\n"
         if hint_base else
-        "No `--base` was supplied. Infer the parent from context: the branch "
-        "currently checked out in CWD, hints in `.pm/config.json` "
-        "(`git.default_base` or `git.branch_prefix`), or recent flow-dev "
-        "sessions at `$HOME/.ghostty-mini/sessions/*.json`. If you can't "
-        "resolve it confidently, ASK via `sos-inbox prompt`.\n"
+        "No base branch was resolved. Infer from context: the branch currently "
+        "checked out in the source repo, `git.default_base` in .pm/config.json, "
+        "or recent flow-dev sessions at $HOME/.ghostty-mini/sessions/*.json. "
+        "If you can't resolve confidently, ASK via `sos-inbox prompt`.\n"
     )
     return f"""You are allocating a git worktree for ticket {ticket}. The work
 happens in that worktree; the downstream phases (pm-start, Review, Work 2, QA)
 expect to run inside whatever directory you pick.
 
-CWD: {cwd}
-POOL DIR: {cwd}/claude/worktrees/  (may not exist yet)
+SOURCE REPO: {source_repo}
+POOL DIR: {source_repo}/claude/worktrees/  (may not exist yet)
 RESULT FILE: /tmp/flow-{ticket}-worktree.json  ← write your decision here
+
+All git operations below should use `git -C {source_repo}` (or cd into the
+source first). Do not rely on the caller's CWD — they might have invoked
+this from anywhere.
 
 {base_hint}
 ## Steps
 
-1. **Inspect CWD.**
-   - Is it a git repo?  `git rev-parse --show-toplevel`  — if not, write
-     `{{"failed": "CWD is not a git repo"}}` to the result file and exit 0.
-   - Is CWD itself already a worktree (i.e., `git rev-parse --git-dir` returns
-     a path under `.git/worktrees/`)? If so, you can probably use CWD directly
-     unless it already has an active non-merged ticket.
+1. **Confirm the source repo.**
+   - `git -C {source_repo} rev-parse --show-toplevel` must succeed.
+   - If not, write `{{"failed": "source repo {source_repo} is not a git repo"}}`
+     and exit 0.
 
-2. **Inspect the pool** at `{cwd}/claude/worktrees/`.
+2. **Inspect the pool** at `{source_repo}/claude/worktrees/`.
    - If the directory doesn't exist, note that and skip to step 4 (create).
    - For each subdirectory, use `git worktree list --porcelain` (run from CWD)
      to confirm it's a registered worktree.
@@ -255,15 +266,16 @@ RESULT FILE: /tmp/flow-{ticket}-worktree.json  ← write your decision here
    Then set `action: "reused"` in the result.
 
 4. **Otherwise, create a new worktree.**
-   - Ensure `{cwd}/claude/worktrees/` exists (`mkdir -p`).
+   - Ensure `{source_repo}/claude/worktrees/` exists (`mkdir -p`).
    - Pick the lowest unused integer N for `wt-N` (scan existing pool).
-   - Create:  `git -C {cwd} worktree add claude/worktrees/wt-N <parent_branch>`
-   - If CWD has a `.pm/config.json`, copy it into the new worktree's `.pm/`
-     dir **verbatim — do NOT modify ports or any other field**. Ports are a
-     runtime concern handled by `sos-flow-dev preview`, which picks free ports
-     from its pool (6006-6099) at start time. Copying the config unchanged
-     means every worktree inherits the same commands/services without the
-     allocator needing to coordinate port assignments.
+   - Create:  `git -C {source_repo} worktree add claude/worktrees/wt-N <parent_branch>`
+   - If the source repo has a `.pm/config.json`, copy it into the new
+     worktree's `.pm/` dir **verbatim — do NOT modify ports or any other
+     field**. Ports are a runtime concern handled by `sos-flow-dev preview`,
+     which picks free ports from its pool (6006-6099) at start time. Copying
+     the config unchanged means every worktree inherits the same
+     commands/services without the allocator needing to coordinate port
+     assignments.
    - Set `action: "created"`.
 
 5. **Write the result file** at `/tmp/flow-{ticket}-worktree.json`:
@@ -379,20 +391,33 @@ def phase_worktree_alloc(ticket, hint_base=None):
     Writes /tmp/flow-<TICKET>-worktree.json with {worktree, parent_branch,
     action, reason, preview_port}.
 
-    Serializes concurrent callers via flock on $GHOSTTY_MINI_STATE/alloc.lock,
-    so two simultaneous `sos-flow-dev start` invocations can't both pick the
-    same pool worktree. Before releasing the lock, writes a stub
-    .pm/active-ticket.json into the chosen worktree so the next allocator sees
-    it as busy — pm-start overwrites this stub in its step 3 with the full
-    version.
+    Source-repo resolution is CWD-independent: the operator can invoke
+    sos-flow-dev from any directory (the main repo, a worktree inside it,
+    or somewhere else entirely) as long as either:
+      - CWD is a git repo related to the work (→ walks up to find main), OR
+      - ~/.ghostty-mini/config.json has `source_repo` set.
+
+    Serializes concurrent callers via flock on $GHOSTTY_MINI_STATE/alloc.lock.
+    Before releasing the lock, writes a stub .pm/active-ticket.json into the
+    chosen worktree so the next allocator sees it as busy.
     """
     step(f"Phase 0/5 — allocating worktree for {ticket}")
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    source_repo = _resolve_source_repo()
+    if source_repo is None:
+        fail(
+            "cannot determine source repo. Either:\n"
+            "  1. cd into the source repo (or any of its worktrees) and retry, OR\n"
+            f"  2. write {_global_config_path()} with\n"
+            '       {"source_repo": "/absolute/path/to/source/repo"}'
+        )
+    base = _resolve_base_branch(hint_base)
+
     lock_path = STATE_DIR / "alloc.lock"
     with open(lock_path, "w") as lock_f:
         fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
-        cwd = os.getcwd()
-        prompt = worktree_alloc_prompt(ticket, cwd, hint_base)
+        prompt = worktree_alloc_prompt(ticket, str(source_repo), base)
         rc = run_subagent(f"flow-{ticket}-alloc", prompt)
         if rc != 0:
             fail(f"worktree-alloc subagent exited {rc}")
@@ -778,6 +803,79 @@ def _wait_for_port(port, timeout_s=30):
             return True
         time.sleep(1)
     return False
+
+
+def _load_global_config():
+    """Return the parsed ~/.ghostty-mini/config.json, or {} if absent/broken.
+
+    Recognized keys:
+      source_repo         — path to the main git checkout where worktrees fork from
+      default_base_branch — branch to use as --base when not explicitly given
+    """
+    if not _global_config_path().exists():
+        return {}
+    try:
+        return json.loads(_global_config_path().read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_global_config(cfg):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    _global_config_path().write_text(json.dumps(cfg, indent=2))
+
+
+def _resolve_source_repo():
+    """Find the source (main) git repo for flow-dev, regardless of CWD.
+
+    Order:
+      1. $SOS_FLOW_DEV_SOURCE env var, if set and exists.
+      2. CWD's git context — handles both "CWD is the main repo" AND "CWD
+         is itself a worktree"; in the worktree case, walks up to the
+         shared main via `git rev-parse --git-common-dir`.
+      3. `source_repo` from ~/.ghostty-mini/config.json.
+
+    Returns an absolute Path or None. None means the operator is outside
+    any git context AND has no config — they need to `cd` into the source
+    OR set ~/.ghostty-mini/config.json.
+    """
+    env = os.environ.get("SOS_FLOW_DEV_SOURCE")
+    if env:
+        p = Path(env).expanduser()
+        if p.is_dir():
+            return p.resolve()
+
+    try:
+        toplevel = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        toplevel = ""
+    if toplevel:
+        top = Path(toplevel).resolve()
+        # If CWD is a worktree, walk up to the shared main.
+        source = _source_repo_for_worktree(top)
+        return source or top
+
+    cfg = _load_global_config()
+    src = cfg.get("source_repo")
+    if src:
+        p = Path(src).expanduser()
+        if p.is_dir():
+            return p.resolve()
+    return None
+
+
+def _resolve_base_branch(explicit=None):
+    """Return the base branch to fork worktrees from.
+
+    Order: explicit --base flag → config's default_base_branch → None.
+    """
+    if explicit:
+        return explicit
+    cfg = _load_global_config()
+    return cfg.get("default_base_branch") or None
 
 
 def _source_repo_for_worktree(worktree_path):
@@ -1408,6 +1506,46 @@ def cmd_resync(args):
     print(f"\n{total} card(s) restored.")
 
 
+def cmd_config(args):
+    """Read or write ~/.ghostty-mini/config.json without hand-editing JSON."""
+    cfg = _load_global_config()
+    if args.action == "get":
+        if args.key:
+            val = cfg.get(args.key)
+            print("" if val is None else json.dumps(val))
+        else:
+            print(json.dumps(cfg, indent=2))
+        return
+    if args.action == "set":
+        if not args.key or args.value is None:
+            fail("usage: sos-flow-dev config set KEY VALUE")
+        # Reject bogus keys early to catch typos.
+        allowed = {"source_repo", "default_base_branch"}
+        if args.key not in allowed:
+            fail(f"unknown config key {args.key!r}; allowed: {', '.join(sorted(allowed))}")
+        val = args.value
+        if args.key == "source_repo":
+            p = Path(val).expanduser()
+            if not p.is_dir():
+                fail(f"source_repo path {val} is not a directory")
+            val = str(p.resolve())
+        cfg[args.key] = val
+        _save_global_config(cfg)
+        check(f"config {args.key} = {val}")
+        return
+    if args.action == "unset":
+        if not args.key:
+            fail("usage: sos-flow-dev config unset KEY")
+        if args.key in cfg:
+            del cfg[args.key]
+            _save_global_config(cfg)
+            check(f"config {args.key} removed")
+        else:
+            print(f"(no {args.key} in config)")
+        return
+    fail(f"unknown action {args.action}")
+
+
 def cmd_status(args):
     if args.ticket:
         sess = session_get(args.ticket)
@@ -1562,6 +1700,22 @@ def main():
     p.add_argument("ticket")
     p.add_argument("reason", nargs="?", default="")
 
+    p = sub.add_parser(
+        "config",
+        help="Get/set global flow-dev settings at ~/.ghostty-mini/config.json",
+        description=(
+            "Allowed keys: source_repo (path to the main git checkout where "
+            "worktrees fork from), default_base_branch (branch used when "
+            "--base is omitted). These let you run sos-flow-dev from any CWD."
+        ),
+    )
+    p.add_argument("action", choices=["get", "set", "unset"],
+                   help="get/set/unset a config key")
+    p.add_argument("key", nargs="?", default=None,
+                   help="Key name (get with no key prints the full config)")
+    p.add_argument("value", nargs="?", default=None,
+                   help="Value (for set)")
+
     p = sub.add_parser("status", help="Show session state (all tickets or one)")
     p.add_argument("ticket", nargs="?", default=None)
 
@@ -1646,6 +1800,7 @@ def main():
         "watch": cmd_watch,
         "preview": cmd_preview,
         "resync": cmd_resync,
+        "config": cmd_config,
         "cleanup": cmd_cleanup,
     }[args.subcommand](args)
 

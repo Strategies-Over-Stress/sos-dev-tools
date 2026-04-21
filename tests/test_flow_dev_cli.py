@@ -979,6 +979,116 @@ class TestPreviewCommand(SessionBase):
         self.assertIn("no preview sessions", errors[0])
 
 
+class TestSourceRepoResolution(SessionBase):
+    """_resolve_source_repo chain: env → CWD git → config."""
+
+    def test_env_var_wins(self):
+        src = Path(self._tmp) / "source"
+        src.mkdir()
+        with patch.dict("os.environ",
+                        {"SOS_FLOW_DEV_SOURCE": str(src)}, clear=False):
+            # Also set a conflicting config to make sure env wins.
+            fd._save_global_config({"source_repo": "/not/used"})
+            result = fd._resolve_source_repo()
+        self.assertEqual(result, src.resolve())
+
+    def test_env_var_missing_path_ignored(self):
+        with patch.dict("os.environ",
+                        {"SOS_FLOW_DEV_SOURCE": "/does/not/exist"}, clear=False), \
+             patch.object(fd.subprocess, "run",
+                          side_effect=fd.subprocess.CalledProcessError(1, "git")):
+            # Falls through to config
+            cfg_src = Path(self._tmp) / "cfg-source"
+            cfg_src.mkdir()
+            fd._save_global_config({"source_repo": str(cfg_src)})
+            result = fd._resolve_source_repo()
+        self.assertEqual(result, cfg_src.resolve())
+
+    def test_cwd_is_source_repo(self):
+        src = Path(self._tmp) / "source"
+        src.mkdir()
+        os.environ.pop("SOS_FLOW_DEV_SOURCE", None)
+        with patch.object(fd.subprocess, "run") as mock_run:
+            # First call: rev-parse --show-toplevel → returns the source path
+            # Second call: rev-parse --git-common-dir → returns ".git" (meaning
+            # this IS the main repo, not a worktree)
+            mock_run.side_effect = [
+                MagicMock(stdout=str(src) + "\n", returncode=0),
+                MagicMock(stdout=".git\n", returncode=0),
+            ]
+            result = fd._resolve_source_repo()
+        self.assertEqual(result, src.resolve())
+
+    def test_cwd_is_worktree_walks_up_to_source(self):
+        """Even if the operator is inside a worktree, resolve the main repo."""
+        src = Path(self._tmp) / "source"
+        src.mkdir()
+        worktree = Path(self._tmp) / "source" / "claude" / "worktrees" / "wt-1"
+        worktree.mkdir(parents=True)
+        os.environ.pop("SOS_FLOW_DEV_SOURCE", None)
+        # git rev-parse --show-toplevel returns the worktree path
+        # git -C <worktree> rev-parse --git-common-dir returns /path/to/source/.git
+        with patch.object(fd.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(stdout=str(worktree) + "\n", returncode=0),   # show-toplevel
+                MagicMock(stdout=str(src / ".git") + "\n", returncode=0),  # git-common-dir
+            ]
+            result = fd._resolve_source_repo()
+        self.assertEqual(result, src)
+
+    def test_config_fallback_when_cwd_has_no_git(self):
+        cfg_src = Path(self._tmp) / "cfg-source"
+        cfg_src.mkdir()
+        fd._save_global_config({"source_repo": str(cfg_src)})
+        os.environ.pop("SOS_FLOW_DEV_SOURCE", None)
+        with patch.object(fd.subprocess, "run",
+                          side_effect=fd.subprocess.CalledProcessError(128, "git")):
+            result = fd._resolve_source_repo()
+        self.assertEqual(result, cfg_src.resolve())
+
+    def test_no_resolution_returns_none(self):
+        os.environ.pop("SOS_FLOW_DEV_SOURCE", None)
+        with patch.object(fd.subprocess, "run",
+                          side_effect=fd.subprocess.CalledProcessError(128, "git")):
+            self.assertIsNone(fd._resolve_source_repo())
+
+
+class TestResolveBaseBranch(SessionBase):
+    def test_explicit_wins(self):
+        fd._save_global_config({"default_base_branch": "main"})
+        self.assertEqual(fd._resolve_base_branch("sbook/epic"), "sbook/epic")
+
+    def test_config_when_no_explicit(self):
+        fd._save_global_config({"default_base_branch": "sbook/epic"})
+        self.assertEqual(fd._resolve_base_branch(None), "sbook/epic")
+
+    def test_none_when_neither(self):
+        self.assertIsNone(fd._resolve_base_branch(None))
+
+
+class TestConfigCommand(SessionBase):
+    def test_set_and_get(self):
+        src = Path(self._tmp) / "src"
+        src.mkdir()
+        fd.cmd_config(args_ns(action="set", key="source_repo", value=str(src)))
+        got = fd._load_global_config()
+        self.assertEqual(got["source_repo"], str(src.resolve()))
+
+    def test_set_rejects_nonexistent_source(self):
+        with self.assertRaises(SystemExit):
+            fd.cmd_config(args_ns(action="set", key="source_repo",
+                                  value="/does/not/exist"))
+
+    def test_set_rejects_unknown_key(self):
+        with self.assertRaises(SystemExit):
+            fd.cmd_config(args_ns(action="set", key="bogus", value="x"))
+
+    def test_unset_removes(self):
+        fd._save_global_config({"default_base_branch": "main"})
+        fd.cmd_config(args_ns(action="unset", key="default_base_branch", value=None))
+        self.assertNotIn("default_base_branch", fd._load_global_config())
+
+
 class TestResync(SessionBase):
     """resync re-posts flow-dev cards from session state, idempotently."""
 
