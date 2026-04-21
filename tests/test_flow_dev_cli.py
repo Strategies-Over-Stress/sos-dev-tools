@@ -645,6 +645,105 @@ class TestPmStartMissing(SessionBase):
                 fd.phase_pm_start("FOO-1")
 
 
+class TestPreviewCommand(SessionBase):
+    """cmd_preview starts/stops/lists detached preview tmux sessions."""
+
+    def test_resolve_tickets_positional(self):
+        args = args_ns(tickets=["FOO-1", "BAR-7"], all=False)
+        self.assertEqual(fd._resolve_preview_tickets(args), ["FOO-1", "BAR-7"])
+
+    def test_resolve_tickets_all_reads_session_files(self):
+        fd.session_set("FOO-1", phase="awaiting-qa", worktree=str(Path(self._tmp)))
+        fd.session_set("BAR-2", phase="merged", worktree=str(Path(self._tmp)))
+        fd.session_set("NOWT-3", phase="alloc")  # no worktree → skipped
+        args = args_ns(tickets=[], all=True)
+        got = fd._resolve_preview_tickets(args)
+        self.assertIn("FOO-1", got)
+        self.assertIn("BAR-2", got)
+        self.assertNotIn("NOWT-3", got)
+
+    def test_preview_config_reads_worktree_json(self):
+        wt = Path(self._tmp) / "wt-1"
+        (wt / ".pm").mkdir(parents=True)
+        (wt / ".pm" / "config.json").write_text(json.dumps({
+            "preview": {"command": "npm run storybook", "cwd": "packages/ui",
+                        "port": 6006}
+        }))
+        fd.session_set("FOO-1", worktree=str(wt))
+        cfg = fd._preview_config_for_ticket("FOO-1")
+        self.assertEqual(cfg["command"], "npm run storybook")
+        self.assertEqual(cfg["port"], 6006)
+
+    def test_preview_config_missing_returns_none(self):
+        fd.session_set("FOO-1", worktree=str(Path(self._tmp)))
+        self.assertIsNone(fd._preview_config_for_ticket("FOO-1"))
+
+    def test_start_preview_no_worktree_errors(self):
+        fd.session_set("FOO-1", phase="awaiting-qa")
+        session, err = fd._start_preview_for("FOO-1", "npm run dev", "", 6006, wait=False)
+        self.assertIsNone(session)
+        self.assertIn("no worktree", err)
+
+    def test_start_preview_port_already_bound(self):
+        wt = Path(self._tmp) / "wt-1"
+        wt.mkdir()
+        fd.session_set("FOO-1", worktree=str(wt))
+        with patch.object(fd, "_port_reachable", return_value=True):
+            session, err = fd._start_preview_for("FOO-1", "npm run dev", "",
+                                                 6006, wait=False)
+        self.assertIsNone(session)
+        self.assertIn("already in use", err)
+
+    def test_start_preview_spawns_tmux(self):
+        wt = Path(self._tmp) / "wt-1"
+        wt.mkdir()
+        fd.session_set("FOO-1", worktree=str(wt))
+        with patch.object(fd, "_port_reachable", return_value=False), \
+             patch.object(fd, "_tmux_session_exists", return_value=False), \
+             patch.object(fd.subprocess, "run",
+                          return_value=MagicMock(returncode=0, stderr="")):
+            session, err = fd._start_preview_for("FOO-1", "npm run dev",
+                                                 "", 6006, wait=False)
+        self.assertEqual(session, "preview-FOO-1")
+        self.assertIsNone(err)
+        # Session state updated with URL/port/session name
+        self.assertEqual(fd.session_get("FOO-1", "preview_url"),
+                         "http://localhost:6006")
+        self.assertEqual(fd.session_get("FOO-1", "preview_port"), 6006)
+
+    def test_start_preview_already_running(self):
+        wt = Path(self._tmp) / "wt-1"
+        wt.mkdir()
+        fd.session_set("FOO-1", worktree=str(wt),
+                       preview_session="preview-FOO-1")
+        with patch.object(fd, "_tmux_session_exists", return_value=True):
+            session, err = fd._start_preview_for("FOO-1", "npm run dev",
+                                                 "", 6006, wait=False)
+        self.assertEqual(session, "preview-FOO-1")
+        self.assertIn("already running", err)
+
+    def test_stop_preview_kills_session(self):
+        fd.session_set("FOO-1", preview_session="preview-FOO-1",
+                       preview_url="http://localhost:6006")
+        with patch.object(fd, "_tmux_session_exists", return_value=True), \
+             patch.object(fd.subprocess, "run") as mock_run:
+            ok, err = fd._stop_preview_for("FOO-1")
+        self.assertTrue(ok)
+        mock_run.assert_called_with(
+            ["tmux", "kill-session", "-t", "preview-FOO-1"],
+            check=False, capture_output=True)
+        # State cleaned up
+        self.assertEqual(fd.session_get("FOO-1", "preview_url"), "")
+        self.assertIsNone(fd.session_get("FOO-1", "preview_port"))
+
+    def test_stop_preview_no_session(self):
+        fd.session_set("FOO-1", phase="merged")
+        with patch.object(fd, "_tmux_session_exists", return_value=False):
+            ok, err = fd._stop_preview_for("FOO-1")
+        self.assertFalse(ok)
+        self.assertIn("no preview session", err)
+
+
 class TestWatchRendering(SessionBase):
     """cmd_watch renders a table from session state and maps phase → live tmux name."""
 

@@ -715,6 +715,233 @@ def cmd_qa_reject(args):
     check("re-QA card posted")
 
 
+# ─── Preview server management ─────────────────────────────────────────────
+
+PREVIEW_PORT_MIN = 6006
+PREVIEW_PORT_MAX = 6099
+
+
+def _next_free_port(start=PREVIEW_PORT_MIN, end=PREVIEW_PORT_MAX):
+    """Return the first port in [start, end] not currently LISTEN'd on."""
+    import socket
+    for p in range(start, end + 1):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", p))
+                return p
+            except OSError:
+                continue
+    raise RuntimeError(f"no free port in {start}-{end}")
+
+
+def _port_reachable(port, timeout=1.0):
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(("127.0.0.1", port))
+            return True
+    except OSError:
+        return False
+
+
+def _wait_for_port(port, timeout_s=30):
+    import time
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if _port_reachable(port):
+            return True
+        time.sleep(1)
+    return False
+
+
+def _preview_config_for_ticket(ticket):
+    """Load the preview block from this ticket's worktree .pm/config.json."""
+    sess = session_get(ticket) or {}
+    wt = sess.get("worktree")
+    if not wt:
+        return None
+    f = Path(wt) / ".pm" / "config.json"
+    if not f.exists():
+        return None
+    try:
+        cfg = json.loads(f.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    return cfg.get("preview") or None
+
+
+def _resolve_preview_tickets(args):
+    """Figure out which tickets --all / positional / current-dir refer to."""
+    if args.tickets:
+        return list(args.tickets)
+    if args.all:
+        d = STATE_DIR / "sessions"
+        if not d.exists():
+            return []
+        tickets = []
+        for f in sorted(d.glob("*.json")):
+            try:
+                data = json.loads(f.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if data.get("worktree"):
+                tickets.append(f.stem)
+        return tickets
+    return []
+
+
+def _start_preview_for(ticket, command, cwd, port, wait=True):
+    """Start a detached preview server for one ticket.
+
+    Returns (session_name, url) on success, (None, error_message) on failure.
+    """
+    sess = session_get(ticket) or {}
+    wt = sess.get("worktree")
+    if not wt:
+        return None, f"no worktree on record for {ticket}"
+    worktree = Path(wt)
+    if not worktree.is_dir():
+        return None, f"worktree {wt} not found on disk"
+    full_cwd = worktree / cwd if cwd else worktree
+    if not full_cwd.is_dir():
+        return None, f"preview cwd {full_cwd} not found"
+
+    session = f"preview-{ticket}"
+    if _tmux_session_exists(session):
+        return session, f"preview already running (tmux: {session})"
+
+    # Refuse to double-bind the port.
+    if _port_reachable(port):
+        return None, f"port {port} is already in use"
+
+    log_path = worktree / ".pm" / "preview.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    wrapped = (
+        f"cd {shlex.quote(str(full_cwd))} && "
+        f"PORT={port} exec {command} 2>&1 | tee {shlex.quote(str(log_path))}"
+    )
+    r = subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session,
+         "-x", "220", "-y", "50", "/bin/sh", "-c", wrapped],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return None, f"tmux spawn failed: {r.stderr.strip()}"
+
+    url = f"http://localhost:{port}"
+    session_set(ticket,
+                preview_url=url, preview_port=port, preview_session=session)
+
+    if wait:
+        if not _wait_for_port(port, timeout_s=60):
+            # Started but not answering — don't fail; warn the operator.
+            return session, f"warning: port {port} didn't respond in 60s — check tmux"
+    return session, None
+
+
+def _stop_preview_for(ticket):
+    """Tear down the preview tmux session for this ticket."""
+    sess = session_get(ticket) or {}
+    session = sess.get("preview_session") or f"preview-{ticket}"
+    if not _tmux_session_exists(session):
+        return False, f"no preview session for {ticket}"
+    subprocess.run(["tmux", "kill-session", "-t", session],
+                   check=False, capture_output=True)
+    session_set(ticket, preview_url="", preview_port=None, preview_session=None)
+    return True, None
+
+
+def cmd_preview(args):
+    """Start, stop, or list preview servers for flow-dev tickets."""
+    tickets = _resolve_preview_tickets(args)
+
+    if args.list:
+        r = subprocess.run(["tmux", "ls"], capture_output=True, text=True)
+        names = [l.split(":")[0] for l in (r.stdout or "").splitlines()
+                 if l.startswith("preview-")]
+        if not names:
+            print("(no preview sessions running)")
+            return
+        print("Running preview sessions:")
+        for n in sorted(names):
+            t = n[len("preview-"):]
+            sess = session_get(t) or {}
+            url = sess.get("preview_url") or "?"
+            print(f"  {n:<28}  {t:<12}  {url}")
+        return
+
+    if args.stop:
+        if not tickets:
+            fail("pass TICKET positional(s) or --all to select what to stop")
+        for t in tickets:
+            ok, err = _stop_preview_for(t)
+            if ok:
+                check(f"stopped preview for {t}")
+            else:
+                print(f"✗ {t}: {err}", file=sys.stderr)
+        return
+
+    # Start
+    if not tickets:
+        fail("pass TICKET positional(s) or --all to start previews")
+
+    started = []
+    last_port = None
+    for t in tickets:
+        cfg = _preview_config_for_ticket(t) or {}
+        command = args.command or cfg.get("command")
+        if not command:
+            print(f"✗ {t}: no preview.command — pass --command or set it in {t}'s "
+                  f"worktree .pm/config.json", file=sys.stderr)
+            continue
+        cwd = args.cwd if args.cwd is not None else (cfg.get("cwd") or "")
+
+        # Port selection: CLI --port wins. Else config. Else next-free after the
+        # previously-used port so multiple tickets in one call don't collide.
+        if args.port:
+            port = args.port + len(started)  # bump per-ticket when explicit base given
+        elif cfg.get("port"):
+            port = int(cfg["port"])
+        else:
+            start_search = (last_port + 1) if last_port else PREVIEW_PORT_MIN
+            try:
+                port = _next_free_port(start=start_search)
+            except RuntimeError as e:
+                print(f"✗ {t}: {e}", file=sys.stderr)
+                continue
+        last_port = port
+
+        step(f"starting preview for {t} on port {port}")
+        session, err = _start_preview_for(t, command, cwd, port, wait=args.wait)
+        if session is None:
+            print(f"✗ {t}: {err}", file=sys.stderr)
+            continue
+        if err:
+            print(f"  ⚠ {err}", file=sys.stderr)
+        url = f"http://localhost:{port}"
+        check(f"{t}: {url}  (tmux attach -t {session})")
+        sess = session_get(t) or {}
+        pr_url = sess.get("pr_url") or None
+        post_card(
+            "info", f"Preview ready · {t}",
+            ticket=t, url=url,
+            ctx=(f"Port {port} · tmux attach -t {session} · PR "
+                 f"{pr_url if pr_url else '(none)'}"),
+            actions=[
+                {"label": "Open preview", "kind": "openUrl"},
+                {"label": "Stop",         "kind": "inject",
+                 "text": f"sos-flow-dev preview --stop {t}\n", "execute": True},
+            ],
+        )
+        started.append(t)
+
+    if started:
+        print()
+        print(f"{len(started)} preview(s) running. "
+              f"Card posted to each ticket's section in the sidebar.")
+
+
 PHASE_TO_LIVE_SESSION = {
     "alloc":          lambda t: f"flow-{t}-alloc",
     "work-1":         lambda t: f"pm-{t}",
@@ -897,6 +1124,12 @@ def cmd_cleanup(args):
     wt = sess.get("worktree")
     parent = sess.get("parent_branch") or "main"
 
+    # Stop the preview first so the port is free for the next run.
+    if sess.get("preview_session") and _tmux_session_exists(sess["preview_session"]):
+        subprocess.run(["tmux", "kill-session", "-t", sess["preview_session"]],
+                       check=False, capture_output=True)
+        check(f"stopped preview session {sess['preview_session']}")
+
     if wt:
         if args.remove:
             _remove_worktree(wt)
@@ -929,7 +1162,7 @@ def main():
             "each inside a detached tmux session."
         ),
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="subcommand", required=True)
 
     p = sub.add_parser(
         "start",
@@ -984,6 +1217,36 @@ def main():
                    help="Refresh interval in seconds (default: 3)")
 
     p = sub.add_parser(
+        "preview",
+        help="Start/stop preview dev servers for active tickets on demand",
+        description=(
+            "Spin up a detached tmux session running the project's preview "
+            "command (from each worktree's .pm/config.json `preview.command`, "
+            "or --command override), bind a unique port, and post an info "
+            "card with the URL to the sidebar. Use this when the original "
+            "flow ran without a preview configured, or to revive a preview "
+            "after it died. `--stop` tears one down."
+        ),
+    )
+    p.add_argument("tickets", nargs="*",
+                   help="Ticket(s) to start/stop previews for")
+    p.add_argument("--all", action="store_true",
+                   help="Apply to all active tickets (those with a worktree on record)")
+    p.add_argument("--stop", action="store_true",
+                   help="Stop the preview instead of starting it")
+    p.add_argument("--list", action="store_true",
+                   help="Show currently-running preview sessions")
+    p.add_argument("--command", default=None,
+                   help="Preview command (overrides .pm/config.json preview.command)")
+    p.add_argument("--cwd", default=None,
+                   help="Subdirectory (relative to worktree) to run preview from")
+    p.add_argument("--port", type=int, default=None,
+                   help="Starting port (auto-bumps per ticket if multiple). "
+                        "Default: next free port in 6006–6099.")
+    p.add_argument("--no-wait", dest="wait", action="store_false", default=True,
+                   help="Don't block waiting for the port to come up")
+
+    p = sub.add_parser(
         "cleanup",
         help="Reset the ticket's worktree for reuse (default) or remove it outright",
     )
@@ -1002,8 +1265,9 @@ def main():
         "qa-reject": cmd_qa_reject,
         "status": cmd_status,
         "watch": cmd_watch,
+        "preview": cmd_preview,
         "cleanup": cmd_cleanup,
-    }[args.command](args)
+    }[args.subcommand](args)
 
 
 if __name__ == "__main__":
