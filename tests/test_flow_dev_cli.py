@@ -1051,20 +1051,32 @@ class TestCmdQaApprove(SessionBase):
         # Session NOT marked as merged
         self.assertNotEqual(fd.session_get("FOO-1", "phase"), "merged")
 
-    def test_failing_check_aborts_merge(self):
-        self._sess(checks={"test": "false"})
+    def test_checks_are_not_run_locally(self):
+        """Local lint/test/typecheck from config should NOT gate merge — CI
+        owns that via branch protection. Ensure the CLI never shells out to
+        the configured check commands."""
+        self._sess(checks={"test": "should-never-run",
+                           "lint": "echo nope && exit 1"})
 
         def fake_run(cmd, **kw):
-            # shell=True path — check command fails
-            if kw.get("shell"):
-                return MagicMock(returncode=1)
+            # If the CLI tried to run the check, its shell=True call would
+            # hit exit 1 and abort. With the checks-in-CI design, shell=True
+            # commands should never be issued.
+            assert not kw.get("shell"), (
+                f"CLI ran a shell command ({cmd!r}) — should delegate checks to CI"
+            )
+            if "merge" in cmd and "pr" in cmd:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            if "view" in cmd and "pr" in cmd:
+                return MagicMock(returncode=0,
+                                 stdout='{"mergedAt":"2026-04-21T20:00:00Z"}')
             return MagicMock(returncode=0, stdout="", stderr="")
 
         with patch.object(fd.subprocess, "run", side_effect=fake_run), \
-             patch.object(fd, "post_card") as mock_post:
-            with self.assertRaises(SystemExit):
-                fd.cmd_qa_approve(args_ns(ticket="FOO-1"))
-        mock_post.assert_not_called()
+             patch.object(fd, "post_card", return_value="card_x"):
+            fd.cmd_qa_approve(args_ns(ticket="FOO-1"))
+
+        self.assertEqual(fd.session_get("FOO-1", "phase"), "merged")
 
     def test_no_pr_num_fails(self):
         fd.session_set("FOO-1", worktree=str(Path(self._tmp)))

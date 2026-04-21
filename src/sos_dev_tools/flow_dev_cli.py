@@ -724,33 +724,22 @@ def _load_project_config(worktree):
         return {}
 
 
-def _run_configured_checks(worktree, cfg):
-    """Run `checks.test`, `checks.lint`, `checks.typecheck` from .pm/config.json.
-    Fail (SystemExit) on any non-zero exit.
-    """
-    checks = (cfg or {}).get("checks") or {}
-    for name in ("test", "lint", "typecheck"):
-        cmd = checks.get(name)
-        if not cmd:
-            continue
-        step(f"running {name}: {cmd}")
-        r = subprocess.run(cmd, shell=True, cwd=worktree or None)
-        if r.returncode != 0:
-            fail(f"{name} failed (exit {r.returncode}) — aborting merge")
-
-
 def cmd_qa_approve(args):
     """Merge the PR that pm-start opened for this ticket.
 
-    Calls `gh pr merge` directly because the human has already explicitly
-    approved via the inbox "Approve & merge" button — pm-finish's interactive
-    "type merge" step is redundant, and its `sos-feature merge-iteration`
-    merges iteration → feature branch, not the PR.
+    Calls `gh pr merge` directly. The human has already explicitly approved
+    via the inbox "Approve & merge" button, so there's no interactive
+    confirmation step to add.
 
-    Runs configured quality checks first (.pm/config.json `checks.test` etc)
-    and refuses to merge if any fail. Verifies GitHub actually marked the PR
-    as merged before posting the confirmation card — no more silent "false
-    merge" success state.
+    Checks (lint, tests, typecheck) are NOT run locally before merge — that's
+    CI's job. GitHub's branch protection rules already gate merges on required
+    status checks. Duplicating in the CLI creates false-positive merge blocks
+    when the local lint env drifts from CI (missing scripts, different node
+    versions, uncommitted dep changes, etc). The CLI's job is just to merge;
+    the repo's branch-protection config decides what "mergeable" means.
+
+    Verifies `mergedAt` from GitHub after the merge call — refuses to post
+    the "Merged" card if the PR isn't actually marked merged.
     """
     ticket = args.ticket
     sess = session_get(ticket) or {}
@@ -759,8 +748,6 @@ def cmd_qa_approve(args):
         fail(f"no PR number on record for {ticket}")
     worktree = sess.get("worktree")
     cfg = _load_project_config(worktree)
-
-    _run_configured_checks(worktree, cfg)
 
     git_cfg = cfg.get("git") or {}
     strategy = (git_cfg.get("merge_strategy") or "squash").lower()
