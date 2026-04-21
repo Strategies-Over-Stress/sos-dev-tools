@@ -722,11 +722,21 @@ def cmd_qa_reject(args):
 PREVIEW_PORT_MIN = 6006
 PREVIEW_PORT_MAX = 6099
 
+# Ports already assigned within THIS process's current invocation. Without
+# this set, when a single `sos-flow-dev preview` call starts multiple
+# services back-to-back, each picks the same next-free port because the
+# previous service hasn't had time to actually bind yet.
+_RUNTIME_CLAIMED_PORTS = set()
+
 
 def _next_free_port(start=PREVIEW_PORT_MIN, end=PREVIEW_PORT_MAX):
-    """Return the first port in [start, end] not currently LISTEN'd on."""
+    """Return the first port in [start, end] that is (a) not bound on localhost
+    AND (b) not already claimed within this invocation of sos-flow-dev.
+    """
     import socket
     for p in range(start, end + 1):
+        if p in _RUNTIME_CLAIMED_PORTS:
+            continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 s.bind(("127.0.0.1", p))
@@ -757,20 +767,68 @@ def _wait_for_port(port, timeout_s=30):
     return False
 
 
+def _source_repo_for_worktree(worktree_path):
+    """Given a git worktree path, return the source (main) repo root, or None.
+
+    Uses `git rev-parse --git-common-dir` which points at the shared `.git`
+    directory; the main repo lives in its parent.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(worktree_path), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    common_dir = Path(r.stdout.strip())
+    # Make absolute if git returned a relative path
+    if not common_dir.is_absolute():
+        common_dir = (Path(worktree_path) / common_dir).resolve()
+    if common_dir.name == ".git":
+        return common_dir.parent
+    return None
+
+
+def _read_preview_block(config_path):
+    """Read and sanity-check the preview block from a .pm/config.json.
+
+    Returns the dict, or None if the file is missing / unreadable / has no
+    useful preview config (all-null legacy template counts as "no config").
+    """
+    if not config_path.exists():
+        return None
+    try:
+        cfg = json.loads(config_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    preview = cfg.get("preview")
+    if not isinstance(preview, dict):
+        return None
+    # Legacy template has command=null, services=null etc. Treat that as unset.
+    if not preview.get("command") and not preview.get("services"):
+        return None
+    return preview
+
+
 def _preview_config_for_ticket(ticket):
-    """Load the preview block from this ticket's worktree .pm/config.json."""
+    """Load the preview block. Prefers the worktree's .pm/config.json, falls
+    back to the source repo's when the worktree has no preview configured —
+    so adding the block once at the source is enough for every worktree.
+    """
     sess = session_get(ticket) or {}
     wt = sess.get("worktree")
     if not wt:
         return None
-    f = Path(wt) / ".pm" / "config.json"
-    if not f.exists():
-        return None
-    try:
-        cfg = json.loads(f.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-    return cfg.get("preview") or None
+    worktree = Path(wt)
+    # Try the worktree first.
+    cfg = _read_preview_block(worktree / ".pm" / "config.json")
+    if cfg:
+        return cfg
+    # Fall back to the source repo.
+    source = _source_repo_for_worktree(worktree)
+    if source:
+        return _read_preview_block(source / ".pm" / "config.json")
+    return None
 
 
 def _normalize_preview_config(cfg):
@@ -838,25 +896,17 @@ def _preview_tmux_name(ticket, service):
 
 
 def _assign_ports(services):
-    """Ensure each service has a port. Ports without a value get next-free;
-    duplicates across services get bumped to avoid collisions.
-    """
-    taken = {s["port"] for s in services if s.get("port")}
+    """Ensure each service has a port. Ports without a value get next-free."""
+    # Explicit ports in the input are already-claimed.
+    for s in services:
+        if s.get("port"):
+            _RUNTIME_CLAIMED_PORTS.add(s["port"])
     for s in services:
         if s.get("port"):
             continue
-        # Start search above highest already-taken port so concurrent services
-        # in one call get distinct ports without retrying.
-        start = (max(taken) + 1) if taken else PREVIEW_PORT_MIN
-        try:
-            p = _next_free_port(start=start)
-        except RuntimeError:
-            p = _next_free_port()  # wrap around; may still collide with taken
-        # Don't accept an already-claimed port within this batch
-        while p in taken:
-            p = _next_free_port(start=p + 1)
+        p = _next_free_port()
         s["port"] = p
-        taken.add(p)
+        _RUNTIME_CLAIMED_PORTS.add(p)
 
 
 def _start_preview_for(ticket, services, wait=True):
@@ -900,13 +950,13 @@ def _start_preview_for(ticket, services, wait=True):
                             "error": f"already running (tmux: {tmux_session})"})
             continue
         if _port_reachable(port):
-            # Someone else is on this port; pick the next free one and keep going.
             try:
                 fallback = _next_free_port(start=port + 1)
             except RuntimeError as e:
                 results.append({"name": name, "session": None, "url": None,
                                 "error": f"port {port} in use and no free port: {e}"})
                 continue
+            _RUNTIME_CLAIMED_PORTS.add(fallback)
             results_warn = f"port {port} in use, switched to {fallback}"
             port = fallback
         else:
@@ -1092,9 +1142,11 @@ def cmd_preview(args):
             if selected_services:
                 services = [s for s in services if s["name"] in selected_services]
             if not services:
-                print(f"✗ {t}: no preview services to start — add a `preview` "
-                      f"block to the worktree's .pm/config.json, or pass --command",
-                      file=sys.stderr)
+                print(f"✗ {t}: no preview services configured.", file=sys.stderr)
+                print(f"    Fix: add a `preview` block to the source repo's "
+                      f".pm/config.json (applies to all worktrees), the "
+                      f"worktree's own .pm/config.json, or pass --command/--cwd "
+                      f"on this invocation.", file=sys.stderr)
                 continue
 
         step(f"starting {len(services)} preview service(s) for {t}")

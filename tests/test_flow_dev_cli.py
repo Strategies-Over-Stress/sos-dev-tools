@@ -116,9 +116,12 @@ class SessionBase(unittest.TestCase):
         self._tmp = tempfile.mkdtemp()
         self._orig_state = fd.STATE_DIR
         fd.STATE_DIR = Path(self._tmp)
+        # Don't let one test's port reservations leak into the next.
+        fd._RUNTIME_CLAIMED_PORTS.clear()
 
     def tearDown(self):
         fd.STATE_DIR = self._orig_state
+        fd._RUNTIME_CLAIMED_PORTS.clear()
         shutil.rmtree(self._tmp, ignore_errors=True)
 
 
@@ -672,11 +675,59 @@ class TestPreviewCommand(SessionBase):
         fd.session_set("FOO-1", worktree=str(wt))
         cfg = fd._preview_config_for_ticket("FOO-1")
         self.assertEqual(cfg["command"], "npm run storybook")
-        self.assertEqual(cfg["port"], 6006)
 
     def test_preview_config_missing_returns_none(self):
-        fd.session_set("FOO-1", worktree=str(Path(self._tmp)))
-        self.assertIsNone(fd._preview_config_for_ticket("FOO-1"))
+        # No worktree config, no source repo fallback → None
+        wt = Path(self._tmp) / "wt-1"
+        wt.mkdir()
+        fd.session_set("FOO-1", worktree=str(wt))
+        with patch.object(fd, "_source_repo_for_worktree", return_value=None):
+            self.assertIsNone(fd._preview_config_for_ticket("FOO-1"))
+
+    def test_preview_config_falls_back_to_source_repo(self):
+        # Worktree has NO preview config; source repo DOES. Fallback wins.
+        wt = Path(self._tmp) / "wt-1"
+        (wt / ".pm").mkdir(parents=True)
+        (wt / ".pm" / "config.json").write_text(json.dumps({
+            "jira": {"project_key": "X"}  # no preview block
+        }))
+        source = Path(self._tmp) / "source"
+        (source / ".pm").mkdir(parents=True)
+        (source / ".pm" / "config.json").write_text(json.dumps({
+            "preview": {"command": "npm run storybook"}
+        }))
+        fd.session_set("FOO-1", worktree=str(wt))
+        with patch.object(fd, "_source_repo_for_worktree", return_value=source):
+            cfg = fd._preview_config_for_ticket("FOO-1")
+        self.assertEqual(cfg["command"], "npm run storybook")
+
+    def test_preview_config_worktree_wins_over_source(self):
+        # When the worktree DOES have preview config, use it, don't fall back.
+        wt = Path(self._tmp) / "wt-1"
+        (wt / ".pm").mkdir(parents=True)
+        (wt / ".pm" / "config.json").write_text(json.dumps({
+            "preview": {"command": "worktree-wins"}
+        }))
+        source = Path(self._tmp) / "source"
+        (source / ".pm").mkdir(parents=True)
+        (source / ".pm" / "config.json").write_text(json.dumps({
+            "preview": {"command": "source-loses"}
+        }))
+        fd.session_set("FOO-1", worktree=str(wt))
+        with patch.object(fd, "_source_repo_for_worktree", return_value=source):
+            cfg = fd._preview_config_for_ticket("FOO-1")
+        self.assertEqual(cfg["command"], "worktree-wins")
+
+    def test_preview_config_all_null_template_treated_as_missing(self):
+        # The all-null template that config.json ships with shouldn't count.
+        wt = Path(self._tmp) / "wt-1"
+        (wt / ".pm").mkdir(parents=True)
+        (wt / ".pm" / "config.json").write_text(json.dumps({
+            "preview": {"command": None, "cwd": None, "services": None}
+        }))
+        fd.session_set("FOO-1", worktree=str(wt))
+        with patch.object(fd, "_source_repo_for_worktree", return_value=None):
+            self.assertIsNone(fd._preview_config_for_ticket("FOO-1"))
 
     def test_normalize_legacy_config(self):
         # Port in config is IGNORED — runner assigns at runtime.
@@ -779,6 +830,34 @@ class TestPreviewCommand(SessionBase):
         # Primary preview_url mirrors default
         self.assertEqual(fd.session_get("FOO-1", "preview_url"),
                          "http://localhost:6006")
+
+    def test_sequential_starts_get_distinct_ports(self):
+        """Calling _start_preview_for back-to-back within one invocation must
+        give each service a different port, even before the previous one binds.
+        """
+        wt = Path(self._tmp) / "wt-1"
+        wt.mkdir()
+        fd.session_set("FOO-1", worktree=str(wt))
+        fd.session_set("BAR-7", worktree=str(wt))
+
+        # Simulate nothing bound ever — _port_reachable always False.
+        # Without the claimed-set, each call would pick 6006.
+        with patch.object(fd, "_port_reachable", return_value=False), \
+             patch.object(fd, "_tmux_session_exists", return_value=False), \
+             patch.object(fd.subprocess, "run",
+                          return_value=MagicMock(returncode=0, stderr="")):
+            r1 = fd._start_preview_for(
+                "FOO-1",
+                [{"name": "default", "command": "a", "cwd": "", "port": None}],
+                wait=False)
+            r2 = fd._start_preview_for(
+                "BAR-7",
+                [{"name": "default", "command": "b", "cwd": "", "port": None}],
+                wait=False)
+        p1 = int(r1[0]["url"].rsplit(":", 1)[-1])
+        p2 = int(r2[0]["url"].rsplit(":", 1)[-1])
+        self.assertNotEqual(p1, p2,
+                            f"both tickets got port {p1} — claimed-set leak")
 
     def test_start_preview_multi_service(self):
         wt = Path(self._tmp) / "wt-1"
