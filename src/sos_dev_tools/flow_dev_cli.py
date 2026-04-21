@@ -771,6 +771,43 @@ def _preview_config_for_ticket(ticket):
     return cfg.get("preview") or None
 
 
+def _normalize_preview_config(cfg):
+    """Return a list of service dicts [{name, command, cwd, port}] from any
+    supported preview config shape.
+
+    Legacy:   {"command": "...", "cwd": "...", "port": N}
+              → one service named "default"
+    Multi:    {"services": [{"name": "...", "command": "...", "cwd": ..., "port": N}]}
+              → list as-is
+
+    Services without a `command` are dropped. Ports left as None get auto-
+    assigned at start time.
+    """
+    if not cfg or not isinstance(cfg, dict):
+        return []
+    svcs = cfg.get("services")
+    if isinstance(svcs, list) and svcs:
+        out = []
+        for i, s in enumerate(svcs):
+            if not isinstance(s, dict) or not s.get("command"):
+                continue
+            out.append({
+                "name": (s.get("name") or f"svc{i}").lower(),
+                "command": s["command"],
+                "cwd": s.get("cwd") or "",
+                "port": int(s["port"]) if s.get("port") else None,
+            })
+        return out
+    if cfg.get("command"):
+        return [{
+            "name": "default",
+            "command": cfg["command"],
+            "cwd": cfg.get("cwd") or "",
+            "port": int(cfg["port"]) if cfg.get("port") else None,
+        }]
+    return []
+
+
 def _resolve_preview_tickets(args):
     """Figure out which tickets --all / positional / current-dir refer to."""
     if args.tickets:
@@ -791,70 +828,200 @@ def _resolve_preview_tickets(args):
     return []
 
 
-def _start_preview_for(ticket, command, cwd, port, wait=True):
-    """Start a detached preview server for one ticket.
+def _preview_tmux_name(ticket, service):
+    return f"preview-{ticket}-{service}"
 
-    Returns (session_name, url) on success, (None, error_message) on failure.
+
+def _assign_ports(services):
+    """Ensure each service has a port. Ports without a value get next-free;
+    duplicates across services get bumped to avoid collisions.
+    """
+    taken = {s["port"] for s in services if s.get("port")}
+    for s in services:
+        if s.get("port"):
+            continue
+        # Start search above highest already-taken port so concurrent services
+        # in one call get distinct ports without retrying.
+        start = (max(taken) + 1) if taken else PREVIEW_PORT_MIN
+        try:
+            p = _next_free_port(start=start)
+        except RuntimeError:
+            p = _next_free_port()  # wrap around; may still collide with taken
+        # Don't accept an already-claimed port within this batch
+        while p in taken:
+            p = _next_free_port(start=p + 1)
+        s["port"] = p
+        taken.add(p)
+
+
+def _start_preview_for(ticket, services, wait=True):
+    """Start one or more preview services for a ticket.
+
+    Returns a list of dicts: [{name, session, url, error}, ...].
+    On success error is None; on failure session/url may be None.
     """
     sess = session_get(ticket) or {}
     wt = sess.get("worktree")
-    if not wt:
-        return None, f"no worktree on record for {ticket}"
+    if not wt or not Path(wt).is_dir():
+        return [{"name": "*", "session": None, "url": None,
+                 "error": f"no worktree on record for {ticket}"}]
     worktree = Path(wt)
-    if not worktree.is_dir():
-        return None, f"worktree {wt} not found on disk"
-    full_cwd = worktree / cwd if cwd else worktree
-    if not full_cwd.is_dir():
-        return None, f"preview cwd {full_cwd} not found"
 
-    session = f"preview-{ticket}"
-    if _tmux_session_exists(session):
-        return session, f"preview already running (tmux: {session})"
+    _assign_ports(services)
 
-    # Refuse to double-bind the port.
-    if _port_reachable(port):
-        return None, f"port {port} is already in use"
+    results = []
+    preview_urls = dict(sess.get("preview_urls") or {})
+    preview_sessions = dict(sess.get("preview_sessions") or {})
+    # Legacy single-service state migration
+    if not preview_urls and sess.get("preview_url") and sess.get("preview_session"):
+        preview_urls["default"] = sess["preview_url"]
+        preview_sessions["default"] = sess["preview_session"]
 
-    log_path = worktree / ".pm" / "preview.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    wrapped = (
-        f"cd {shlex.quote(str(full_cwd))} && "
-        f"PORT={port} exec {command} 2>&1 | tee {shlex.quote(str(log_path))}"
+    for svc in services:
+        name = svc["name"]
+        command = svc["command"]
+        cwd = svc.get("cwd") or ""
+        port = svc["port"]
+        tmux_session = _preview_tmux_name(ticket, name)
+        full_cwd = worktree / cwd if cwd else worktree
+
+        if not full_cwd.is_dir():
+            results.append({"name": name, "session": None, "url": None,
+                            "error": f"cwd {full_cwd} not found"})
+            continue
+        if _tmux_session_exists(tmux_session):
+            results.append({"name": name, "session": tmux_session,
+                            "url": preview_urls.get(name),
+                            "error": f"already running (tmux: {tmux_session})"})
+            continue
+        if _port_reachable(port):
+            results.append({"name": name, "session": None, "url": None,
+                            "error": f"port {port} is already in use"})
+            continue
+
+        log_path = worktree / ".pm" / f"preview-{name}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        wrapped = (
+            f"cd {shlex.quote(str(full_cwd))} && "
+            f"PORT={port} exec {command} 2>&1 | tee {shlex.quote(str(log_path))}"
+        )
+        r = subprocess.run(
+            ["tmux", "new-session", "-d", "-s", tmux_session,
+             "-x", "220", "-y", "50", "/bin/sh", "-c", wrapped],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            results.append({"name": name, "session": None, "url": None,
+                            "error": f"tmux spawn failed: {r.stderr.strip()}"})
+            continue
+
+        url = f"http://localhost:{port}"
+        preview_urls[name] = url
+        preview_sessions[name] = tmux_session
+        results.append({"name": name, "session": tmux_session, "url": url,
+                        "error": None})
+
+    # Persist consolidated state. `preview_url` (singular) stays populated with
+    # the primary — first service that started cleanly — so existing
+    # QA-card logic keeps working.
+    primary_url = next(
+        (r["url"] for r in results if r["session"] and r["url"]),
+        None,
     )
-    r = subprocess.run(
-        ["tmux", "new-session", "-d", "-s", session,
-         "-x", "220", "-y", "50", "/bin/sh", "-c", wrapped],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        return None, f"tmux spawn failed: {r.stderr.strip()}"
-
-    url = f"http://localhost:{port}"
     session_set(ticket,
-                preview_url=url, preview_port=port, preview_session=session)
+                preview_urls=preview_urls,
+                preview_sessions=preview_sessions,
+                preview_url=primary_url or "")
 
     if wait:
-        if not _wait_for_port(port, timeout_s=60):
-            # Started but not answering — don't fail; warn the operator.
-            return session, f"warning: port {port} didn't respond in 60s — check tmux"
-    return session, None
+        for r in results:
+            if r["error"] is not None or r["url"] is None:
+                continue
+            port = int(r["url"].rsplit(":", 1)[-1])
+            if not _wait_for_port(port, timeout_s=60):
+                r["error"] = f"warning: port {port} didn't respond in 60s"
+
+    return results
 
 
-def _stop_preview_for(ticket):
-    """Tear down the preview tmux session for this ticket."""
+def _stop_preview_for(ticket, service_names=None):
+    """Stop one, some, or all preview services for a ticket.
+
+    service_names=None  → stop every recorded service
+    service_names=["x","y"] → stop only those
+
+    Returns (stopped_names, error_messages).
+    """
     sess = session_get(ticket) or {}
-    session = sess.get("preview_session") or f"preview-{ticket}"
-    if not _tmux_session_exists(session):
-        return False, f"no preview session for {ticket}"
-    subprocess.run(["tmux", "kill-session", "-t", session],
-                   check=False, capture_output=True)
-    session_set(ticket, preview_url="", preview_port=None, preview_session=None)
-    return True, None
+    sessions = dict(sess.get("preview_sessions") or {})
+    urls = dict(sess.get("preview_urls") or {})
+    # Legacy single-service state
+    if not sessions and sess.get("preview_session"):
+        sessions["default"] = sess["preview_session"]
+        if sess.get("preview_url"):
+            urls["default"] = sess["preview_url"]
+
+    if not sessions:
+        return [], [f"{ticket}: no preview sessions recorded"]
+
+    targets = service_names or list(sessions.keys())
+    stopped, errors = [], []
+    for name in targets:
+        sname = sessions.get(name)
+        if not sname:
+            errors.append(f"{ticket}: no service named {name!r}")
+            continue
+        if _tmux_session_exists(sname):
+            subprocess.run(["tmux", "kill-session", "-t", sname],
+                           check=False, capture_output=True)
+        stopped.append(name)
+        sessions.pop(name, None)
+        urls.pop(name, None)
+
+    primary = next(iter(urls.values()), "")
+    session_set(ticket,
+                preview_urls=urls, preview_sessions=sessions,
+                preview_url=primary,
+                # Clear legacy fields
+                preview_session=None, preview_port=None)
+    return stopped, errors
+
+
+def _post_preview_card(ticket, results):
+    """Post one info card summarizing all services that started for this ticket."""
+    running = [r for r in results if r["session"] and r["url"]]
+    if not running:
+        return
+    primary = running[0]["url"]
+    ctx_parts = []
+    for r in running:
+        try:
+            port = r["url"].rsplit(":", 1)[-1]
+        except Exception:
+            port = "?"
+        ctx_parts.append(f"{r['name']}→{port}")
+    sess = session_get(ticket) or {}
+    pr_url = sess.get("pr_url") or "(none)"
+    ctx = f"Services: {' · '.join(ctx_parts)} · PR {pr_url}"
+
+    actions = []
+    for r in running:
+        label = "Open preview" if r["name"] == "default" else f"Open {r['name']}"
+        actions.append({"label": label, "kind": "openUrl", "url": r["url"]})
+    actions.append({
+        "label": "Stop all" if len(running) > 1 else "Stop",
+        "kind": "inject",
+        "text": f"sos-flow-dev preview --stop {ticket}\n",
+        "execute": True,
+    })
+    post_card("info", f"Preview ready · {ticket}", ticket=ticket,
+              url=primary, ctx=ctx, actions=actions)
 
 
 def cmd_preview(args):
-    """Start, stop, or list preview servers for flow-dev tickets."""
+    """Start/stop/list preview dev-servers. Supports multiple services per ticket."""
     tickets = _resolve_preview_tickets(args)
+    selected_services = set(args.service) if args.service else None
 
     if args.list:
         r = subprocess.run(["tmux", "ls"], capture_output=True, text=True)
@@ -865,81 +1032,74 @@ def cmd_preview(args):
             return
         print("Running preview sessions:")
         for n in sorted(names):
-            t = n[len("preview-"):]
+            # preview-<TICKET>-<SERVICE>
+            tail = n[len("preview-"):]
+            parts = tail.rsplit("-", 1)
+            if len(parts) == 2:
+                t, svc = parts
+            else:
+                t, svc = tail, "default"
             sess = session_get(t) or {}
-            url = sess.get("preview_url") or "?"
-            print(f"  {n:<28}  {t:<12}  {url}")
+            url = (sess.get("preview_urls") or {}).get(svc) \
+                  or sess.get("preview_url") or "?"
+            print(f"  {n:<32}  {t:<12}  {svc:<12}  {url}")
         return
 
     if args.stop:
         if not tickets:
             fail("pass TICKET positional(s) or --all to select what to stop")
         for t in tickets:
-            ok, err = _stop_preview_for(t)
-            if ok:
-                check(f"stopped preview for {t}")
-            else:
-                print(f"✗ {t}: {err}", file=sys.stderr)
+            stopped, errors = _stop_preview_for(
+                t, list(selected_services) if selected_services else None)
+            for name in stopped:
+                check(f"stopped {t}/{name}")
+            for msg in errors:
+                print(f"✗ {msg}", file=sys.stderr)
         return
 
-    # Start
     if not tickets:
         fail("pass TICKET positional(s) or --all to start previews")
 
-    started = []
-    last_port = None
+    any_started = False
     for t in tickets:
-        cfg = _preview_config_for_ticket(t) or {}
-        command = args.command or cfg.get("command")
-        if not command:
-            print(f"✗ {t}: no preview.command — pass --command or set it in {t}'s "
-                  f"worktree .pm/config.json", file=sys.stderr)
-            continue
-        cwd = args.cwd if args.cwd is not None else (cfg.get("cwd") or "")
-
-        # Port selection: CLI --port wins. Else config. Else next-free after the
-        # previously-used port so multiple tickets in one call don't collide.
-        if args.port:
-            port = args.port + len(started)  # bump per-ticket when explicit base given
-        elif cfg.get("port"):
-            port = int(cfg["port"])
+        # Determine services to launch
+        if args.command:
+            # CLI override → single synthetic service
+            svc_name = (next(iter(selected_services))
+                        if selected_services else "default")
+            services = [{
+                "name": svc_name,
+                "command": args.command,
+                "cwd": args.cwd or "",
+                "port": args.port,
+            }]
         else:
-            start_search = (last_port + 1) if last_port else PREVIEW_PORT_MIN
-            try:
-                port = _next_free_port(start=start_search)
-            except RuntimeError as e:
-                print(f"✗ {t}: {e}", file=sys.stderr)
+            cfg = _preview_config_for_ticket(t)
+            services = _normalize_preview_config(cfg)
+            if selected_services:
+                services = [s for s in services if s["name"] in selected_services]
+            if not services:
+                print(f"✗ {t}: no preview services to start — add a `preview` "
+                      f"block to the worktree's .pm/config.json, or pass --command",
+                      file=sys.stderr)
                 continue
-        last_port = port
 
-        step(f"starting preview for {t} on port {port}")
-        session, err = _start_preview_for(t, command, cwd, port, wait=args.wait)
-        if session is None:
-            print(f"✗ {t}: {err}", file=sys.stderr)
-            continue
-        if err:
-            print(f"  ⚠ {err}", file=sys.stderr)
-        url = f"http://localhost:{port}"
-        check(f"{t}: {url}  (tmux attach -t {session})")
-        sess = session_get(t) or {}
-        pr_url = sess.get("pr_url") or None
-        post_card(
-            "info", f"Preview ready · {t}",
-            ticket=t, url=url,
-            ctx=(f"Port {port} · tmux attach -t {session} · PR "
-                 f"{pr_url if pr_url else '(none)'}"),
-            actions=[
-                {"label": "Open preview", "kind": "openUrl"},
-                {"label": "Stop",         "kind": "inject",
-                 "text": f"sos-flow-dev preview --stop {t}\n", "execute": True},
-            ],
-        )
-        started.append(t)
+        step(f"starting {len(services)} preview service(s) for {t}")
+        results = _start_preview_for(t, services, wait=args.wait)
+        for r in results:
+            if r["session"] is None:
+                print(f"  ✗ {r['name']}: {r['error']}", file=sys.stderr)
+            elif r["error"]:
+                print(f"  ⚠ {r['name']}: {r['error']}", file=sys.stderr)
+            else:
+                check(f"  {r['name']}: {r['url']}  (tmux: {r['session']})")
+        _post_preview_card(t, results)
+        if any(r["session"] and not r["error"] for r in results):
+            any_started = True
 
-    if started:
+    if any_started:
         print()
-        print(f"{len(started)} preview(s) running. "
-              f"Card posted to each ticket's section in the sidebar.")
+        print("Cards posted to each ticket's section in the sidebar.")
 
 
 PHASE_TO_LIVE_SESSION = {
@@ -1124,11 +1284,10 @@ def cmd_cleanup(args):
     wt = sess.get("worktree")
     parent = sess.get("parent_branch") or "main"
 
-    # Stop the preview first so the port is free for the next run.
-    if sess.get("preview_session") and _tmux_session_exists(sess["preview_session"]):
-        subprocess.run(["tmux", "kill-session", "-t", sess["preview_session"]],
-                       check=False, capture_output=True)
-        check(f"stopped preview session {sess['preview_session']}")
+    # Stop every preview service this ticket spawned so ports are freed.
+    stopped, _ = _stop_preview_for(ticket)
+    for name in stopped:
+        check(f"stopped preview {ticket}/{name}")
 
     if wt:
         if args.remove:
@@ -1236,12 +1395,16 @@ def main():
                    help="Stop the preview instead of starting it")
     p.add_argument("--list", action="store_true",
                    help="Show currently-running preview sessions")
+    p.add_argument("--service", action="append", default=[], metavar="NAME",
+                   help="Target specific named service (repeat for multiple). "
+                        "Default: start/stop ALL services defined in config.")
     p.add_argument("--command", default=None,
-                   help="Preview command (overrides .pm/config.json preview.command)")
+                   help="Preview command (overrides .pm/config.json preview.command). "
+                        "When passed, only one service is launched.")
     p.add_argument("--cwd", default=None,
                    help="Subdirectory (relative to worktree) to run preview from")
     p.add_argument("--port", type=int, default=None,
-                   help="Starting port (auto-bumps per ticket if multiple). "
+                   help="Starting port (auto-bumps if more needed). "
                         "Default: next free port in 6006–6099.")
     p.add_argument("--no-wait", dest="wait", action="store_false", default=True,
                    help="Don't block waiting for the port to come up")

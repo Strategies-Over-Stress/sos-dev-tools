@@ -678,21 +678,57 @@ class TestPreviewCommand(SessionBase):
         fd.session_set("FOO-1", worktree=str(Path(self._tmp)))
         self.assertIsNone(fd._preview_config_for_ticket("FOO-1"))
 
+    def test_normalize_legacy_config(self):
+        cfg = {"command": "npm run storybook", "cwd": "packages/ui", "port": 6006}
+        svcs = fd._normalize_preview_config(cfg)
+        self.assertEqual(svcs, [{
+            "name": "default", "command": "npm run storybook",
+            "cwd": "packages/ui", "port": 6006,
+        }])
+
+    def test_normalize_multi_service_config(self):
+        cfg = {"services": [
+            {"name": "app", "command": "npm run dev", "cwd": "apps/web", "port": 3000},
+            {"name": "Storybook", "command": "npm run storybook",
+             "cwd": "packages/ui", "port": 6006},
+        ]}
+        svcs = fd._normalize_preview_config(cfg)
+        self.assertEqual(len(svcs), 2)
+        self.assertEqual(svcs[0]["name"], "app")
+        self.assertEqual(svcs[1]["name"], "storybook")  # lower-cased
+        self.assertEqual(svcs[1]["port"], 6006)
+
+    def test_normalize_drops_services_without_command(self):
+        cfg = {"services": [
+            {"name": "bad"},  # no command
+            {"name": "ok", "command": "npm run dev"},
+        ]}
+        svcs = fd._normalize_preview_config(cfg)
+        self.assertEqual(len(svcs), 1)
+        self.assertEqual(svcs[0]["name"], "ok")
+
+    def test_normalize_empty(self):
+        self.assertEqual(fd._normalize_preview_config(None), [])
+        self.assertEqual(fd._normalize_preview_config({}), [])
+
     def test_start_preview_no_worktree_errors(self):
         fd.session_set("FOO-1", phase="awaiting-qa")
-        session, err = fd._start_preview_for("FOO-1", "npm run dev", "", 6006, wait=False)
-        self.assertIsNone(session)
-        self.assertIn("no worktree", err)
+        results = fd._start_preview_for(
+            "FOO-1", [{"name": "default", "command": "npm run dev",
+                       "cwd": "", "port": 6006}], wait=False)
+        self.assertEqual(len(results), 1)
+        self.assertIsNone(results[0]["session"])
+        self.assertIn("no worktree", results[0]["error"])
 
     def test_start_preview_port_already_bound(self):
         wt = Path(self._tmp) / "wt-1"
         wt.mkdir()
         fd.session_set("FOO-1", worktree=str(wt))
         with patch.object(fd, "_port_reachable", return_value=True):
-            session, err = fd._start_preview_for("FOO-1", "npm run dev", "",
-                                                 6006, wait=False)
-        self.assertIsNone(session)
-        self.assertIn("already in use", err)
+            results = fd._start_preview_for(
+                "FOO-1", [{"name": "default", "command": "npm run dev",
+                           "cwd": "", "port": 6006}], wait=False)
+        self.assertIn("already in use", results[0]["error"])
 
     def test_start_preview_spawns_tmux(self):
         wt = Path(self._tmp) / "wt-1"
@@ -702,46 +738,98 @@ class TestPreviewCommand(SessionBase):
              patch.object(fd, "_tmux_session_exists", return_value=False), \
              patch.object(fd.subprocess, "run",
                           return_value=MagicMock(returncode=0, stderr="")):
-            session, err = fd._start_preview_for("FOO-1", "npm run dev",
-                                                 "", 6006, wait=False)
-        self.assertEqual(session, "preview-FOO-1")
-        self.assertIsNone(err)
-        # Session state updated with URL/port/session name
+            results = fd._start_preview_for(
+                "FOO-1",
+                [{"name": "default", "command": "npm run dev",
+                  "cwd": "", "port": 6006}],
+                wait=False)
+        r = results[0]
+        self.assertEqual(r["session"], "preview-FOO-1-default")
+        self.assertEqual(r["url"], "http://localhost:6006")
+        self.assertIsNone(r["error"])
+        # Dict-form session state
+        self.assertEqual(fd.session_get("FOO-1", "preview_urls"),
+                         {"default": "http://localhost:6006"})
+        self.assertEqual(fd.session_get("FOO-1", "preview_sessions"),
+                         {"default": "preview-FOO-1-default"})
+        # Primary preview_url mirrors default
         self.assertEqual(fd.session_get("FOO-1", "preview_url"),
                          "http://localhost:6006")
-        self.assertEqual(fd.session_get("FOO-1", "preview_port"), 6006)
 
-    def test_start_preview_already_running(self):
+    def test_start_preview_multi_service(self):
         wt = Path(self._tmp) / "wt-1"
         wt.mkdir()
-        fd.session_set("FOO-1", worktree=str(wt),
-                       preview_session="preview-FOO-1")
-        with patch.object(fd, "_tmux_session_exists", return_value=True):
-            session, err = fd._start_preview_for("FOO-1", "npm run dev",
-                                                 "", 6006, wait=False)
-        self.assertEqual(session, "preview-FOO-1")
-        self.assertIn("already running", err)
+        fd.session_set("FOO-1", worktree=str(wt))
+        services = [
+            {"name": "app",       "command": "npm run dev",       "cwd": "", "port": 3000},
+            {"name": "storybook", "command": "npm run storybook", "cwd": "", "port": 6006},
+        ]
+        with patch.object(fd, "_port_reachable", return_value=False), \
+             patch.object(fd, "_tmux_session_exists", return_value=False), \
+             patch.object(fd.subprocess, "run",
+                          return_value=MagicMock(returncode=0, stderr="")):
+            results = fd._start_preview_for("FOO-1", services, wait=False)
+        self.assertEqual(len(results), 2)
+        names = {r["name"] for r in results}
+        self.assertEqual(names, {"app", "storybook"})
+        urls = fd.session_get("FOO-1", "preview_urls")
+        self.assertEqual(urls["app"], "http://localhost:3000")
+        self.assertEqual(urls["storybook"], "http://localhost:6006")
+        sessions = fd.session_get("FOO-1", "preview_sessions")
+        self.assertEqual(sessions["app"], "preview-FOO-1-app")
+        self.assertEqual(sessions["storybook"], "preview-FOO-1-storybook")
 
-    def test_stop_preview_kills_session(self):
-        fd.session_set("FOO-1", preview_session="preview-FOO-1",
-                       preview_url="http://localhost:6006")
+    def test_stop_preview_all(self):
+        fd.session_set("FOO-1",
+                       preview_urls={"app": "http://localhost:3000",
+                                     "storybook": "http://localhost:6006"},
+                       preview_sessions={"app": "preview-FOO-1-app",
+                                         "storybook": "preview-FOO-1-storybook"})
         with patch.object(fd, "_tmux_session_exists", return_value=True), \
              patch.object(fd.subprocess, "run") as mock_run:
-            ok, err = fd._stop_preview_for("FOO-1")
-        self.assertTrue(ok)
-        mock_run.assert_called_with(
-            ["tmux", "kill-session", "-t", "preview-FOO-1"],
-            check=False, capture_output=True)
+            stopped, errors = fd._stop_preview_for("FOO-1")
+        self.assertEqual(sorted(stopped), ["app", "storybook"])
+        self.assertEqual(errors, [])
         # State cleaned up
-        self.assertEqual(fd.session_get("FOO-1", "preview_url"), "")
-        self.assertIsNone(fd.session_get("FOO-1", "preview_port"))
+        self.assertEqual(fd.session_get("FOO-1", "preview_urls"), {})
+        self.assertEqual(fd.session_get("FOO-1", "preview_sessions"), {})
+        # Both tmux kills invoked
+        killed = [c.args[0] for c in mock_run.call_args_list
+                  if "kill-session" in c.args[0]]
+        self.assertEqual(len(killed), 2)
 
-    def test_stop_preview_no_session(self):
+    def test_stop_preview_specific_service(self):
+        fd.session_set("FOO-1",
+                       preview_urls={"app": "http://localhost:3000",
+                                     "storybook": "http://localhost:6006"},
+                       preview_sessions={"app": "preview-FOO-1-app",
+                                         "storybook": "preview-FOO-1-storybook"})
+        with patch.object(fd, "_tmux_session_exists", return_value=True), \
+             patch.object(fd.subprocess, "run"):
+            stopped, errors = fd._stop_preview_for("FOO-1", ["app"])
+        self.assertEqual(stopped, ["app"])
+        # storybook survives
+        self.assertEqual(fd.session_get("FOO-1", "preview_sessions"),
+                         {"storybook": "preview-FOO-1-storybook"})
+        self.assertEqual(fd.session_get("FOO-1", "preview_urls"),
+                         {"storybook": "http://localhost:6006"})
+
+    def test_stop_preview_migrates_legacy_state(self):
+        # Legacy single-URL state should be understood and stopped.
+        fd.session_set("FOO-1",
+                       preview_url="http://localhost:6006",
+                       preview_session="preview-FOO-1")
+        with patch.object(fd, "_tmux_session_exists", return_value=True), \
+             patch.object(fd.subprocess, "run"):
+            stopped, errors = fd._stop_preview_for("FOO-1")
+        self.assertEqual(stopped, ["default"])
+        self.assertEqual(errors, [])
+
+    def test_stop_preview_no_sessions(self):
         fd.session_set("FOO-1", phase="merged")
-        with patch.object(fd, "_tmux_session_exists", return_value=False):
-            ok, err = fd._stop_preview_for("FOO-1")
-        self.assertFalse(ok)
-        self.assertIn("no preview session", err)
+        stopped, errors = fd._stop_preview_for("FOO-1")
+        self.assertEqual(stopped, [])
+        self.assertIn("no preview sessions", errors[0])
 
 
 class TestWatchRendering(SessionBase):
