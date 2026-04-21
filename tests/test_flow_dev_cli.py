@@ -174,10 +174,25 @@ class TestCmdStartHappyPath(SessionBase):
         }))
         self.addCleanup(lambda: f.unlink() if f.exists() else None)
 
+    def _stub_alloc(self, ticket, worktree_path, parent="main"):
+        """Patch phase_worktree_alloc so cmd_start doesn't actually alloc."""
+        patcher = patch.object(fd, "phase_worktree_alloc", return_value={
+            "worktree": str(worktree_path),
+            "parent_branch": parent,
+            "action": "reused",
+            "reason": "test stub",
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # Also patch os.chdir so we don't actually change CWD mid-test.
+        chdir_patch = patch.object(fd.os, "chdir")
+        chdir_patch.start()
+        self.addCleanup(chdir_patch.stop)
+
     def test_approve_verdict_skips_work2(self):
         self._stub_pm_complete("FOO-1")
+        self._stub_alloc("FOO-1", Path(self._tmp))
 
-        # Mock every side-effect
         with patch.object(fd, "phase_pm_start") as pm, \
              patch.object(fd, "phase_review") as review, \
              patch.object(fd, "phase_work2") as work2, \
@@ -190,17 +205,18 @@ class TestCmdStartHappyPath(SessionBase):
                 "worktree": "repo",
             }
             review.return_value = {"comments": 0, "verdict": "approve"}
-            fd.cmd_start(args_ns(ticket="FOO-1", pause_after=None))
+            fd.cmd_start(args_ns(ticket="FOO-1", pause_after=None, base=None))
 
             pm.assert_called_once_with("FOO-1")
             review.assert_called_once()
-            work2.assert_not_called()  # verdict=approve → skip
+            work2.assert_not_called()
 
-        # Session ended at awaiting-qa
         self.assertEqual(fd.session_get("FOO-1", "phase"), "awaiting-qa")
         self.assertEqual(fd.session_get("FOO-1", "review_verdict"), "approve")
+        # Phase 0 result persisted
+        self.assertEqual(fd.session_get("FOO-1", "worktree"), str(Path(self._tmp)))
+        self.assertEqual(fd.session_get("FOO-1", "parent_branch"), "main")
 
-        # Three cards posted: PR opened, Review posted, Ready for QA
         self.assertEqual(post.call_count, 3)
         kinds = [c.args[0] for c in post.call_args_list]
         titles = [c.args[1] for c in post.call_args_list]
@@ -209,6 +225,7 @@ class TestCmdStartHappyPath(SessionBase):
 
     def test_changes_requested_runs_work2(self):
         self._stub_pm_complete("FOO-1")
+        self._stub_alloc("FOO-1", Path(self._tmp))
 
         with patch.object(fd, "phase_pm_start") as pm, \
              patch.object(fd, "phase_review") as review, \
@@ -223,16 +240,16 @@ class TestCmdStartHappyPath(SessionBase):
             review.return_value = {"comments": 4, "verdict": "changes-requested"}
             work2.return_value = {"ready": True, "url": "http://localhost:6006"}
 
-            fd.cmd_start(args_ns(ticket="FOO-1", pause_after=None))
+            fd.cmd_start(args_ns(ticket="FOO-1", pause_after=None, base=None))
             work2.assert_called_once_with("FOO-1", "42", 4)
 
-        # preview_url in session was updated from work-2's output
         self.assertEqual(fd.session_get("FOO-1", "preview_url"),
                          "http://localhost:6006")
         self.assertEqual(fd.session_get("FOO-1", "phase"), "awaiting-qa")
 
     def test_work2_failure_exits_and_posts_action_card(self):
         self._stub_pm_complete("FOO-1")
+        self._stub_alloc("FOO-1", Path(self._tmp))
 
         with patch.object(fd, "phase_pm_start") as pm, \
              patch.object(fd, "phase_review") as review, \
@@ -245,12 +262,31 @@ class TestCmdStartHappyPath(SessionBase):
             work2.return_value = {"failed": "tests red after fix"}
 
             with self.assertRaises(SystemExit) as cm:
-                fd.cmd_start(args_ns(ticket="FOO-1", pause_after=None))
+                fd.cmd_start(args_ns(ticket="FOO-1", pause_after=None, base=None))
             self.assertNotEqual(cm.exception.code, 0)
 
-            # An action card was posted announcing the failure
             titles = [c.args[1] for c in post.call_args_list]
             self.assertTrue(any("Work 2 failed" in t for t in titles))
+
+    def test_base_flag_passed_to_allocator(self):
+        self._stub_pm_complete("FOO-1")
+        with patch.object(fd, "phase_worktree_alloc",
+                          return_value={"worktree": str(Path(self._tmp)),
+                                         "parent_branch": "sbook/epic",
+                                         "action": "reused",
+                                         "reason": ""}) as alloc, \
+             patch.object(fd.os, "chdir"), \
+             patch.object(fd, "phase_pm_start",
+                          return_value={"pr_url": "https://x/pull/1",
+                                         "preview_url": "", "worktree": "x"}), \
+             patch.object(fd, "phase_review",
+                          return_value={"comments": 0, "verdict": "approve"}), \
+             patch.object(fd, "post_card", return_value="id"), \
+             patch.object(fd, "worktree_root", return_value=Path(self._tmp)):
+            fd.cmd_start(args_ns(ticket="FOO-1", pause_after=None,
+                                 base="sbook/epic"))
+            alloc.assert_called_once_with("FOO-1", hint_base="sbook/epic")
+        self.assertEqual(fd.session_get("FOO-1", "parent_branch"), "sbook/epic")
 
 
 class TestCmdStartGating(SessionBase):
@@ -264,7 +300,12 @@ class TestCmdStartGating(SessionBase):
 
     def test_pause_after_work1_gates(self):
         self._stub_pm_complete("FOO-1")
-        with patch.object(fd, "phase_pm_start",
+        with patch.object(fd, "phase_worktree_alloc",
+                          return_value={"worktree": str(Path(self._tmp)),
+                                         "parent_branch": "main",
+                                         "action": "reused", "reason": ""}), \
+             patch.object(fd.os, "chdir"), \
+             patch.object(fd, "phase_pm_start",
                           return_value={"pr_url": "https://x/pull/1",
                                          "preview_url": "", "worktree": "x"}), \
              patch.object(fd, "phase_review",
@@ -272,14 +313,18 @@ class TestCmdStartGating(SessionBase):
              patch.object(fd, "post_card", return_value="card_abc"), \
              patch.object(fd, "prompt_user", return_value="continue") as gate_prompt, \
              patch.object(fd, "worktree_root", return_value=Path(self._tmp)):
-            fd.cmd_start(args_ns(ticket="FOO-1", pause_after="work1"))
+            fd.cmd_start(args_ns(ticket="FOO-1", pause_after="work1", base=None))
             gate_prompt.assert_called_once()
-            # Gate question includes the phase name
             self.assertIn("Work 1 done", gate_prompt.call_args[0][0])
 
     def test_pause_after_work1_abort_exits(self):
         self._stub_pm_complete("FOO-1")
-        with patch.object(fd, "phase_pm_start",
+        with patch.object(fd, "phase_worktree_alloc",
+                          return_value={"worktree": str(Path(self._tmp)),
+                                         "parent_branch": "main",
+                                         "action": "reused", "reason": ""}), \
+             patch.object(fd.os, "chdir"), \
+             patch.object(fd, "phase_pm_start",
                           return_value={"pr_url": "https://x/pull/1",
                                          "preview_url": "", "worktree": "x"}), \
              patch.object(fd, "phase_review") as review, \
@@ -287,8 +332,8 @@ class TestCmdStartGating(SessionBase):
              patch.object(fd, "prompt_user", return_value="abort"), \
              patch.object(fd, "worktree_root", return_value=Path(self._tmp)):
             with self.assertRaises(SystemExit):
-                fd.cmd_start(args_ns(ticket="FOO-1", pause_after="work1"))
-            review.assert_not_called()  # abort short-circuits
+                fd.cmd_start(args_ns(ticket="FOO-1", pause_after="work1", base=None))
+            review.assert_not_called()
 
 
 class TestCmdStatus(SessionBase):
@@ -322,27 +367,147 @@ class TestCmdStatus(SessionBase):
 
 
 class TestCmdCleanup(SessionBase):
-    def test_rm_session_and_tmp(self):
-        fd.session_set("FOO-1", phase="merged", worktree="/does/not/exist")
+    """cleanup default resets the worktree for reuse; --remove destroys it."""
+
+    def _make_fake_worktree(self, name="wt-1"):
+        wt = Path(self._tmp) / name
+        (wt / ".pm").mkdir(parents=True)
+        # These files should all be dropped by the reset path.
+        (wt / ".pm" / "active-ticket.json").write_text('{"status":"merged"}')
+        (wt / ".pm" / "work-summary.md").write_text("summary")
+        (wt / ".pm" / "review-result.json").write_text("{}")
+        (wt / ".pm" / "work-2-result.json").write_text("{}")
+        (wt / ".pm" / "failed.json").write_text("{}")
+        # This should survive (config carries the port assignment).
+        (wt / ".pm" / "config.json").write_text('{"preview":{"port":3001}}')
+        return wt
+
+    def test_default_resets_worktree_and_preserves_config(self):
+        wt = self._make_fake_worktree("wt-1")
+        fd.session_set("FOO-1", phase="merged", worktree=str(wt),
+                       parent_branch="main")
         marker = Path("/tmp/pm-complete-FOO-1.json")
         marker.write_text("{}")
         self.addCleanup(lambda: marker.unlink() if marker.exists() else None)
 
         with patch.object(fd.subprocess, "run") as mock_run:
-            fd.cmd_cleanup(args_ns(ticket="FOO-1"))
-            # git worktree remove was attempted
-            mock_run.assert_called_with(
-                ["git", "worktree", "remove", "--force", "/does/not/exist"],
-                check=False)
+            # Simulate git commands succeeding
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            fd.cmd_cleanup(args_ns(ticket="FOO-1", remove=False))
 
+            # Verify the git reset sequence was attempted
+            git_cmds = [c.args[0] for c in mock_run.call_args_list
+                        if len(c.args) and len(c.args[0]) >= 2 and c.args[0][0] == "git"]
+            # At minimum: fetch, switch, reset, clean
+            kinds = [(c[1] if c[1] != "-C" else c[3]) for c in git_cmds]
+            self.assertIn("fetch", kinds)
+            self.assertIn("switch", kinds)
+            self.assertIn("reset", kinds)
+            self.assertIn("clean", kinds)
+
+        # Ticket-scoped pm files were dropped
+        self.assertFalse((wt / ".pm" / "active-ticket.json").exists())
+        self.assertFalse((wt / ".pm" / "work-summary.md").exists())
+        self.assertFalse((wt / ".pm" / "review-result.json").exists())
+        self.assertFalse((wt / ".pm" / "failed.json").exists())
+        # Config preserved
+        self.assertTrue((wt / ".pm" / "config.json").exists())
+        # Session + marker gone
         self.assertIsNone(fd.session_get("FOO-1"))
         self.assertFalse(marker.exists())
 
+    def test_remove_flag_destroys_worktree(self):
+        wt = self._make_fake_worktree("wt-1")
+        fd.session_set("FOO-1", phase="merged", worktree=str(wt),
+                       parent_branch="main")
+
+        with patch.object(fd.subprocess, "run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            fd.cmd_cleanup(args_ns(ticket="FOO-1", remove=True))
+
+            # --remove goes through git worktree remove --force
+            calls = [c.args[0] for c in mock_run.call_args_list]
+            self.assertIn(
+                ["git", "worktree", "remove", "--force", str(wt)],
+                calls,
+            )
+            # No reset-for-reuse git commands
+            for c in calls:
+                self.assertNotIn("reset", c)
+
     def test_no_session_no_worktree_still_succeeds(self):
         with patch.object(fd.subprocess, "run") as mock_run:
-            # Should not raise
-            fd.cmd_cleanup(args_ns(ticket="NOPE-999"))
+            fd.cmd_cleanup(args_ns(ticket="NOPE-999", remove=False))
             mock_run.assert_not_called()
+
+
+class TestPhaseWorktreeAlloc(SessionBase):
+    """phase_worktree_alloc runs the subagent and reads the result file."""
+
+    def _result_file(self, ticket):
+        return Path(f"/tmp/flow-{ticket}-worktree.json")
+
+    def test_happy_path_returns_alloc_dict(self):
+        result = self._result_file("FOO-1")
+        result.write_text(json.dumps({
+            "worktree": self._tmp,
+            "parent_branch": "main",
+            "action": "created",
+            "reason": "no pool yet",
+        }))
+        self.addCleanup(lambda: result.unlink() if result.exists() else None)
+
+        with patch.object(fd, "run_subagent", return_value=0) as mock_run:
+            out = fd.phase_worktree_alloc("FOO-1")
+            mock_run.assert_called_once()
+            self.assertEqual(out["worktree"], self._tmp)
+            self.assertEqual(out["parent_branch"], "main")
+            self.assertEqual(out["action"], "created")
+
+    def test_hint_base_reaches_prompt(self):
+        result = self._result_file("FOO-1")
+        result.write_text(json.dumps({
+            "worktree": self._tmp, "parent_branch": "sbook/epic",
+            "action": "reused", "reason": "",
+        }))
+        self.addCleanup(lambda: result.unlink() if result.exists() else None)
+
+        with patch.object(fd, "run_subagent", return_value=0) as mock_run:
+            fd.phase_worktree_alloc("FOO-1", hint_base="sbook/epic")
+            prompt = mock_run.call_args[0][1]
+            self.assertIn("sbook/epic", prompt)
+            self.assertIn("--base", prompt)
+
+    def test_missing_result_file_exits(self):
+        with patch.object(fd, "run_subagent", return_value=0):
+            with self.assertRaises(SystemExit):
+                fd.phase_worktree_alloc("NOTA-999")
+
+    def test_subagent_reports_failed(self):
+        result = self._result_file("FOO-1")
+        result.write_text(json.dumps({"failed": "CWD is not a git repo"}))
+        self.addCleanup(lambda: result.unlink() if result.exists() else None)
+
+        with patch.object(fd, "run_subagent", return_value=0):
+            with self.assertRaises(SystemExit):
+                fd.phase_worktree_alloc("FOO-1")
+
+    def test_invalid_worktree_path_exits(self):
+        result = self._result_file("FOO-1")
+        result.write_text(json.dumps({
+            "worktree": "/does/not/exist",
+            "parent_branch": "main", "action": "created", "reason": "",
+        }))
+        self.addCleanup(lambda: result.unlink() if result.exists() else None)
+
+        with patch.object(fd, "run_subagent", return_value=0):
+            with self.assertRaises(SystemExit):
+                fd.phase_worktree_alloc("FOO-1")
+
+    def test_subagent_nonzero_exit_fails(self):
+        with patch.object(fd, "run_subagent", return_value=1):
+            with self.assertRaises(SystemExit):
+                fd.phase_worktree_alloc("FOO-1")
 
 
 class TestPmStartMissing(SessionBase):

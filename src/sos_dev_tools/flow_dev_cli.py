@@ -187,6 +187,97 @@ def _blocker_for(ticket):
     return BLOCKER_CONTRACT.replace("<TICKET>", ticket)
 
 
+def worktree_alloc_prompt(ticket, cwd, hint_base=None):
+    """Phase-0 subagent: decide where to do the work, write the answer to a file."""
+    base_hint = (
+        f"The user passed `--base {hint_base}` — use that as the parent branch "
+        f"unless you find a strong reason not to.\n"
+        if hint_base else
+        "No `--base` was supplied. Infer the parent from context: the branch "
+        "currently checked out in CWD, hints in `.pm/config.json` "
+        "(`git.default_base` or `git.branch_prefix`), or recent flow-dev "
+        "sessions at `$HOME/.ghostty-mini/sessions/*.json`. If you can't "
+        "resolve it confidently, ASK via `sos-inbox prompt`.\n"
+    )
+    return f"""You are allocating a git worktree for ticket {ticket}. The work
+happens in that worktree; the downstream phases (pm-start, Review, Work 2, QA)
+expect to run inside whatever directory you pick.
+
+CWD: {cwd}
+POOL DIR: {cwd}/claude/worktrees/  (may not exist yet)
+RESULT FILE: /tmp/flow-{ticket}-worktree.json  ← write your decision here
+
+{base_hint}
+## Steps
+
+1. **Inspect CWD.**
+   - Is it a git repo?  `git rev-parse --show-toplevel`  — if not, write
+     `{{"failed": "CWD is not a git repo"}}` to the result file and exit 0.
+   - Is CWD itself already a worktree (i.e., `git rev-parse --git-dir` returns
+     a path under `.git/worktrees/`)? If so, you can probably use CWD directly
+     unless it already has an active non-merged ticket.
+
+2. **Inspect the pool** at `{cwd}/claude/worktrees/`.
+   - If the directory doesn't exist, note that and skip to step 4 (create).
+   - For each subdirectory, use `git worktree list --porcelain` (run from CWD)
+     to confirm it's a registered worktree.
+   - For each worktree, determine AVAILABILITY. A worktree is AVAILABLE if:
+     * `.pm/active-ticket.json` is missing, OR
+     * its `status` is `"merged"`, OR
+     * its `completed_at` is older than 7 days (stale).
+
+3. **If an available pool worktree exists**, pick the lowest-numbered one
+   (e.g. prefer `wt-1` over `wt-5`). Reset it for reuse:
+       git -C <wt> fetch origin <parent_branch>
+       git -C <wt> switch <parent_branch>
+       git -C <wt> reset --hard origin/<parent_branch>
+       git -C <wt> clean -fd
+       # Remove ticket-specific pm files but keep .pm/config.json intact
+       rm -f <wt>/.pm/active-ticket.json <wt>/.pm/work-summary.md \\
+             <wt>/.pm/dev-agent-instructions.md <wt>/.pm/*-result.json \\
+             <wt>/.pm/failed.json <wt>/.pm/preview.log
+   Then set `action: "reused"` in the result.
+
+4. **Otherwise, create a new worktree.**
+   - Ensure `{cwd}/claude/worktrees/` exists (`mkdir -p`).
+   - Pick the lowest unused integer N for `wt-N` (scan existing pool).
+   - Create:  `git -C {cwd} worktree add claude/worktrees/wt-N <parent_branch>`
+   - If CWD has a `.pm/config.json`, copy it into the new worktree's `.pm/` dir.
+     Then bump `preview.port` by (N — the new worktree's index) so each pool
+     entry has a unique port. If no config.json exists in CWD, skip this step
+     (flow will fall through to "no preview" per pm-start's handling).
+   - Set `action: "created"`.
+
+5. **Write the result file** at `/tmp/flow-{ticket}-worktree.json`:
+   ```json
+   {{
+     "worktree": "<absolute path to the chosen worktree>",
+     "parent_branch": "<branch name>",
+     "action": "reused" | "created",
+     "reason": "<one-sentence rationale>",
+     "preview_port": <int or null>
+   }}
+   ```
+   Exit 0 after writing.
+
+## When to use the inbox
+
+If you hit genuine ambiguity — especially around parent branch when it's not
+obvious — ask the human via `sos-inbox prompt`. Examples:
+
+- CWD has no clear parent (detached HEAD, or on a non-standard branch).
+- You found both `main` and `sbook/epic` as plausible parents and the ticket
+  key doesn't hint either way.
+- An existing worktree's state is confusing (has a branch checked out but no
+  active-ticket.json — was work done manually?).
+
+Never guess silently on the parent branch. Cost of asking: 30 seconds. Cost
+of forking from the wrong branch: hours of rework downstream.
+
+{_blocker_for(ticket)}
+"""
+
+
 def review_prompt(ticket, pr_num):
     return f"""You are a senior code reviewer. Review PR #{pr_num} in this repo.
 
@@ -264,8 +355,33 @@ def work3_prompt(ticket, pr_num, reason):
 
 # ─── Phase runners (the mechanical parts) ──────────────────────────────────
 
+def phase_worktree_alloc(ticket, hint_base=None):
+    """Phase 0 — AI subagent picks or creates a worktree; return its path + parent.
+
+    Writes /tmp/flow-<TICKET>-worktree.json with {worktree, parent_branch,
+    action, reason, preview_port}.
+    """
+    step(f"Phase 0/5 — allocating worktree for {ticket}")
+    cwd = os.getcwd()
+    prompt = worktree_alloc_prompt(ticket, cwd, hint_base)
+    rc = run_subagent(f"flow-{ticket}-alloc", prompt)
+    if rc != 0:
+        fail(f"worktree-alloc subagent exited {rc}")
+    result_file = Path(f"/tmp/flow-{ticket}-worktree.json")
+    if not result_file.exists():
+        fail(f"worktree-alloc did not write {result_file} — "
+             f"check `tmux attach -t flow-{ticket}-alloc` for last state")
+    data = json.loads(result_file.read_text())
+    if "failed" in data:
+        fail(f"worktree-alloc failed: {data['failed']}")
+    wt = data.get("worktree")
+    if not wt or not Path(wt).is_dir():
+        fail(f"worktree-alloc reported invalid path: {wt}")
+    return data  # {worktree, parent_branch, action, reason, preview_port?}
+
+
 def phase_pm_start(ticket):
-    step(f"Phase 1/4 — pm-start {ticket}")
+    step(f"Phase 1/5 — pm-start {ticket}")
     if not PM_START_SKILL.exists():
         fail(f"pm-start skill not found at {PM_START_SKILL}")
     body = PM_START_SKILL.read_text() + f"\n\n{ticket} first-pass\n"
@@ -276,7 +392,7 @@ def phase_pm_start(ticket):
 
 
 def phase_review(ticket, pr_num):
-    step(f"Phase 2/4 — review PR #{pr_num}")
+    step(f"Phase 2/5 — review PR #{pr_num}")
     rc = run_subagent(f"flow-{ticket}-review", review_prompt(ticket, pr_num))
     if rc != 0:
         fail(f"review subagent exited {rc}")
@@ -287,7 +403,7 @@ def phase_review(ticket, pr_num):
 
 
 def phase_work2(ticket, pr_num, comments_n):
-    step(f"Phase 3/4 — address {comments_n} review comments")
+    step(f"Phase 3/5 — address {comments_n} review comments")
     rc = run_subagent(f"flow-{ticket}-work2", work2_prompt(ticket, pr_num, comments_n))
     if rc != 0:
         fail(f"work-2 subagent exited {rc}")
@@ -298,7 +414,7 @@ def phase_work2(ticket, pr_num, comments_n):
 
 
 def phase_work3(ticket, pr_num, reason):
-    step(f"Phase 3/4 (re-QA) — address reviewer feedback")
+    step(f"Phase 3/5 (re-QA) — address reviewer feedback")
     rc = run_subagent(f"flow-{ticket}-work3", work3_prompt(ticket, pr_num, reason))
     if rc != 0:
         fail(f"work-3 subagent exited {rc}")
@@ -341,16 +457,27 @@ def gate(ticket, question):
 
 def cmd_start(args):
     ticket = args.ticket
-    session_set(ticket, phase="work-1", started_at=now_iso())
+    session_set(ticket, phase="alloc", started_at=now_iso())
+
+    # Phase 0 — AI-driven worktree allocation
+    alloc = phase_worktree_alloc(ticket, hint_base=args.base)
+    wt_path = alloc["worktree"]
+    parent_branch = alloc.get("parent_branch") or ""
+    action = alloc.get("action") or "unknown"
+    os.chdir(wt_path)
+    session_set(ticket, worktree=wt_path, parent_branch=parent_branch,
+                worktree_action=action, phase="work-1")
+    check(f"worktree {action}: {wt_path} (parent: {parent_branch})")
 
     # Phase 1 — pm-start
     pm = phase_pm_start(ticket)
     pr_url = pm.get("pr_url") or ""
     preview_url = pm.get("preview_url") or ""
     pr_num = extract_pr_num(pr_url)
-    session_set(ticket,
-                pr_url=pr_url, pr_num=pr_num, preview_url=preview_url,
-                worktree=pm.get("worktree"), phase="review")
+    # Note: pm.worktree is just the basename pm-start observed; Phase 0's
+    # full path is already on the session and authoritative. Don't overwrite.
+    session_set(ticket, pr_url=pr_url, pr_num=pr_num,
+                preview_url=preview_url, phase="review")
     post_card(
         "info", f"PR #{pr_num} opened" if pr_num else "Work 1 complete",
         ticket=ticket, url=pr_url or None,
@@ -386,7 +513,7 @@ def cmd_start(args):
             gate(ticket, "Work 2 done — continue to QA card?")
 
     # Phase 4 — QA card
-    step("Phase 4/4 — post QA gate")
+    step("Phase 4/5 — post QA gate")
     card_id = post_card(
         "action", "Ready for QA",
         ticket=ticket, url=preview_url or pr_url or None,
@@ -492,18 +619,75 @@ def cmd_status(args):
         print(f"{t}  phase={phase:<14}  pr={pr}  preview={preview}")
 
 
+PM_STATE_FILES_TO_DROP = [
+    "active-ticket.json", "work-summary.md", "dev-agent-instructions.md",
+    "review-result.json", "work-2-result.json", "work-3-result.json",
+    "failed.json", "preview.log", "summary.md",
+]
+
+
+def _reset_worktree_for_reuse(wt, parent):
+    """Put a worktree back into 'available in the pool' state.
+
+    Preserves: .pm/config.json (port assignment), node_modules, build caches.
+    Drops: ticket-scoped .pm/ files, uncommitted changes.
+    """
+    wt_path = Path(wt)
+    if not wt_path.is_dir():
+        fail(f"worktree path {wt} not found — already cleaned up?")
+    step(f"resetting {wt} to {parent} for reuse")
+    try:
+        subprocess.run(["git", "-C", wt, "fetch", "origin", parent],
+                       check=False, capture_output=True)
+        subprocess.run(["git", "-C", wt, "switch", parent], check=True)
+        # Prefer origin/<parent>; fall back to local if origin doesn't have it.
+        try:
+            subprocess.run(["git", "-C", wt, "reset", "--hard", f"origin/{parent}"],
+                           check=True, capture_output=True)
+        except subprocess.CalledProcessError:
+            subprocess.run(["git", "-C", wt, "reset", "--hard", parent], check=True)
+        subprocess.run(["git", "-C", wt, "clean", "-fd"], check=False)
+    except subprocess.CalledProcessError as e:
+        fail(f"git reset failed during cleanup: {e}")
+    pm_dir = wt_path / ".pm"
+    if pm_dir.is_dir():
+        for name in PM_STATE_FILES_TO_DROP:
+            p = pm_dir / name
+            if p.exists():
+                try: p.unlink()
+                except OSError: pass
+    check(f"worktree {wt_path.name} reset — available for reuse")
+
+
+def _remove_worktree(wt):
+    step(f"removing worktree {wt}")
+    r = subprocess.run(["git", "worktree", "remove", "--force", wt], check=False,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"  git worktree remove warning: {r.stderr.strip()}", file=sys.stderr)
+
+
 def cmd_cleanup(args):
     ticket = args.ticket
     sess = session_get(ticket) or {}
     wt = sess.get("worktree")
+    parent = sess.get("parent_branch") or "main"
+
     if wt:
-        step(f"removing worktree {wt}")
-        subprocess.run(["git", "worktree", "remove", "--force", wt], check=False)
+        if args.remove:
+            _remove_worktree(wt)
+        else:
+            _reset_worktree_for_reuse(wt, parent)
+
     session_rm(ticket)
-    # Remove transient files.
+
+    # Transient per-ticket files.
     pm_complete = Path(f"/tmp/pm-complete-{ticket}.json")
     if pm_complete.exists():
         pm_complete.unlink()
+    alloc = Path(f"/tmp/flow-{ticket}-worktree.json")
+    if alloc.exists():
+        alloc.unlink()
     for p in _glob.glob(f"/tmp/sos-flow-dev-flow-{ticket}-*"):
         try: os.unlink(p)
         except OSError: pass
@@ -523,8 +707,11 @@ def main():
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("start", help="Full workflow: Work 1 → Review → Work 2 → QA card")
+    p = sub.add_parser("start", help="Full workflow: allocate worktree → Work 1 → Review → Work 2 → QA card")
     p.add_argument("ticket")
+    p.add_argument("--base", default=None,
+                   help="Hint to the worktree-alloc subagent about the parent branch (e.g. 'sbook/epic'). "
+                        "If omitted, the subagent infers from context and asks via sos-inbox prompt if ambiguous.")
     p.add_argument("--pause-after", choices=["work1", "review", "work2"], default=None,
                    help="Post a gate card after the named phase; requires a reply to continue")
 
@@ -546,8 +733,14 @@ def main():
     p = sub.add_parser("status", help="Show session state (all tickets or one)")
     p.add_argument("ticket", nargs="?", default=None)
 
-    p = sub.add_parser("cleanup", help="Remove worktree, session state, tmp files")
+    p = sub.add_parser(
+        "cleanup",
+        help="Reset the ticket's worktree for reuse (default) or remove it outright",
+    )
     p.add_argument("ticket")
+    p.add_argument("--remove", action="store_true",
+                   help="Destroy the worktree (git worktree remove --force) instead of "
+                        "resetting it for reuse. Use when you want to shrink the pool.")
 
     args = parser.parse_args()
 
