@@ -979,6 +979,88 @@ class TestPreviewCommand(SessionBase):
         self.assertIn("no preview sessions", errors[0])
 
 
+class TestResync(SessionBase):
+    """resync re-posts flow-dev cards from session state, idempotently."""
+
+    def test_resync_awaiting_qa_posts_three_cards(self):
+        fd.session_set("FOO-1",
+                       phase="awaiting-qa",
+                       pr_url="https://x/pull/42", pr_num="42",
+                       preview_url="",
+                       review_verdict="approve", review_comments=0)
+        with patch.object(fd, "_existing_card_titles", return_value=set()), \
+             patch.object(fd, "post_card", return_value="card_x") as mock_post:
+            n = fd._resync_cards_for("FOO-1")
+        self.assertEqual(n, 3)
+        titles = [c.args[1] for c in mock_post.call_args_list]
+        self.assertEqual(titles, [
+            "PR #42 opened",
+            "Review posted — 0 comments",
+            "Ready for QA",
+        ])
+
+    def test_resync_skips_existing_cards(self):
+        fd.session_set("FOO-1",
+                       phase="awaiting-qa",
+                       pr_url="https://x/pull/42", pr_num="42",
+                       preview_url="",
+                       review_verdict="changes-requested", review_comments=3)
+        # "PR #42 opened" already in inbox → skip it
+        with patch.object(fd, "_existing_card_titles",
+                          return_value={"PR #42 opened"}), \
+             patch.object(fd, "post_card", return_value="card_x") as mock_post:
+            n = fd._resync_cards_for("FOO-1")
+        self.assertEqual(n, 2)
+        titles = [c.args[1] for c in mock_post.call_args_list]
+        self.assertNotIn("PR #42 opened", titles)
+        self.assertIn("Review posted — 3 comments", titles)
+        self.assertIn("Ready for QA", titles)
+
+    def test_resync_merged_phase_posts_merged_card(self):
+        fd.session_set("FOO-1",
+                       phase="merged", pr_url="https://x/pull/42",
+                       pr_num="42", review_verdict="approve", review_comments=0)
+        with patch.object(fd, "_existing_card_titles", return_value=set()), \
+             patch.object(fd, "post_card", return_value="card_x") as mock_post:
+            fd._resync_cards_for("FOO-1")
+        titles = [c.args[1] for c in mock_post.call_args_list]
+        self.assertIn("Merged · FOO-1", titles)
+
+    def test_resync_early_phase_posts_nothing(self):
+        fd.session_set("FOO-1", phase="alloc", pr_num="")
+        with patch.object(fd, "_existing_card_titles", return_value=set()), \
+             patch.object(fd, "post_card") as mock_post:
+            n = fd._resync_cards_for("FOO-1")
+        self.assertEqual(n, 0)
+        mock_post.assert_not_called()
+
+    def test_resync_preview_cards_when_services_running(self):
+        fd.session_set("FOO-1",
+                       phase="awaiting-qa", pr_url="https://x/pull/42", pr_num="42",
+                       preview_urls={"app": "http://localhost:3001"},
+                       preview_sessions={"app": "preview-FOO-1-app"},
+                       review_verdict="approve", review_comments=0)
+        with patch.object(fd, "_existing_card_titles", return_value=set()), \
+             patch.object(fd, "_tmux_session_exists", return_value=True), \
+             patch.object(fd, "post_card", return_value="card_x") as mock_post:
+            fd._resync_cards_for("FOO-1")
+        titles = [c.args[1] for c in mock_post.call_args_list]
+        self.assertIn("Preview ready · FOO-1", titles)
+
+    def test_resync_skips_preview_cards_when_sessions_dead(self):
+        fd.session_set("FOO-1",
+                       phase="awaiting-qa", pr_url="https://x/pull/42", pr_num="42",
+                       preview_urls={"app": "http://localhost:3001"},
+                       preview_sessions={"app": "preview-FOO-1-app"},
+                       review_verdict="approve", review_comments=0)
+        with patch.object(fd, "_existing_card_titles", return_value=set()), \
+             patch.object(fd, "_tmux_session_exists", return_value=False), \
+             patch.object(fd, "post_card", return_value="card_x") as mock_post:
+            fd._resync_cards_for("FOO-1")
+        titles = [c.args[1] for c in mock_post.call_args_list]
+        self.assertNotIn("Preview ready · FOO-1", titles)
+
+
 class TestWatchRendering(SessionBase):
     """cmd_watch renders a table from session state and maps phase → live tmux name."""
 

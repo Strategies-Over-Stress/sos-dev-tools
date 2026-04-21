@@ -1296,6 +1296,118 @@ def cmd_watch(args):
         print("\n(detached — runs continue. `sos-flow-dev watch` to resume.)")
 
 
+def _existing_card_titles(ticket):
+    """Return the set of card titles currently in the inbox for this ticket."""
+    r = subprocess.run(
+        ["sos-inbox", "list", "--ticket", ticket, "--json"],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0 or not r.stdout:
+        return set()
+    try:
+        cards = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return set()
+    return {c.get("title", "") for c in cards if isinstance(c, dict)}
+
+
+def _resync_cards_for(ticket):
+    """Re-post the standard flow-dev cards for a ticket from session state.
+
+    Idempotent — a card whose title already exists for the ticket is skipped.
+    Returns the count of cards actually posted.
+    """
+    sess = session_get(ticket)
+    if not sess:
+        return 0
+    pr_url = sess.get("pr_url") or ""
+    pr_num = sess.get("pr_num") or ""
+    phase = sess.get("phase", "")
+    existing = _existing_card_titles(ticket)
+    posted = 0
+
+    def _maybe_post(kind, title, **kw):
+        nonlocal posted
+        if title in existing:
+            return
+        post_card(kind, title, ticket=ticket, **kw)
+        posted += 1
+
+    # 1. PR opened (info)
+    if pr_num and phase not in ("alloc", "work-1", ""):
+        preview_url = sess.get("preview_url") or ""
+        ctx = (f"Work 1 done · preview at {preview_url}" if preview_url
+               else "Work 1 done · no preview configured")
+        _maybe_post("info", f"PR #{pr_num} opened", url=pr_url, ctx=ctx)
+
+    # 2. Review posted (info)
+    verdict = sess.get("review_verdict")
+    comments = sess.get("review_comments")
+    if verdict is not None and comments is not None:
+        _maybe_post("info", f"Review posted — {comments} comments",
+                    url=pr_url or None, ctx=f"Verdict: {verdict}")
+
+    # 3. Phase-specific card
+    if phase == "awaiting-qa":
+        preview_url = sess.get("preview_url") or ""
+        ctx = (f"PR #{pr_num} · preview at {preview_url} · QA per PR description"
+               if preview_url
+               else f"PR #{pr_num} · see PR description for QA steps")
+        _maybe_post("action", "Ready for QA",
+                    url=(preview_url or pr_url or None),
+                    ctx=ctx,
+                    actions=qa_card_actions(ticket, pr_url, preview_url))
+    elif phase == "awaiting-qa-2":
+        preview_url = sess.get("preview_url") or ""
+        _maybe_post("action", f"Re-QA on {ticket}",
+                    url=(preview_url or pr_url or None),
+                    ctx=f"PR #{pr_num} · re-review after feedback",
+                    actions=qa_card_actions(ticket, pr_url, preview_url))
+    elif phase == "merged":
+        _maybe_post("info", f"Merged · {ticket}",
+                    url=pr_url or None, ctx="branch merged into parent")
+
+    # 4. Preview ready (info) — only if services are actually running
+    preview_urls = sess.get("preview_urls") or {}
+    preview_sessions = sess.get("preview_sessions") or {}
+    live_services = [
+        (name, url) for name, url in preview_urls.items()
+        if _tmux_session_exists(preview_sessions.get(name, ""))
+    ]
+    if live_services and f"Preview ready · {ticket}" not in existing:
+        fake_results = [
+            {"name": name, "session": preview_sessions.get(name, "?"),
+             "url": url, "error": None}
+            for name, url in live_services
+        ]
+        _post_preview_card(ticket, fake_results)
+        posted += 1
+
+    return posted
+
+
+def cmd_resync(args):
+    """Restore missing flow-dev cards for tickets by re-posting from session state."""
+    if args.tickets:
+        tickets = list(args.tickets)
+    elif args.all:
+        d = STATE_DIR / "sessions"
+        tickets = sorted(f.stem for f in d.glob("*.json")) if d.exists() else []
+    else:
+        fail("pass TICKET(s) or --all")
+
+    total = 0
+    for t in tickets:
+        n = _resync_cards_for(t)
+        if n:
+            check(f"{t}: posted {n} card(s)")
+            total += n
+        else:
+            print(f"  {t}: nothing to resync (no state or already in sync)",
+                  file=sys.stderr)
+    print(f"\n{total} card(s) restored.")
+
+
 def cmd_status(args):
     if args.ticket:
         sess = session_get(args.ticket)
@@ -1454,6 +1566,23 @@ def main():
     p.add_argument("ticket", nargs="?", default=None)
 
     p = sub.add_parser(
+        "resync",
+        help="Re-post the standard flow-dev cards for a ticket from session state",
+        description=(
+            "When cards get wiped (accidental `sos-inbox clear`, server "
+            "restart before persistence, etc), this reads session state and "
+            "re-posts whichever standard cards the ticket's phase warrants: "
+            "'PR #N opened', 'Review posted', the QA gate action card, "
+            "and any running preview cards. Idempotent — cards whose titles "
+            "already exist are skipped."
+        ),
+    )
+    p.add_argument("tickets", nargs="*",
+                   help="Specific tickets to restore (omit + use --all for every one)")
+    p.add_argument("--all", action="store_true",
+                   help="Restore cards for every ticket that has session state")
+
+    p = sub.add_parser(
         "watch",
         help="Live dashboard of active flow-dev sessions (updates in place; Ctrl+C to exit)",
     )
@@ -1516,6 +1645,7 @@ def main():
         "status": cmd_status,
         "watch": cmd_watch,
         "preview": cmd_preview,
+        "resync": cmd_resync,
         "cleanup": cmd_cleanup,
     }[args.subcommand](args)
 
