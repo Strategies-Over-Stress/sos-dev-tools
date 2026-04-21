@@ -20,6 +20,9 @@ Usage:
     sos-inbox list [--ticket FOO-123] [--json]
     sos-inbox remove CARD_ID
     sos-inbox clear  [--ticket FOO-123]
+    sos-inbox reply CARD_ID "text"       # append a reply to a card
+    sos-inbox replies CARD_ID [--json]   # list replies on a card
+    sos-inbox wait CARD_ID [--timeout SEC] [--since TS]  # block until a reply arrives
     sos-inbox status
 
 All network errors except HTTP 4xx/5xx silently no-op and exit 0 — a missing
@@ -31,12 +34,16 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
 
 DEFAULT_BASE = "http://localhost:3030"
 TIMEOUT_SECONDS = 2.0
+# Server caps a single long-poll at 5 minutes. `wait` loops under the hood
+# so callers can ask for longer total waits without blowing the per-request cap.
+SERVER_WAIT_CAP_MS = 290_000
 
 
 def inbox_base():
@@ -63,10 +70,10 @@ def _post(path, body):
         return None
 
 
-def _get(path):
+def _get(path, timeout=TIMEOUT_SECONDS):
     """GET JSON from the inbox. Returns parsed response, or None if unreachable."""
     try:
-        with urllib.request.urlopen(inbox_base() + path, timeout=TIMEOUT_SECONDS) as resp:
+        with urllib.request.urlopen(inbox_base() + path, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
@@ -183,6 +190,74 @@ def cmd_remove(args):
     print(f"removed {args.card_id}")
 
 
+def cmd_reply(args):
+    """Append a reply to a card."""
+    result = _post(f"/inbox/{args.card_id}/reply", {"text": args.text})
+    if result is None:
+        print("inbox unreachable", file=sys.stderr)
+        sys.exit(1)
+    # The card's broadcast handler prints success implicitly; echo the id.
+    print(f"replied to {args.card_id}")
+
+
+def cmd_replies(args):
+    """List the reply thread on a card."""
+    result = _get(f"/inbox/{args.card_id}/replies")
+    if result is None:
+        print("inbox unreachable", file=sys.stderr)
+        sys.exit(1)
+    replies = result.get("replies", [])
+    if args.json:
+        print(json.dumps(replies, indent=2))
+        return
+    if not replies:
+        print("(no replies)")
+        return
+    for r in replies:
+        ts = r.get("ts", 0)
+        # ISO8601 UTC for readability — same format sos-pm uses.
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts / 1000)) if ts else "?"
+        print(f"[{when}] {r.get('text', '')}")
+
+
+def cmd_wait(args):
+    """Block until a reply arrives on a card, print it, exit.
+
+    Total wait is the user-requested --timeout. Under the hood we issue
+    repeated long-polls that each stay under the server's 5-minute cap.
+    """
+    deadline = time.time() + args.timeout
+    since = args.since
+    while True:
+        remaining_s = deadline - time.time()
+        if remaining_s <= 0:
+            print("wait: timed out", file=sys.stderr)
+            sys.exit(2)
+        chunk_ms = min(int(remaining_s * 1000), SERVER_WAIT_CAP_MS)
+        # HTTP timeout slightly longer than server's so its timeout response can arrive.
+        http_timeout = (chunk_ms / 1000) + 5
+        path = f"/inbox/{args.card_id}/wait?since={since}&timeout_ms={chunk_ms}"
+        result = _get(path, timeout=http_timeout)
+        if result is None:
+            print("inbox unreachable", file=sys.stderr)
+            sys.exit(1)
+        if "reply" in result:
+            reply = result["reply"]
+            if args.json:
+                print(json.dumps(reply))
+            else:
+                print(reply.get("text", ""))
+            return
+        if result.get("timeout"):
+            # Bump `since` past now so we don't re-receive replies that arrived
+            # during the gap between polls (shouldn't happen but belt-and-suspenders).
+            since = int(time.time() * 1000)
+            continue
+        # Unknown shape — exit non-zero so the caller knows.
+        print(f"wait: unexpected response {result!r}", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_clear(args):
     """Clear all cards — or all cards in a ticket group."""
     if args.ticket:
@@ -253,6 +328,26 @@ def main():
     p.add_argument("--ticket", "-T", default=None,
                    help="Clear only this ticket group (otherwise: clear everything)")
 
+    p = sub.add_parser("reply", help="Append a reply to a card")
+    p.add_argument("card_id", help="Card id (e.g. card_abc123)")
+    p.add_argument("text", help="Reply text")
+
+    p = sub.add_parser("replies", help="List the reply thread on a card")
+    p.add_argument("card_id")
+    p.add_argument("--json", action="store_true", help="Output as JSON")
+
+    p = sub.add_parser(
+        "wait",
+        help="Block until a reply lands on a card; print the reply text to stdout",
+    )
+    p.add_argument("card_id")
+    p.add_argument("--timeout", type=int, default=3600,
+                   help="Maximum total wait in seconds (default: 3600)")
+    p.add_argument("--since", type=int, default=0,
+                   help="Only return replies newer than this ms-epoch timestamp")
+    p.add_argument("--json", action="store_true",
+                   help="Output the full reply object as JSON instead of just text")
+
     sub.add_parser("status", help="Show whether any browser tab is connected")
 
     args = parser.parse_args()
@@ -263,6 +358,9 @@ def main():
         "list": cmd_list,
         "remove": cmd_remove,
         "clear": cmd_clear,
+        "reply": cmd_reply,
+        "replies": cmd_replies,
+        "wait": cmd_wait,
         "status": cmd_status,
     }[args.command](args)
 

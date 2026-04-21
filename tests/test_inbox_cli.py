@@ -377,5 +377,113 @@ class TestCmdClear(unittest.TestCase):
         self.assertEqual(cm.exception.code, 1)
 
 
+class TestCmdReply(unittest.TestCase):
+    """cmd_reply POSTs text to /inbox/:id/reply."""
+
+    @patch.object(inbox_cli, "_post", return_value={"ok": True})
+    def test_posts_to_correct_endpoint(self, mock_post):
+        args = make_args(card_id="card_abc", text="it broke on Safari")
+        with patch("builtins.print") as mock_print:
+            inbox_cli.cmd_reply(args)
+        mock_post.assert_called_with("/inbox/card_abc/reply", {"text": "it broke on Safari"})
+        mock_print.assert_called_with("replied to card_abc")
+
+    @patch.object(inbox_cli, "_post", return_value=None)
+    def test_unreachable_exits(self, mock_post):
+        args = make_args(card_id="card_abc", text="hi")
+        with self.assertRaises(SystemExit) as cm:
+            with patch("builtins.print"):
+                inbox_cli.cmd_reply(args)
+        self.assertEqual(cm.exception.code, 1)
+
+
+class TestCmdReplies(unittest.TestCase):
+    """cmd_replies lists the reply thread on a card."""
+
+    SAMPLE = {"replies": [
+        {"text": "hello", "ts": 1700000000000},
+        {"text": "follow-up", "ts": 1700000060000},
+    ]}
+
+    @patch.object(inbox_cli, "_get", return_value=SAMPLE)
+    def test_text_output(self, mock_get):
+        args = make_args(card_id="card_abc", json=False)
+        with patch("builtins.print") as mock_print:
+            inbox_cli.cmd_replies(args)
+        lines = [c.args[0] for c in mock_print.call_args_list]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("hello", lines[0])
+        self.assertIn("follow-up", lines[1])
+
+    @patch.object(inbox_cli, "_get", return_value=SAMPLE)
+    def test_json_output(self, mock_get):
+        args = make_args(card_id="card_abc", json=True)
+        with patch("builtins.print") as mock_print:
+            inbox_cli.cmd_replies(args)
+        parsed = json.loads(mock_print.call_args[0][0])
+        self.assertEqual(parsed, self.SAMPLE["replies"])
+
+    @patch.object(inbox_cli, "_get", return_value={"replies": []})
+    def test_empty_thread_message(self, mock_get):
+        args = make_args(card_id="card_abc", json=False)
+        with patch("builtins.print") as mock_print:
+            inbox_cli.cmd_replies(args)
+        mock_print.assert_called_with("(no replies)")
+
+
+class TestCmdWait(unittest.TestCase):
+    """cmd_wait long-polls and returns the first reply."""
+
+    @patch.object(inbox_cli, "_get", return_value={"reply": {"text": "approved", "ts": 123}})
+    def test_immediate_reply(self, mock_get):
+        args = make_args(card_id="card_abc", timeout=60, since=0, json=False)
+        with patch("builtins.print") as mock_print:
+            inbox_cli.cmd_wait(args)
+        mock_print.assert_called_with("approved")
+        # Verify it built the correct URL path including since + timeout_ms.
+        called_path = mock_get.call_args[0][0]
+        self.assertIn("/inbox/card_abc/wait?since=0&timeout_ms=", called_path)
+
+    @patch.object(inbox_cli, "_get", return_value={"reply": {"text": "hi", "ts": 42}})
+    def test_json_output_prints_full_reply(self, mock_get):
+        args = make_args(card_id="card_abc", timeout=60, since=0, json=True)
+        with patch("builtins.print") as mock_print:
+            inbox_cli.cmd_wait(args)
+        parsed = json.loads(mock_print.call_args[0][0])
+        self.assertEqual(parsed, {"text": "hi", "ts": 42})
+
+    @patch.object(inbox_cli, "_get")
+    def test_retries_on_timeout_then_succeeds(self, mock_get):
+        # First poll times out, second returns a reply.
+        mock_get.side_effect = [
+            {"timeout": True},
+            {"reply": {"text": "done waiting", "ts": 456}},
+        ]
+        args = make_args(card_id="card_abc", timeout=60, since=0, json=False)
+        with patch("builtins.print") as mock_print:
+            inbox_cli.cmd_wait(args)
+        self.assertEqual(mock_get.call_count, 2)
+        mock_print.assert_called_with("done waiting")
+
+    @patch.object(inbox_cli, "_get", return_value=None)
+    def test_unreachable_exits(self, mock_get):
+        args = make_args(card_id="card_abc", timeout=60, since=0, json=False)
+        with self.assertRaises(SystemExit) as cm:
+            with patch("builtins.print"):
+                inbox_cli.cmd_wait(args)
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_deadline_already_passed_exits(self):
+        # Zero timeout means deadline is essentially now — loop should detect
+        # and exit with code 2 before even issuing a request.
+        args = make_args(card_id="card_abc", timeout=0, since=0, json=False)
+        with patch.object(inbox_cli, "_get") as mock_get:
+            with self.assertRaises(SystemExit) as cm:
+                with patch("builtins.print"):
+                    inbox_cli.cmd_wait(args)
+            self.assertEqual(cm.exception.code, 2)
+            mock_get.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
