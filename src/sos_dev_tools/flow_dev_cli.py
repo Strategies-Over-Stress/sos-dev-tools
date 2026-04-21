@@ -546,8 +546,11 @@ def _fanout(tickets, base, pause_after):
         print()
 
     print(
-        f"{len(ok)} running. Monitor: `sos-flow-dev status` · `tmux ls` · "
-        f"sidebar at http://localhost:3030  (Ctrl+B D to detach from any tmux)"
+        f"{len(ok)} running. Monitor:\n"
+        f"  sos-flow-dev watch             live dashboard (Ctrl+C to detach)\n"
+        f"  sos-flow-dev status            one-shot snapshot\n"
+        f"  tmux ls                        all live sessions\n"
+        f"  sidebar at http://localhost:3030"
     )
 
     if err and not ok:
@@ -559,6 +562,13 @@ def cmd_start(args):
     # and return immediately. Single-ticket without --detach blocks (legacy).
     if len(args.tickets) > 1 or args.detach:
         _fanout(args.tickets, args.base, args.pause_after)
+        if args.watch:
+            # Drop into watch mode filtered to just the tickets we launched.
+            print()
+            print("Entering watch mode (Ctrl+C to detach — runs keep going):")
+            print()
+            watch_args = argparse.Namespace(tickets=args.tickets, interval=3)
+            cmd_watch(watch_args)
         return
     _run_start_blocking(args.tickets[0], args)
 
@@ -705,6 +715,113 @@ def cmd_qa_reject(args):
     check("re-QA card posted")
 
 
+PHASE_TO_LIVE_SESSION = {
+    "alloc":          lambda t: f"flow-{t}-alloc",
+    "work-1":         lambda t: f"pm-{t}",
+    "review":         lambda t: f"flow-{t}-review",
+    "work-2":         lambda t: f"flow-{t}-work2",
+    "work-3":         lambda t: f"flow-{t}-work3",
+    "awaiting-qa":    lambda t: None,     # no leaf — waiting for human
+    "awaiting-qa-2":  lambda t: None,
+    "merged":         lambda t: None,
+}
+
+
+def _elapsed_since(iso_ts):
+    if not iso_ts:
+        return "—"
+    try:
+        started = datetime.datetime.strptime(iso_ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return "—"
+    delta = datetime.datetime.now(datetime.timezone.utc) - started
+    total_s = int(delta.total_seconds())
+    if total_s < 60:
+        return f"{total_s}s"
+    m, s = divmod(total_s, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
+
+
+def _live_session_for(ticket, phase):
+    """Return the leaf tmux session name for this phase, or None if not applicable."""
+    builder = PHASE_TO_LIVE_SESSION.get(phase)
+    if builder is None:
+        return None
+    return builder(ticket)
+
+
+def _tmux_session_exists(name):
+    if not name:
+        return False
+    r = subprocess.run(["tmux", "has-session", "-t", name],
+                       capture_output=True)
+    return r.returncode == 0
+
+
+def _render_watch_table(tickets_filter=None):
+    """Snapshot of session state → list of (ticket, phase, live_session, elapsed, pr, preview) tuples."""
+    d = STATE_DIR / "sessions"
+    if not d.exists():
+        return []
+    rows = []
+    for f in sorted(d.glob("*.json")):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        t = f.stem
+        if tickets_filter and t not in tickets_filter:
+            continue
+        phase = data.get("phase", "?")
+        leaf = _live_session_for(t, phase)
+        leaf_str = ""
+        if leaf:
+            leaf_str = leaf if _tmux_session_exists(leaf) else f"{leaf} (gone)"
+        elapsed = _elapsed_since(data.get("started_at", ""))
+        pr_num = data.get("pr_num") or ""
+        pr_str = f"#{pr_num}" if pr_num else "—"
+        preview = data.get("preview_url") or "—"
+        rows.append((t, phase, leaf_str or "—", elapsed, pr_str, preview))
+    return rows
+
+
+def _print_watch(rows, first=False):
+    """Print the dashboard, overwriting the previous render in place on repeats."""
+    if not first and rows:
+        # Move cursor up by (2 header lines + number of rows) and clear to end of screen
+        sys.stdout.write(f"\x1b[{len(rows) + 3}A\x1b[J")
+    # Columns sized for typical content; preview URL truncates but stays readable.
+    hdr = f"{'TICKET':<12}  {'PHASE':<14}  {'LIVE TMUX':<30}  {'ELAPSED':<10}  {'PR':<6}  PREVIEW"
+    print(hdr)
+    print("─" * len(hdr))
+    if not rows:
+        print("(no active flow-dev sessions — run `sos-flow-dev start TICKET`)")
+        return
+    for t, phase, leaf, elapsed, pr, preview in rows:
+        preview_short = preview[:40] + "…" if len(preview) > 41 else preview
+        print(f"{t:<12}  {phase:<14}  {leaf:<30}  {elapsed:<10}  {pr:<6}  {preview_short}")
+
+
+def cmd_watch(args):
+    """Live dashboard of all active flow-dev sessions. Ctrl+C to exit."""
+    interval = max(1, args.interval)
+    tickets_filter = set(args.tickets) if args.tickets else None
+    import time
+    first = True
+    try:
+        while True:
+            rows = _render_watch_table(tickets_filter)
+            _print_watch(rows, first=first)
+            first = False
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n(detached — runs continue. `sos-flow-dev watch` to resume.)")
+
+
 def cmd_status(args):
     if args.ticket:
         sess = session_get(args.ticket)
@@ -835,6 +952,9 @@ def main():
     p.add_argument("--detach", action="store_true",
                    help="Force detached tmux runner even for a single ticket "
                         "(implicit when multiple tickets are passed)")
+    p.add_argument("--watch", action="store_true",
+                   help="After spawning runners, enter watch mode in this terminal. "
+                        "Ctrl+C to detach (runs continue).")
 
     p = sub.add_parser("review", help="Re-run just the review phase against the current PR")
     p.add_argument("ticket")
@@ -855,6 +975,15 @@ def main():
     p.add_argument("ticket", nargs="?", default=None)
 
     p = sub.add_parser(
+        "watch",
+        help="Live dashboard of active flow-dev sessions (updates in place; Ctrl+C to exit)",
+    )
+    p.add_argument("tickets", nargs="*",
+                   help="Optionally filter to these ticket IDs")
+    p.add_argument("--interval", "-i", type=int, default=3,
+                   help="Refresh interval in seconds (default: 3)")
+
+    p = sub.add_parser(
         "cleanup",
         help="Reset the ticket's worktree for reuse (default) or remove it outright",
     )
@@ -872,6 +1001,7 @@ def main():
         "qa-approve": cmd_qa_approve,
         "qa-reject": cmd_qa_reject,
         "status": cmd_status,
+        "watch": cmd_watch,
         "cleanup": cmd_cleanup,
     }[args.command](args)
 

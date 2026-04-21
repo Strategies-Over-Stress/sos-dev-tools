@@ -205,7 +205,7 @@ class TestCmdStartHappyPath(SessionBase):
                 "worktree": "repo",
             }
             review.return_value = {"comments": 0, "verdict": "approve"}
-            fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after=None, base=None, detach=False))
+            fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after=None, base=None, detach=False, watch=False))
 
             pm.assert_called_once_with("FOO-1")
             review.assert_called_once()
@@ -240,7 +240,7 @@ class TestCmdStartHappyPath(SessionBase):
             review.return_value = {"comments": 4, "verdict": "changes-requested"}
             work2.return_value = {"ready": True, "url": "http://localhost:6006"}
 
-            fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after=None, base=None, detach=False))
+            fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after=None, base=None, detach=False, watch=False))
             work2.assert_called_once_with("FOO-1", "42", 4)
 
         self.assertEqual(fd.session_get("FOO-1", "preview_url"),
@@ -262,7 +262,7 @@ class TestCmdStartHappyPath(SessionBase):
             work2.return_value = {"failed": "tests red after fix"}
 
             with self.assertRaises(SystemExit) as cm:
-                fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after=None, base=None, detach=False))
+                fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after=None, base=None, detach=False, watch=False))
             self.assertNotEqual(cm.exception.code, 0)
 
             titles = [c.args[1] for c in post.call_args_list]
@@ -284,7 +284,7 @@ class TestCmdStartHappyPath(SessionBase):
              patch.object(fd, "post_card", return_value="id"), \
              patch.object(fd, "worktree_root", return_value=Path(self._tmp)):
             fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after=None,
-                                 base="sbook/epic", detach=False))
+                                 base="sbook/epic", detach=False, watch=False))
             alloc.assert_called_once_with("FOO-1", hint_base="sbook/epic")
         self.assertEqual(fd.session_get("FOO-1", "parent_branch"), "sbook/epic")
 
@@ -313,7 +313,7 @@ class TestCmdStartGating(SessionBase):
              patch.object(fd, "post_card", return_value="card_abc"), \
              patch.object(fd, "prompt_user", return_value="continue") as gate_prompt, \
              patch.object(fd, "worktree_root", return_value=Path(self._tmp)):
-            fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after="work1", base=None, detach=False))
+            fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after="work1", base=None, detach=False, watch=False))
             gate_prompt.assert_called_once()
             self.assertIn("Work 1 done", gate_prompt.call_args[0][0])
 
@@ -332,7 +332,7 @@ class TestCmdStartGating(SessionBase):
              patch.object(fd, "prompt_user", return_value="abort"), \
              patch.object(fd, "worktree_root", return_value=Path(self._tmp)):
             with self.assertRaises(SystemExit):
-                fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after="work1", base=None, detach=False))
+                fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after="work1", base=None, detach=False, watch=False))
             review.assert_not_called()
 
 
@@ -460,7 +460,7 @@ class TestFanout(SessionBase):
             with patch("builtins.print") as mp:
                 fd.cmd_start(args_ns(
                     tickets=["FOO-1", "FOO-2", "FOO-3"],
-                    pause_after=None, base=None, detach=False,
+                    pause_after=None, base=None, detach=False, watch=False,
                 ))
             # Three new-session calls expected
             new_session_calls = [
@@ -482,7 +482,7 @@ class TestFanout(SessionBase):
             ]
             with patch("builtins.print"):
                 fd.cmd_start(args_ns(
-                    tickets=["FOO-1"], pause_after=None, base=None, detach=True,
+                    tickets=["FOO-1"], pause_after=None, base=None, detach=True, watch=False,
                 ))
             new_session = [c.args[0] for c in mock_run.call_args_list
                            if c.args[0][0] == "tmux" and c.args[0][1] == "new-session"]
@@ -500,7 +500,7 @@ class TestFanout(SessionBase):
             with patch("builtins.print"):
                 fd.cmd_start(args_ns(
                     tickets=["FOO-1", "FOO-2"],
-                    pause_after=None, base=None, detach=False,
+                    pause_after=None, base=None, detach=False, watch=False,
                 ))
             # new-session called exactly once (only for FOO-2)
             new_session = [c.args[0] for c in mock_run.call_args_list
@@ -513,7 +513,7 @@ class TestFanout(SessionBase):
             with self.assertRaises(SystemExit):
                 fd.cmd_start(args_ns(
                     tickets=["FOO-1", "FOO-2"],
-                    pause_after=None, base=None, detach=False,
+                    pause_after=None, base=None, detach=False, watch=False,
                 ))
 
     def test_single_ticket_without_detach_blocks_not_fanout(self):
@@ -523,7 +523,7 @@ class TestFanout(SessionBase):
         with patch.object(fd, "_fanout") as fanout, \
              patch.object(fd, "_run_start_blocking") as blocking:
             fd.cmd_start(args_ns(
-                tickets=["FOO-1"], pause_after=None, base=None, detach=False,
+                tickets=["FOO-1"], pause_after=None, base=None, detach=False, watch=False,
             ))
             fanout.assert_not_called()
             blocking.assert_called_once()
@@ -643,6 +643,66 @@ class TestPmStartMissing(SessionBase):
         with patch.object(fd, "PM_START_SKILL", Path("/does/not/exist")):
             with self.assertRaises(SystemExit):
                 fd.phase_pm_start("FOO-1")
+
+
+class TestWatchRendering(SessionBase):
+    """cmd_watch renders a table from session state and maps phase → live tmux name."""
+
+    def test_live_session_for_each_phase(self):
+        self.assertEqual(fd._live_session_for("FOO-1", "alloc"), "flow-FOO-1-alloc")
+        self.assertEqual(fd._live_session_for("FOO-1", "work-1"), "pm-FOO-1")
+        self.assertEqual(fd._live_session_for("FOO-1", "review"), "flow-FOO-1-review")
+        self.assertEqual(fd._live_session_for("FOO-1", "work-2"), "flow-FOO-1-work2")
+        self.assertEqual(fd._live_session_for("FOO-1", "work-3"), "flow-FOO-1-work3")
+        self.assertIsNone(fd._live_session_for("FOO-1", "awaiting-qa"))
+        self.assertIsNone(fd._live_session_for("FOO-1", "merged"))
+        self.assertIsNone(fd._live_session_for("FOO-1", "mystery"))
+
+    def test_render_table_reads_sessions(self):
+        fd.session_set("FOO-1", phase="awaiting-qa",
+                       pr_url="https://x/pull/42", pr_num="42",
+                       preview_url="http://localhost:6006",
+                       started_at="2026-04-21T10:00:00Z")
+        fd.session_set("BAR-7", phase="review",
+                       pr_url="https://x/pull/7", pr_num="7",
+                       preview_url="",
+                       started_at="2026-04-21T10:05:00Z")
+        with patch.object(fd, "_tmux_session_exists", return_value=True):
+            rows = fd._render_watch_table()
+        self.assertEqual(len(rows), 2)
+        tickets = [r[0] for r in rows]
+        self.assertIn("FOO-1", tickets)
+        self.assertIn("BAR-7", tickets)
+        foo = next(r for r in rows if r[0] == "FOO-1")
+        # phase=awaiting-qa → no leaf session
+        self.assertEqual(foo[2], "—")
+        self.assertEqual(foo[4], "#42")
+        self.assertEqual(foo[5], "http://localhost:6006")
+        bar = next(r for r in rows if r[0] == "BAR-7")
+        self.assertEqual(bar[2], "flow-BAR-7-review")
+
+    def test_render_flags_dead_tmux_session(self):
+        fd.session_set("FOO-1", phase="review", pr_num="42",
+                       started_at="2026-04-21T10:00:00Z")
+        with patch.object(fd, "_tmux_session_exists", return_value=False):
+            rows = fd._render_watch_table()
+        self.assertEqual(rows[0][2], "flow-FOO-1-review (gone)")
+
+    def test_ticket_filter_narrows_rows(self):
+        fd.session_set("FOO-1", phase="review", pr_num="1",
+                       started_at="2026-04-21T10:00:00Z")
+        fd.session_set("BAR-7", phase="review", pr_num="7",
+                       started_at="2026-04-21T10:00:00Z")
+        with patch.object(fd, "_tmux_session_exists", return_value=True):
+            rows = fd._render_watch_table(tickets_filter={"FOO-1"})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "FOO-1")
+
+    def test_empty_state_shows_help_line(self):
+        with patch("builtins.print") as mp:
+            fd._print_watch([], first=True)
+        printed = "\n".join(str(c.args[0]) if c.args else "" for c in mp.call_args_list)
+        self.assertIn("no active flow-dev sessions", printed)
 
 
 if __name__ == "__main__":
