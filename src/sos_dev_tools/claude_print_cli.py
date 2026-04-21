@@ -36,7 +36,12 @@ encodes the wrapper once so downstream skills can't forget a var:
 
 import argparse
 import os
+import shlex
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
 
 STRIP_ENV = [
     "CLAUDECODE",
@@ -47,12 +52,80 @@ STRIP_ENV = [
 
 DEFAULT_ARGS = ["--dangerously-skip-permissions", "--print"]
 
+TMUX_POLL_INTERVAL_S = 1.0
+
 
 def stripped_env(source=None):
     """Return a copy of the env with the parent-harness + API-key vars removed."""
     if source is None:
         source = os.environ
     return {k: v for k, v in source.items() if k not in STRIP_ENV}
+
+
+def run_in_tmux(session, cmd_argv):
+    """Run cmd_argv inside a detached tmux session, block until it exits,
+    propagate the exit code.
+
+    Why: `claude --print`'s stdout is block-buffered when not attached to a TTY
+    (typical when a skill redirects to a log file). That leaves long agent runs
+    invisible — 15+ minutes of silence followed by one flush at exit. Running
+    inside tmux gives claude a real pty, so output line-buffers and the caller
+    can `tmux attach -t SESSION` from anywhere to watch live.
+
+    Exit code is captured by writing $? to a temp file inside the session shell,
+    since tmux doesn't propagate exit codes natively.
+
+    Env-var stripping is applied twice: once via the inherited env for the
+    `tmux new-session` call, and again via `unset` inside the session shell,
+    in case the tmux server's own environment is polluted.
+    """
+    if shutil.which("tmux") is None:
+        print("sos-claude-print: --tmux requires tmux on PATH", file=sys.stderr)
+        sys.exit(127)
+
+    exit_file = tempfile.mktemp(suffix=".exit", prefix=f"sos-claude-{session}-")
+    unset_cmd = "unset " + " ".join(STRIP_ENV)
+    cmd_str = " ".join(shlex.quote(a) for a in cmd_argv)
+    wrapper = f'{unset_cmd}; {cmd_str}; echo $? > {shlex.quote(exit_file)}'
+
+    # new-session -d: detached. -A: attach to existing session with this name
+    # instead of erroring, so re-runs are idempotent.
+    try:
+        subprocess.check_call([
+            "tmux", "new-session", "-d", "-s", session, "-x", "220", "-y", "50",
+            "/bin/sh", "-c", wrapper,
+        ], env=stripped_env())
+    except subprocess.CalledProcessError as e:
+        print(f"sos-claude-print: tmux new-session failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[sos-claude-print] agent running in tmux session '{session}'", file=sys.stderr)
+    print(f"[sos-claude-print] attach to watch live: tmux attach -t {session}", file=sys.stderr)
+    print(f"[sos-claude-print] detach without killing: Ctrl+B then D", file=sys.stderr)
+
+    # Poll until the session dies.
+    while True:
+        r = subprocess.run(["tmux", "has-session", "-t", session],
+                           capture_output=True)
+        if r.returncode != 0:
+            break
+        time.sleep(TMUX_POLL_INTERVAL_S)
+
+    # Retrieve the exit code.
+    exit_code = 0
+    try:
+        with open(exit_file) as f:
+            exit_code = int((f.read().strip() or "0"))
+    except (FileNotFoundError, ValueError):
+        # Session vanished without writing — treat as failure.
+        exit_code = 1
+    finally:
+        try:
+            os.unlink(exit_file)
+        except OSError:
+            pass
+
+    return exit_code
 
 
 def build_cmd(prompt, extra_args, include_defaults=True):
@@ -84,6 +157,12 @@ def main():
                         help="Prompt text (or omit and pass --file)")
     parser.add_argument("--file", "-f", default=None,
                         help="Read prompt from this file instead of the positional arg")
+    parser.add_argument("--tmux", default=None, metavar="SESSION",
+                        help=(
+                            "Run the agent inside a detached tmux session with the given name. "
+                            "Block until it exits, then propagate its exit code. "
+                            "Use `tmux attach -t SESSION` from anywhere to watch live output."
+                        ))
     parser.add_argument("--no-default-args", action="store_true",
                         help="Omit --dangerously-skip-permissions --print (rare; for custom invocations)")
     parser.add_argument("claude_args", nargs=argparse.REMAINDER,
@@ -102,9 +181,12 @@ def main():
     else:
         parser.error("must provide either a positional prompt argument or --file PATH")
 
-    env = stripped_env()
     cmd = build_cmd(prompt, args.claude_args, include_defaults=not args.no_default_args)
 
+    if args.tmux:
+        sys.exit(run_in_tmux(args.tmux, cmd))
+
+    env = stripped_env()
     try:
         os.execvpe("claude", cmd, env)
     except FileNotFoundError:

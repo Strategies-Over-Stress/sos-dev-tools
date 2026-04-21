@@ -8,9 +8,10 @@ Usage:
 """
 
 import os
+import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sos_dev_tools import claude_print_cli
 
@@ -155,6 +156,101 @@ class TestMain(unittest.TestCase):
         cmd = mock_exec.call_args[0][1]
         self.assertIn("--model", cmd)
         self.assertIn("claude-opus-4-7", cmd)
+
+
+class TestTmuxMode(unittest.TestCase):
+    """--tmux flag dispatches to run_in_tmux instead of execvpe."""
+
+    @patch.object(claude_print_cli.shutil, "which", return_value=None)
+    def test_tmux_missing_exits_127(self, mock_which):
+        with self.assertRaises(SystemExit) as cm:
+            claude_print_cli.run_in_tmux("sess", ["claude", "--print", "hi"])
+        self.assertEqual(cm.exception.code, 127)
+
+    @patch.object(claude_print_cli.shutil, "which", return_value="/usr/bin/tmux")
+    @patch.object(claude_print_cli.time, "sleep")  # skip real sleeps
+    @patch.object(claude_print_cli.subprocess, "check_call")
+    @patch.object(claude_print_cli.subprocess, "run")
+    @patch.object(claude_print_cli.tempfile, "mktemp")
+    def test_happy_path(self, mock_mktemp, mock_run, mock_check_call, mock_sleep, mock_which):
+        # Simulate: session created, poll sees session alive, then dead.
+        # Exit file contains "0".
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("0")
+            exit_path = f.name
+        mock_mktemp.return_value = exit_path
+        # has-session: first call returncode=0 (alive), second returncode=1 (dead)
+        mock_run.side_effect = [
+            MagicMock(returncode=0),
+            MagicMock(returncode=1),
+        ]
+        try:
+            result = claude_print_cli.run_in_tmux("my-session", ["claude", "--print", "hi"])
+            self.assertEqual(result, 0)
+            # Verify tmux new-session was invoked with the expected skeleton.
+            new_session_cmd = mock_check_call.call_args[0][0]
+            self.assertEqual(new_session_cmd[:3], ["tmux", "new-session", "-d"])
+            self.assertIn("-s", new_session_cmd)
+            self.assertIn("my-session", new_session_cmd)
+            # Wrapper script should include the unset + the exit file.
+            wrapper = new_session_cmd[-1]
+            for v in claude_print_cli.STRIP_ENV:
+                self.assertIn(v, wrapper)
+            self.assertIn(exit_path, wrapper)
+        finally:
+            if os.path.exists(exit_path):
+                os.unlink(exit_path)
+
+    @patch.object(claude_print_cli.shutil, "which", return_value="/usr/bin/tmux")
+    @patch.object(claude_print_cli.time, "sleep")
+    @patch.object(claude_print_cli.subprocess, "check_call")
+    @patch.object(claude_print_cli.subprocess, "run")
+    @patch.object(claude_print_cli.tempfile, "mktemp")
+    def test_propagates_nonzero_exit(self, mock_mktemp, mock_run, mock_check_call, mock_sleep, mock_which):
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("42")
+            exit_path = f.name
+        mock_mktemp.return_value = exit_path
+        mock_run.side_effect = [MagicMock(returncode=1)]  # session already dead on first check
+        try:
+            result = claude_print_cli.run_in_tmux("sess", ["claude", "hi"])
+            self.assertEqual(result, 42)
+        finally:
+            if os.path.exists(exit_path):
+                os.unlink(exit_path)
+
+    @patch.object(claude_print_cli.shutil, "which", return_value="/usr/bin/tmux")
+    @patch.object(claude_print_cli.time, "sleep")
+    @patch.object(claude_print_cli.subprocess, "check_call")
+    @patch.object(claude_print_cli.subprocess, "run")
+    @patch.object(claude_print_cli.tempfile, "mktemp")
+    def test_missing_exit_file_treated_as_failure(self, mock_mktemp, mock_run, mock_check_call, mock_sleep, mock_which):
+        # Session dies without writing the exit file (e.g., killed from outside).
+        mock_mktemp.return_value = "/tmp/definitely-does-not-exist-zzzz.exit"
+        mock_run.side_effect = [MagicMock(returncode=1)]
+        result = claude_print_cli.run_in_tmux("sess", ["claude", "hi"])
+        self.assertEqual(result, 1)
+
+    @patch.object(claude_print_cli.shutil, "which", return_value="/usr/bin/tmux")
+    @patch.object(claude_print_cli.subprocess, "check_call",
+                  side_effect=subprocess.CalledProcessError(1, "tmux"))
+    def test_tmux_new_session_failure_exits_1(self, mock_check_call, mock_which):
+        with self.assertRaises(SystemExit) as cm:
+            claude_print_cli.run_in_tmux("sess", ["claude", "hi"])
+        self.assertEqual(cm.exception.code, 1)
+
+    @patch.object(claude_print_cli, "run_in_tmux", return_value=7)
+    def test_main_dispatches_to_tmux_when_flag_set(self, mock_run_tmux):
+        with patch.object(claude_print_cli.sys, "argv", [
+            "sos-claude-print", "--tmux", "my-session", "hello",
+        ]):
+            with self.assertRaises(SystemExit) as cm:
+                claude_print_cli.main()
+            self.assertEqual(cm.exception.code, 7)
+        mock_run_tmux.assert_called_once()
+        session, cmd = mock_run_tmux.call_args[0]
+        self.assertEqual(session, "my-session")
+        self.assertEqual(cmd[-1], "hello")
 
 
 if __name__ == "__main__":
