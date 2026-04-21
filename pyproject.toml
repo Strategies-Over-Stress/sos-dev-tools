@@ -20,6 +20,7 @@ sos-feature = "sos_dev_tools.feature_cli:main"
 sos-pm = "sos_dev_tools.pm_cli:main"
 sos-inbox = "sos_dev_tools.inbox_cli:main"
 sos-claude-print = "sos_dev_tools.claude_print_cli:main"
+sos-flow-dev = "sos_dev_tools.flow_dev_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
