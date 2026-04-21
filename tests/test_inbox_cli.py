@@ -9,7 +9,10 @@ Usage:
 """
 
 import argparse
+import base64
 import json
+import os
+import tempfile
 import unittest
 from io import BytesIO
 from unittest.mock import MagicMock, patch
@@ -378,19 +381,96 @@ class TestCmdClear(unittest.TestCase):
 
 
 class TestCmdReply(unittest.TestCase):
-    """cmd_reply POSTs text to /inbox/:id/reply."""
+    """cmd_reply POSTs text + optional attachments to /inbox/:id/reply."""
 
     @patch.object(inbox_cli, "_post", return_value={"ok": True})
-    def test_posts_to_correct_endpoint(self, mock_post):
-        args = make_args(card_id="card_abc", text="it broke on Safari")
+    def test_text_only(self, mock_post):
+        args = make_args(card_id="card_abc", text="it broke on Safari", attach=[])
         with patch("builtins.print") as mock_print:
             inbox_cli.cmd_reply(args)
-        mock_post.assert_called_with("/inbox/card_abc/reply", {"text": "it broke on Safari"})
+        path, body = mock_post.call_args[0]
+        self.assertEqual(path, "/inbox/card_abc/reply")
+        self.assertEqual(body, {"text": "it broke on Safari"})
         mock_print.assert_called_with("replied to card_abc")
+
+    @patch.object(inbox_cli, "_post", return_value={"ok": True})
+    def test_with_attachment(self, mock_post):
+        # Write a tiny fake PNG to disk; CLI reads + base64-encodes.
+        fake_png = b"\x89PNG\r\n\x1a\ntest-bytes"
+        with tempfile.NamedTemporaryFile("wb", suffix=".png", delete=False) as f:
+            f.write(fake_png)
+            path = f.name
+        try:
+            args = make_args(card_id="card_abc", text="here's the bug",
+                             attach=[path])
+            with patch("builtins.print") as mock_print:
+                inbox_cli.cmd_reply(args)
+            body = mock_post.call_args[0][1]
+            self.assertEqual(body["text"], "here's the bug")
+            self.assertEqual(len(body["attachments"]), 1)
+            att = body["attachments"][0]
+            self.assertEqual(att["filename"], os.path.basename(path))
+            self.assertEqual(att["mime"], "image/png")
+            self.assertEqual(base64.b64decode(att["data_base64"]), fake_png)
+            mock_print.assert_called_with("replied to card_abc with 1 attachment")
+        finally:
+            os.unlink(path)
+
+    @patch.object(inbox_cli, "_post", return_value={"ok": True})
+    def test_attachment_only_no_text(self, mock_post):
+        fake = b"jpeg-bytes"
+        with tempfile.NamedTemporaryFile("wb", suffix=".jpg", delete=False) as f:
+            f.write(fake)
+            path = f.name
+        try:
+            args = make_args(card_id="card_abc", text="", attach=[path])
+            with patch("builtins.print") as mock_print:
+                inbox_cli.cmd_reply(args)
+            body = mock_post.call_args[0][1]
+            self.assertEqual(body["text"], "")
+            self.assertEqual(body["attachments"][0]["mime"], "image/jpeg")
+            mock_print.assert_called_with("replied to card_abc with 1 attachment")
+        finally:
+            os.unlink(path)
+
+    def test_empty_text_and_no_attachments_exits(self):
+        args = make_args(card_id="card_abc", text="", attach=[])
+        with self.assertRaises(SystemExit) as cm:
+            with patch("builtins.print"):
+                inbox_cli.cmd_reply(args)
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_missing_attachment_file_exits(self):
+        args = make_args(card_id="card_abc", text="hi",
+                         attach=["/does/not/exist/photo.png"])
+        with self.assertRaises(SystemExit) as cm:
+            with patch("builtins.print"):
+                inbox_cli.cmd_reply(args)
+        self.assertEqual(cm.exception.code, 2)
+
+    @patch.object(inbox_cli, "_post", return_value={"ok": True})
+    def test_multiple_attachments(self, mock_post):
+        files = []
+        for ext, data in [(".png", b"a"), (".jpg", b"b"), (".gif", b"c")]:
+            with tempfile.NamedTemporaryFile("wb", suffix=ext, delete=False) as f:
+                f.write(data)
+                files.append(f.name)
+        try:
+            args = make_args(card_id="card_abc", text="three pics", attach=files)
+            with patch("builtins.print") as mock_print:
+                inbox_cli.cmd_reply(args)
+            body = mock_post.call_args[0][1]
+            self.assertEqual(len(body["attachments"]), 3)
+            mimes = [a["mime"] for a in body["attachments"]]
+            self.assertEqual(mimes, ["image/png", "image/jpeg", "image/gif"])
+            mock_print.assert_called_with("replied to card_abc with 3 attachments")
+        finally:
+            for p in files:
+                os.unlink(p)
 
     @patch.object(inbox_cli, "_post", return_value=None)
     def test_unreachable_exits(self, mock_post):
-        args = make_args(card_id="card_abc", text="hi")
+        args = make_args(card_id="card_abc", text="hi", attach=[])
         with self.assertRaises(SystemExit) as cm:
             with patch("builtins.print"):
                 inbox_cli.cmd_reply(args)
@@ -429,6 +509,23 @@ class TestCmdReplies(unittest.TestCase):
         with patch("builtins.print") as mock_print:
             inbox_cli.cmd_replies(args)
         mock_print.assert_called_with("(no replies)")
+
+    @patch.object(inbox_cli, "_get", return_value={"replies": [
+        {"text": "see screenshot", "ts": 1700000000000, "attachments": [
+            {"filename": "bug.png", "mime": "image/png",
+             "path": "/Users/x/.ghostty-mini/attachments/abc.png"},
+        ]},
+    ]})
+    def test_attachment_lines_rendered(self, mock_get):
+        args = make_args(card_id="card_abc", json=False)
+        with patch("builtins.print") as mock_print:
+            inbox_cli.cmd_replies(args)
+        lines = [c.args[0] for c in mock_print.call_args_list]
+        # Text line + attachment indicator line
+        self.assertEqual(len(lines), 2)
+        self.assertIn("see screenshot", lines[0])
+        self.assertIn("bug.png", lines[1])
+        self.assertIn("/Users/x/.ghostty-mini/attachments/abc.png", lines[1])
 
 
 class TestCmdWait(unittest.TestCase):

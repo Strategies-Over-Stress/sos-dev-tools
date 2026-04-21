@@ -36,7 +36,9 @@ print to stderr and exit 1.
 """
 
 import argparse
+import base64
 import json
+import mimetypes
 import os
 import sys
 import time
@@ -249,14 +251,40 @@ def cmd_prompt(args):
         print(reply.get("text", ""))
 
 
+def _encode_attachment(path):
+    """Read a local image file, return the server's attachment payload shape."""
+    with open(path, "rb") as f:
+        data = f.read()
+    mime, _ = mimetypes.guess_type(path)
+    if not mime:
+        # Fallback — let the server reject unsupported mimes.
+        mime = "application/octet-stream"
+    return {
+        "filename": os.path.basename(path),
+        "mime": mime,
+        "data_base64": base64.b64encode(data).decode("ascii"),
+    }
+
+
 def cmd_reply(args):
-    """Append a reply to a card."""
-    result = _post(f"/inbox/{args.card_id}/reply", {"text": args.text})
+    """Append a reply to a card, optionally with image attachments."""
+    body = {"text": args.text or ""}
+    if args.attach:
+        try:
+            body["attachments"] = [_encode_attachment(p) for p in args.attach]
+        except FileNotFoundError as e:
+            print(f"reply: file not found: {e.filename}", file=sys.stderr)
+            sys.exit(2)
+    if not body["text"].strip() and not body.get("attachments"):
+        print("reply: at least text or one --attach is required", file=sys.stderr)
+        sys.exit(2)
+    result = _post(f"/inbox/{args.card_id}/reply", body)
     if result is None:
         print("inbox unreachable", file=sys.stderr)
         sys.exit(1)
-    # The card's broadcast handler prints success implicitly; echo the id.
-    print(f"replied to {args.card_id}")
+    n = len(body.get("attachments") or [])
+    suffix = f" with {n} attachment{'s' if n != 1 else ''}" if n else ""
+    print(f"replied to {args.card_id}{suffix}")
 
 
 def cmd_replies(args):
@@ -277,6 +305,8 @@ def cmd_replies(args):
         # ISO8601 UTC for readability — same format sos-pm uses.
         when = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts / 1000)) if ts else "?"
         print(f"[{when}] {r.get('text', '')}")
+        for a in r.get("attachments") or []:
+            print(f"          📎 {a.get('filename', '?')} — {a.get('path', '?')}")
 
 
 def cmd_wait(args):
@@ -389,7 +419,10 @@ def main():
 
     p = sub.add_parser("reply", help="Append a reply to a card")
     p.add_argument("card_id", help="Card id (e.g. card_abc123)")
-    p.add_argument("text", help="Reply text")
+    p.add_argument("text", nargs="?", default="",
+                   help="Reply text (optional if at least one --attach is given)")
+    p.add_argument("--attach", "-a", action="append", default=[], metavar="PATH",
+                   help="Attach an image file (repeat for multiple; up to 8)")
 
     p = sub.add_parser("replies", help="List the reply thread on a card")
     p.add_argument("card_id")
