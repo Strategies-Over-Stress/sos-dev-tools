@@ -28,6 +28,8 @@ import glob as _glob
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -476,8 +478,85 @@ def gate(ticket, question):
 
 # ─── Top-level subcommands ─────────────────────────────────────────────────
 
+def _launch_runner(ticket, base=None, pause_after=None):
+    """Spawn a detached tmux session running `sos-flow-dev start <ticket>`.
+
+    Returns (session_name, log_path) on success, (None, error_message) on failure.
+    """
+    session = f"flow-runner-{ticket}"
+    check_existing = subprocess.run(
+        ["tmux", "has-session", "-t", session],
+        capture_output=True,
+    )
+    if check_existing.returncode == 0:
+        return None, f"tmux session '{session}' already exists — skipping"
+
+    cmd_parts = ["sos-flow-dev", "start", ticket]
+    if base:
+        cmd_parts += ["--base", base]
+    if pause_after:
+        cmd_parts += ["--pause-after", pause_after]
+    log_path = f"/tmp/flow-runner-{ticket}.log"
+    # `exec` replaces the shell with sos-flow-dev so the session dies cleanly
+    # when the orchestrator exits. `tee` keeps a tail-able log.
+    wrapped = (
+        f"exec {' '.join(shlex.quote(c) for c in cmd_parts)} "
+        f"2>&1 | tee {shlex.quote(log_path)}"
+    )
+    spawn = subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session,
+         "-x", "220", "-y", "50", "/bin/sh", "-c", wrapped],
+        capture_output=True, text=True,
+    )
+    if spawn.returncode != 0:
+        return None, f"tmux new-session failed: {spawn.stderr.strip()}"
+    return session, log_path
+
+
+def _fanout(tickets, base, pause_after):
+    """Launch one detached runner per ticket. Print the resulting tmux IDs."""
+    if shutil.which("tmux") is None:
+        fail("tmux is required for multi-ticket or --detach runs (not on PATH)")
+    results = []
+    for t in tickets:
+        session, info = _launch_runner(t, base=base, pause_after=pause_after)
+        results.append((t, session, info))
+
+    ok = [(t, s, log) for t, s, log in results if s is not None]
+    err = [(t, _, msg) for t, _, msg in results if _ is None]
+
+    if ok:
+        print()
+        print("Runner tmux sessions:")
+        for t, session, log in ok:
+            print(f"  ✓ {t:<12}  tmux attach -t {session}")
+            print(f"                tail -f {log}")
+    if err:
+        print()
+        print("Skipped / failed:")
+        for t, _, msg in err:
+            print(f"  ✗ {t:<12}  {msg}", file=sys.stderr)
+
+    print()
+    print(
+        f"{len(ok)} ticket(s) running. "
+        f"`sos-flow-dev status` for all · `sos-inbox list` for live cards"
+    )
+
+    if err and not ok:
+        sys.exit(1)
+
+
 def cmd_start(args):
-    ticket = args.ticket
+    # Multi-ticket OR explicit --detach → fan out to detached tmux runners
+    # and return immediately. Single-ticket without --detach blocks (legacy).
+    if len(args.tickets) > 1 or args.detach:
+        _fanout(args.tickets, args.base, args.pause_after)
+        return
+    _run_start_blocking(args.tickets[0], args)
+
+
+def _run_start_blocking(ticket, args):
     session_set(ticket, phase="alloc", started_at=now_iso())
 
     # Phase 0 — AI-driven worktree allocation
@@ -728,13 +807,27 @@ def main():
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("start", help="Full workflow: allocate worktree → Work 1 → Review → Work 2 → QA card")
-    p.add_argument("ticket")
+    p = sub.add_parser(
+        "start",
+        help="Full workflow per ticket: allocate worktree → Work 1 → Review → Work 2 → QA card",
+        description=(
+            "One ticket: blocks the current terminal and runs end-to-end. "
+            "Multiple tickets (or --detach): fans each out to its own detached "
+            "tmux session (flow-runner-<TICKET>), returns the tmux session names "
+            "immediately. Phase 0 allocation still serializes across runners via "
+            "an exclusive flock so pool worktrees don't collide."
+        ),
+    )
+    p.add_argument("tickets", nargs="+", metavar="TICKET",
+                   help="One or more ticket IDs to run in parallel")
     p.add_argument("--base", default=None,
                    help="Hint to the worktree-alloc subagent about the parent branch (e.g. 'sbook/epic'). "
                         "If omitted, the subagent infers from context and asks via sos-inbox prompt if ambiguous.")
     p.add_argument("--pause-after", choices=["work1", "review", "work2"], default=None,
                    help="Post a gate card after the named phase; requires a reply to continue")
+    p.add_argument("--detach", action="store_true",
+                   help="Force detached tmux runner even for a single ticket "
+                        "(implicit when multiple tickets are passed)")
 
     p = sub.add_parser("review", help="Re-run just the review phase against the current PR")
     p.add_argument("ticket")

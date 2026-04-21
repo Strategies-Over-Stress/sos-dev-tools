@@ -205,7 +205,7 @@ class TestCmdStartHappyPath(SessionBase):
                 "worktree": "repo",
             }
             review.return_value = {"comments": 0, "verdict": "approve"}
-            fd.cmd_start(args_ns(ticket="FOO-1", pause_after=None, base=None))
+            fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after=None, base=None, detach=False))
 
             pm.assert_called_once_with("FOO-1")
             review.assert_called_once()
@@ -240,7 +240,7 @@ class TestCmdStartHappyPath(SessionBase):
             review.return_value = {"comments": 4, "verdict": "changes-requested"}
             work2.return_value = {"ready": True, "url": "http://localhost:6006"}
 
-            fd.cmd_start(args_ns(ticket="FOO-1", pause_after=None, base=None))
+            fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after=None, base=None, detach=False))
             work2.assert_called_once_with("FOO-1", "42", 4)
 
         self.assertEqual(fd.session_get("FOO-1", "preview_url"),
@@ -262,7 +262,7 @@ class TestCmdStartHappyPath(SessionBase):
             work2.return_value = {"failed": "tests red after fix"}
 
             with self.assertRaises(SystemExit) as cm:
-                fd.cmd_start(args_ns(ticket="FOO-1", pause_after=None, base=None))
+                fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after=None, base=None, detach=False))
             self.assertNotEqual(cm.exception.code, 0)
 
             titles = [c.args[1] for c in post.call_args_list]
@@ -283,8 +283,8 @@ class TestCmdStartHappyPath(SessionBase):
                           return_value={"comments": 0, "verdict": "approve"}), \
              patch.object(fd, "post_card", return_value="id"), \
              patch.object(fd, "worktree_root", return_value=Path(self._tmp)):
-            fd.cmd_start(args_ns(ticket="FOO-1", pause_after=None,
-                                 base="sbook/epic"))
+            fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after=None,
+                                 base="sbook/epic", detach=False))
             alloc.assert_called_once_with("FOO-1", hint_base="sbook/epic")
         self.assertEqual(fd.session_get("FOO-1", "parent_branch"), "sbook/epic")
 
@@ -313,7 +313,7 @@ class TestCmdStartGating(SessionBase):
              patch.object(fd, "post_card", return_value="card_abc"), \
              patch.object(fd, "prompt_user", return_value="continue") as gate_prompt, \
              patch.object(fd, "worktree_root", return_value=Path(self._tmp)):
-            fd.cmd_start(args_ns(ticket="FOO-1", pause_after="work1", base=None))
+            fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after="work1", base=None, detach=False))
             gate_prompt.assert_called_once()
             self.assertIn("Work 1 done", gate_prompt.call_args[0][0])
 
@@ -332,7 +332,7 @@ class TestCmdStartGating(SessionBase):
              patch.object(fd, "prompt_user", return_value="abort"), \
              patch.object(fd, "worktree_root", return_value=Path(self._tmp)):
             with self.assertRaises(SystemExit):
-                fd.cmd_start(args_ns(ticket="FOO-1", pause_after="work1", base=None))
+                fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after="work1", base=None, detach=False))
             review.assert_not_called()
 
 
@@ -439,6 +439,94 @@ class TestCmdCleanup(SessionBase):
         with patch.object(fd.subprocess, "run") as mock_run:
             fd.cmd_cleanup(args_ns(ticket="NOPE-999", remove=False))
             mock_run.assert_not_called()
+
+
+class TestFanout(SessionBase):
+    """Multi-ticket start → one detached tmux runner per ticket."""
+
+    def test_multiple_tickets_spawn_runners(self):
+        with patch.object(fd.shutil, "which", return_value="/usr/bin/tmux"), \
+             patch.object(fd.subprocess, "run") as mock_run:
+            # has-session checks return 1 (session doesn't exist yet)
+            # new-session calls return 0 (success)
+            mock_run.side_effect = [
+                MagicMock(returncode=1),  # has-session FOO-1
+                MagicMock(returncode=0, stderr=""),  # new-session FOO-1
+                MagicMock(returncode=1),  # has-session FOO-2
+                MagicMock(returncode=0, stderr=""),  # new-session FOO-2
+                MagicMock(returncode=1),  # has-session FOO-3
+                MagicMock(returncode=0, stderr=""),  # new-session FOO-3
+            ]
+            with patch("builtins.print") as mp:
+                fd.cmd_start(args_ns(
+                    tickets=["FOO-1", "FOO-2", "FOO-3"],
+                    pause_after=None, base=None, detach=False,
+                ))
+            # Three new-session calls expected
+            new_session_calls = [
+                c.args[0] for c in mock_run.call_args_list
+                if c.args[0][0] == "tmux" and c.args[0][1] == "new-session"
+            ]
+            self.assertEqual(len(new_session_calls), 3)
+            # Session names are predictable
+            printed = "\n".join(str(c.args[0]) if c.args else "" for c in mp.call_args_list)
+            for t in ["FOO-1", "FOO-2", "FOO-3"]:
+                self.assertIn(f"flow-runner-{t}", printed)
+
+    def test_single_ticket_with_detach_also_fans_out(self):
+        with patch.object(fd.shutil, "which", return_value="/usr/bin/tmux"), \
+             patch.object(fd.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=1),  # has-session
+                MagicMock(returncode=0, stderr=""),  # new-session
+            ]
+            with patch("builtins.print"):
+                fd.cmd_start(args_ns(
+                    tickets=["FOO-1"], pause_after=None, base=None, detach=True,
+                ))
+            new_session = [c.args[0] for c in mock_run.call_args_list
+                           if c.args[0][0] == "tmux" and c.args[0][1] == "new-session"]
+            self.assertEqual(len(new_session), 1)
+            self.assertIn("flow-runner-FOO-1", new_session[0])
+
+    def test_existing_session_skipped_with_warning(self):
+        with patch.object(fd.shutil, "which", return_value="/usr/bin/tmux"), \
+             patch.object(fd.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0),  # has-session FOO-1 → already exists
+                MagicMock(returncode=1),  # has-session FOO-2 → free
+                MagicMock(returncode=0, stderr=""),  # new-session FOO-2
+            ]
+            with patch("builtins.print"):
+                fd.cmd_start(args_ns(
+                    tickets=["FOO-1", "FOO-2"],
+                    pause_after=None, base=None, detach=False,
+                ))
+            # new-session called exactly once (only for FOO-2)
+            new_session = [c.args[0] for c in mock_run.call_args_list
+                           if c.args[0][0] == "tmux" and c.args[0][1] == "new-session"]
+            self.assertEqual(len(new_session), 1)
+            self.assertIn("flow-runner-FOO-2", new_session[0])
+
+    def test_no_tmux_fails(self):
+        with patch.object(fd.shutil, "which", return_value=None):
+            with self.assertRaises(SystemExit):
+                fd.cmd_start(args_ns(
+                    tickets=["FOO-1", "FOO-2"],
+                    pause_after=None, base=None, detach=False,
+                ))
+
+    def test_single_ticket_without_detach_blocks_not_fanout(self):
+        """Sanity: single ticket, no --detach → still goes through blocking path."""
+        # We mock phase_worktree_alloc etc. to stubs so the path runs without
+        # actually invoking tmux; the key is that _fanout was NOT called.
+        with patch.object(fd, "_fanout") as fanout, \
+             patch.object(fd, "_run_start_blocking") as blocking:
+            fd.cmd_start(args_ns(
+                tickets=["FOO-1"], pause_after=None, base=None, detach=False,
+            ))
+            fanout.assert_not_called()
+            blocking.assert_called_once()
 
 
 class TestPhaseWorktreeAlloc(SessionBase):
