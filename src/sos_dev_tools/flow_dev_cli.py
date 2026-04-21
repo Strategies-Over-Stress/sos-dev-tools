@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import datetime
+import fcntl
 import glob as _glob
 import json
 import os
@@ -360,23 +361,43 @@ def phase_worktree_alloc(ticket, hint_base=None):
 
     Writes /tmp/flow-<TICKET>-worktree.json with {worktree, parent_branch,
     action, reason, preview_port}.
+
+    Serializes concurrent callers via flock on $GHOSTTY_MINI_STATE/alloc.lock,
+    so two simultaneous `sos-flow-dev start` invocations can't both pick the
+    same pool worktree. Before releasing the lock, writes a stub
+    .pm/active-ticket.json into the chosen worktree so the next allocator sees
+    it as busy — pm-start overwrites this stub in its step 3 with the full
+    version.
     """
     step(f"Phase 0/5 — allocating worktree for {ticket}")
-    cwd = os.getcwd()
-    prompt = worktree_alloc_prompt(ticket, cwd, hint_base)
-    rc = run_subagent(f"flow-{ticket}-alloc", prompt)
-    if rc != 0:
-        fail(f"worktree-alloc subagent exited {rc}")
-    result_file = Path(f"/tmp/flow-{ticket}-worktree.json")
-    if not result_file.exists():
-        fail(f"worktree-alloc did not write {result_file} — "
-             f"check `tmux attach -t flow-{ticket}-alloc` for last state")
-    data = json.loads(result_file.read_text())
-    if "failed" in data:
-        fail(f"worktree-alloc failed: {data['failed']}")
-    wt = data.get("worktree")
-    if not wt or not Path(wt).is_dir():
-        fail(f"worktree-alloc reported invalid path: {wt}")
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = STATE_DIR / "alloc.lock"
+    with open(lock_path, "w") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        cwd = os.getcwd()
+        prompt = worktree_alloc_prompt(ticket, cwd, hint_base)
+        rc = run_subagent(f"flow-{ticket}-alloc", prompt)
+        if rc != 0:
+            fail(f"worktree-alloc subagent exited {rc}")
+        result_file = Path(f"/tmp/flow-{ticket}-worktree.json")
+        if not result_file.exists():
+            fail(f"worktree-alloc did not write {result_file} — "
+                 f"check `tmux attach -t flow-{ticket}-alloc` for last state")
+        data = json.loads(result_file.read_text())
+        if "failed" in data:
+            fail(f"worktree-alloc failed: {data['failed']}")
+        wt = data.get("worktree")
+        if not wt or not Path(wt).is_dir():
+            fail(f"worktree-alloc reported invalid path: {wt}")
+        # Claim the worktree under the lock so concurrent allocators see it
+        # as busy even before pm-start runs.
+        pm_dir = Path(wt) / ".pm"
+        pm_dir.mkdir(parents=True, exist_ok=True)
+        (pm_dir / "active-ticket.json").write_text(json.dumps({
+            "ticket_id": ticket,
+            "status": "claimed",
+            "claimed_at": now_iso(),
+        }, indent=2))
     return data  # {worktree, parent_branch, action, reason, preview_port?}
 
 

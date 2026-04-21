@@ -509,6 +509,46 @@ class TestPhaseWorktreeAlloc(SessionBase):
             with self.assertRaises(SystemExit):
                 fd.phase_worktree_alloc("FOO-1")
 
+    def test_writes_claim_stub_to_allocated_worktree(self):
+        # Simulate a real allocated worktree dir (under tmpdir).
+        wt = Path(self._tmp) / "wt-1"
+        wt.mkdir()
+        result = self._result_file("FOO-1")
+        result.write_text(json.dumps({
+            "worktree": str(wt),
+            "parent_branch": "main",
+            "action": "created",
+            "reason": "fresh pool",
+        }))
+        self.addCleanup(lambda: result.unlink() if result.exists() else None)
+
+        with patch.object(fd, "run_subagent", return_value=0):
+            fd.phase_worktree_alloc("FOO-1")
+
+        claim = wt / ".pm" / "active-ticket.json"
+        self.assertTrue(claim.exists())
+        data = json.loads(claim.read_text())
+        self.assertEqual(data["ticket_id"], "FOO-1")
+        self.assertEqual(data["status"], "claimed")
+        self.assertIn("claimed_at", data)
+
+    def test_creates_lock_file(self):
+        """Lock file is created at STATE_DIR/alloc.lock so concurrent callers serialize."""
+        wt = Path(self._tmp) / "wt-1"
+        wt.mkdir()
+        result = self._result_file("FOO-1")
+        result.write_text(json.dumps({
+            "worktree": str(wt), "parent_branch": "main",
+            "action": "created", "reason": "",
+        }))
+        self.addCleanup(lambda: result.unlink() if result.exists() else None)
+
+        with patch.object(fd, "run_subagent", return_value=0):
+            fd.phase_worktree_alloc("FOO-1")
+
+        lock_file = Path(self._tmp) / "alloc.lock"
+        self.assertTrue(lock_file.exists())
+
 
 class TestPmStartMissing(SessionBase):
     def test_missing_skill_exits(self):
