@@ -372,23 +372,29 @@ def cmd_clear(args):
     print(f"cleared {result.get('removed', 0)} card(s)")
 
 
-def _add_card_args(p, with_actions=False):
+def _add_card_args(p):
+    """Common flags for card-posting subcommands (info, action, prompt).
+
+    --actions is exposed on every card type. The server accepts actions on
+    info cards too (reference cards with an 'Open X' button are legitimate);
+    the CLI used to gate this flag behind the `action` subcommand only, which
+    silently broke any caller that tried to post actionable info cards.
+    """
     p.add_argument("title", help="Card title (required)")
     p.add_argument("--ticket", "-T", default=None,
                    help="Group card under this ticket key (e.g. FOO-123)")
     p.add_argument("--url", "-u", default=None, help="Primary URL for the card")
     p.add_argument("--ctx", "-c", default=None, help="Context / provenance line")
-    if with_actions:
-        p.add_argument(
-            "--actions", default=None,
-            help=(
-                "JSON array of button objects. Each button: "
-                "{label, kind, text?, url?, execute?}. "
-                "kind is one of: openUrl, copy, inject, dismiss. "
-                "For inject buttons, execute:true appends newline so the command "
-                "runs on click; execute:false types without running."
-            ),
-        )
+    p.add_argument(
+        "--actions", default=None,
+        help=(
+            "JSON array of button objects. Each button: "
+            "{label, kind, text?, url?, execute?}. "
+            "kind is one of: openUrl, copy, inject, reply, dismiss. "
+            "For inject buttons, execute:true appends newline so the command "
+            "runs on click; execute:false types without running."
+        ),
+    )
 
 
 def main():
@@ -399,10 +405,10 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("info", help="Post a reference card (no action required)")
-    _add_card_args(p, with_actions=False)
+    _add_card_args(p)
 
     p = sub.add_parser("action", help="Post an action-required card")
-    _add_card_args(p, with_actions=True)
+    _add_card_args(p)
 
     p = sub.add_parser("list", help="Show the current inbox contents")
     p.add_argument("--ticket", "-T", default=None,
@@ -451,7 +457,7 @@ def main():
             "action/wait/remove chains."
         ),
     )
-    _add_card_args(p, with_actions=True)
+    _add_card_args(p)
     p.add_argument("--timeout", type=int, default=3600,
                    help="Max total wait in seconds (default: 3600)")
     p.add_argument("--json", action="store_true",
