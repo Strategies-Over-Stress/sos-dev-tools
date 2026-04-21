@@ -979,6 +979,125 @@ class TestPreviewCommand(SessionBase):
         self.assertIn("no preview sessions", errors[0])
 
 
+class TestCmdQaApprove(SessionBase):
+    """qa-approve calls gh pr merge directly and verifies mergedAt."""
+
+    def _sess(self, merge_strategy=None, checks=None):
+        wt = Path(self._tmp) / "wt"
+        (wt / ".pm").mkdir(parents=True)
+        cfg = {}
+        if merge_strategy:
+            cfg["git"] = {"merge_strategy": merge_strategy}
+        if checks:
+            cfg["checks"] = checks
+        (wt / ".pm" / "config.json").write_text(json.dumps(cfg))
+        fd.session_set("FOO-1",
+                       pr_url="https://github.com/x/y/pull/42",
+                       pr_num="42",
+                       worktree=str(wt),
+                       parent_branch="main")
+        return wt
+
+    def test_happy_path_merges_and_verifies(self):
+        self._sess(merge_strategy="squash")
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if "merge" in cmd and "pr" in cmd:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            if "view" in cmd and "pr" in cmd:
+                return MagicMock(returncode=0,
+                                 stdout='{"mergedAt":"2026-04-21T20:00:00Z"}',
+                                 stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(fd.subprocess, "run", side_effect=fake_run), \
+             patch.object(fd, "post_card", return_value="card_x") as mock_post:
+            fd.cmd_qa_approve(args_ns(ticket="FOO-1"))
+
+        # gh pr merge was invoked with --squash
+        merge_calls = [c for c in calls if isinstance(c, list)
+                       and len(c) >= 4 and c[0:3] == ["gh", "pr", "merge"]]
+        self.assertEqual(len(merge_calls), 1)
+        self.assertIn("--squash", merge_calls[0])
+        self.assertIn("--delete-branch", merge_calls[0])
+        # Verification call happened
+        view_calls = [c for c in calls if isinstance(c, list)
+                      and c[0:3] == ["gh", "pr", "view"]]
+        self.assertEqual(len(view_calls), 1)
+        # Card posted
+        mock_post.assert_called_once()
+        self.assertEqual(fd.session_get("FOO-1", "phase"), "merged")
+
+    def test_unmerged_refuses_to_post_card(self):
+        """If gh pr merge returns 0 but mergedAt is null, refuse to lie."""
+        self._sess()
+
+        def fake_run(cmd, **kw):
+            if "merge" in cmd and "pr" in cmd:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            if "view" in cmd and "pr" in cmd:
+                # mergedAt is null — merge didn't actually happen
+                return MagicMock(returncode=0, stdout='{"mergedAt":null}',
+                                 stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(fd.subprocess, "run", side_effect=fake_run), \
+             patch.object(fd, "post_card") as mock_post:
+            with self.assertRaises(SystemExit):
+                fd.cmd_qa_approve(args_ns(ticket="FOO-1"))
+        mock_post.assert_not_called()
+        # Session NOT marked as merged
+        self.assertNotEqual(fd.session_get("FOO-1", "phase"), "merged")
+
+    def test_failing_check_aborts_merge(self):
+        self._sess(checks={"test": "false"})
+
+        def fake_run(cmd, **kw):
+            # shell=True path — check command fails
+            if kw.get("shell"):
+                return MagicMock(returncode=1)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(fd.subprocess, "run", side_effect=fake_run), \
+             patch.object(fd, "post_card") as mock_post:
+            with self.assertRaises(SystemExit):
+                fd.cmd_qa_approve(args_ns(ticket="FOO-1"))
+        mock_post.assert_not_called()
+
+    def test_no_pr_num_fails(self):
+        fd.session_set("FOO-1", worktree=str(Path(self._tmp)))
+        with self.assertRaises(SystemExit):
+            fd.cmd_qa_approve(args_ns(ticket="FOO-1"))
+
+    def test_merge_strategy_config(self):
+        self._sess(merge_strategy="rebase")
+        def fake_run(cmd, **kw):
+            if "merge" in cmd and "pr" in cmd:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            if "view" in cmd and "pr" in cmd:
+                return MagicMock(returncode=0,
+                                 stdout='{"mergedAt":"2026-04-21T20:00:00Z"}')
+            return MagicMock(returncode=0, stdout="")
+
+        captured_cmd = []
+        def capture(cmd, **kw):
+            if isinstance(cmd, list) and len(cmd) >= 4 and cmd[0:3] == ["gh", "pr", "merge"]:
+                captured_cmd.append(cmd)
+            return fake_run(cmd, **kw)
+
+        with patch.object(fd.subprocess, "run", side_effect=capture), \
+             patch.object(fd, "post_card"):
+            fd.cmd_qa_approve(args_ns(ticket="FOO-1"))
+        self.assertIn("--rebase", captured_cmd[0])
+
+    def test_invalid_strategy_fails(self):
+        self._sess(merge_strategy="nonsense")
+        with self.assertRaises(SystemExit):
+            fd.cmd_qa_approve(args_ns(ticket="FOO-1"))
+
+
 class TestSourceRepoResolution(SessionBase):
     """_resolve_source_repo chain: env → CWD git → config."""
 

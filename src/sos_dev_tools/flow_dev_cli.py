@@ -711,28 +711,116 @@ def cmd_work2(args):
     check(f"work-2 done · ready={w.get('ready')} · preview={preview_url or 'none'}")
 
 
+def _load_project_config(worktree):
+    """Read the worktree's .pm/config.json, return {} on any failure."""
+    if not worktree:
+        return {}
+    f = Path(worktree) / ".pm" / "config.json"
+    if not f.exists():
+        return {}
+    try:
+        return json.loads(f.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _run_configured_checks(worktree, cfg):
+    """Run `checks.test`, `checks.lint`, `checks.typecheck` from .pm/config.json.
+    Fail (SystemExit) on any non-zero exit.
+    """
+    checks = (cfg or {}).get("checks") or {}
+    for name in ("test", "lint", "typecheck"):
+        cmd = checks.get(name)
+        if not cmd:
+            continue
+        step(f"running {name}: {cmd}")
+        r = subprocess.run(cmd, shell=True, cwd=worktree or None)
+        if r.returncode != 0:
+            fail(f"{name} failed (exit {r.returncode}) — aborting merge")
+
+
 def cmd_qa_approve(args):
+    """Merge the PR that pm-start opened for this ticket.
+
+    Calls `gh pr merge` directly because the human has already explicitly
+    approved via the inbox "Approve & merge" button — pm-finish's interactive
+    "type merge" step is redundant, and its `sos-feature merge-iteration`
+    merges iteration → feature branch, not the PR.
+
+    Runs configured quality checks first (.pm/config.json `checks.test` etc)
+    and refuses to merge if any fail. Verifies GitHub actually marked the PR
+    as merged before posting the confirmation card — no more silent "false
+    merge" success state.
+    """
     ticket = args.ticket
-    if not PM_FINISH_SKILL.exists():
-        fail(f"pm-finish skill not found at {PM_FINISH_SKILL}")
-    step(f"delegating merge to pm-finish {ticket}")
-    body = PM_FINISH_SKILL.read_text() + f"\n\n{ticket}\n"
-    rc = run_subagent(f"flow-{ticket}-merge", body)
-    if rc != 0:
-        fail(f"pm-finish subagent exited {rc}")
     sess = session_get(ticket) or {}
+    pr_num = sess.get("pr_num")
+    if not pr_num:
+        fail(f"no PR number on record for {ticket}")
+    worktree = sess.get("worktree")
+    cfg = _load_project_config(worktree)
+
+    _run_configured_checks(worktree, cfg)
+
+    git_cfg = cfg.get("git") or {}
+    strategy = (git_cfg.get("merge_strategy") or "squash").lower()
+    strategy_flag = {"squash": "--squash",
+                     "merge": "--merge",
+                     "rebase": "--rebase"}.get(strategy)
+    if not strategy_flag:
+        fail(f"unknown merge_strategy {strategy!r} — use squash|merge|rebase")
+    delete_branch = git_cfg.get("delete_branch_on_merge", True)
+
+    merge_cmd = ["gh", "pr", "merge", str(pr_num), strategy_flag]
+    if delete_branch:
+        merge_cmd.append("--delete-branch")
+    step(f"merging PR #{pr_num} ({strategy})")
+    r = subprocess.run(merge_cmd, cwd=worktree or None,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        fail(f"gh pr merge failed: {(r.stderr or r.stdout).strip()}")
+
+    # Verify GitHub actually marked it merged. Pre-refactor, a silent
+    # subagent no-op would falsely post a "Merged" card.
+    verify = subprocess.run(
+        ["gh", "pr", "view", str(pr_num), "--json", "mergedAt"],
+        cwd=worktree or None, capture_output=True, text=True,
+    )
+    merged_at = None
+    if verify.returncode == 0:
+        try:
+            merged_at = json.loads(verify.stdout).get("mergedAt")
+        except json.JSONDecodeError:
+            pass
+    if not merged_at:
+        fail(f"gh pr merge returned 0 but PR #{pr_num} is not marked merged "
+             f"(mergedAt is null) — refusing to post confirmation")
+
+    # Update Jira if the project has auto_transition + a known done status.
+    jira_cfg = cfg.get("jira") or {}
+    if jira_cfg.get("auto_transition"):
+        done_status = jira_cfg.get("done_status") or "Done"
+        subprocess.run(["sos-jira", "move", ticket, done_status],
+                       capture_output=True, text=True, check=False)
+        subprocess.run(
+            ["sos-jira", "comment", ticket,
+             f"PR #{pr_num} merged via sos-flow-dev."],
+            capture_output=True, text=True, check=False,
+        )
+
     post_card(
         "info", f"Merged · {ticket}",
         ticket=ticket, url=sess.get("pr_url") or None,
-        ctx="branch merged into parent",
+        ctx=f"PR #{pr_num} merged · {strategy} → {sess.get('parent_branch', 'parent')}",
         actions=[
             {"label": "Open PR", "kind": "openUrl"},
             {"label": "Cleanup worktree", "kind": "inject",
              "text": f"sos-flow-dev cleanup {ticket}\n", "execute": True},
         ],
     )
-    session_set(ticket, phase="merged", merged_at=now_iso())
-    check(f"{ticket} merged")
+    session_set(ticket, phase="merged", merged_at=now_iso(),
+                merged_via=strategy)
+    check(f"{ticket} merged (PR #{pr_num}, {strategy})")
 
 
 def cmd_qa_reject(args):
