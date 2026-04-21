@@ -485,5 +485,100 @@ class TestCmdWait(unittest.TestCase):
             mock_get.assert_not_called()
 
 
+class TestCmdPrompt(unittest.TestCase):
+    """cmd_prompt is a composite: post card → wait for reply → remove → print text."""
+
+    def _base_args(self, **over):
+        base = dict(
+            title="Use JWT or sessions?",
+            ticket="FOO-1",
+            url=None,
+            ctx="ADR-014 conflict",
+            actions='[{"label":"JWT","kind":"reply","text":"use JWT"}]',
+            timeout=60,
+            json=False,
+        )
+        base.update(over)
+        return make_args(**base)
+
+    @patch.object(inbox_cli, "_delete", return_value={"ok": True})
+    @patch.object(inbox_cli, "_get", return_value={"reply": {"text": "use JWT", "ts": 123}})
+    @patch.object(inbox_cli, "_post", return_value={"ok": True, "id": "card_abc"})
+    def test_happy_path_posts_waits_removes_prints(self, mock_post, mock_get, mock_delete):
+        with patch("builtins.print") as mock_print:
+            inbox_cli.cmd_prompt(self._base_args())
+
+        # 1. Posts the card as action-kind.
+        post_path, post_body = mock_post.call_args[0]
+        self.assertEqual(post_path, "/inbox")
+        self.assertEqual(post_body["kind"], "action")
+        self.assertEqual(post_body["ticket"], "FOO-1")
+        self.assertEqual(post_body["title"], "Use JWT or sessions?")
+        self.assertEqual(post_body["actions"], [{"label": "JWT", "kind": "reply", "text": "use JWT"}])
+
+        # 2. Waits on that card.
+        self.assertIn("/inbox/card_abc/wait", mock_get.call_args[0][0])
+
+        # 3. Removes the card.
+        mock_delete.assert_called_with("/inbox/card_abc")
+
+        # 4. Prints the reply text.
+        mock_print.assert_called_with("use JWT")
+
+    @patch.object(inbox_cli, "_delete", return_value={"ok": True})
+    @patch.object(inbox_cli, "_get", return_value={"reply": {"text": "later", "ts": 42}})
+    @patch.object(inbox_cli, "_post", return_value={"ok": True, "id": "card_abc"})
+    def test_json_output(self, mock_post, mock_get, mock_delete):
+        with patch("builtins.print") as mock_print:
+            inbox_cli.cmd_prompt(self._base_args(json=True))
+        parsed = json.loads(mock_print.call_args[0][0])
+        self.assertEqual(parsed, {"text": "later", "ts": 42})
+
+    @patch.object(inbox_cli, "_delete", return_value={"ok": True})
+    @patch.object(inbox_cli, "_get")
+    @patch.object(inbox_cli, "_post", return_value={"ok": True, "id": "card_abc"})
+    def test_retries_through_timeouts(self, mock_post, mock_get, mock_delete):
+        mock_get.side_effect = [
+            {"timeout": True},
+            {"timeout": True},
+            {"reply": {"text": "finally", "ts": 9}},
+        ]
+        with patch("builtins.print") as mock_print:
+            inbox_cli.cmd_prompt(self._base_args())
+        self.assertEqual(mock_get.call_count, 3)
+        mock_print.assert_called_with("finally")
+
+    @patch.object(inbox_cli, "_delete", return_value={"ok": True})
+    @patch.object(inbox_cli, "_get")
+    @patch.object(inbox_cli, "_post", return_value={"ok": True, "id": "card_abc"})
+    def test_deadline_exits_nonzero_and_still_removes(self, mock_post, mock_get, mock_delete):
+        # timeout=0 → deadline already passed → exit 2 before ever polling.
+        # Still must clean up the posted card.
+        args = self._base_args(timeout=0)
+        with self.assertRaises(SystemExit) as cm:
+            with patch("builtins.print"):
+                inbox_cli.cmd_prompt(args)
+        self.assertEqual(cm.exception.code, 2)
+        mock_delete.assert_called_with("/inbox/card_abc")
+
+    @patch.object(inbox_cli, "_post", return_value=None)
+    def test_unreachable_on_post_exits(self, mock_post):
+        with self.assertRaises(SystemExit) as cm:
+            with patch("builtins.print"):
+                inbox_cli.cmd_prompt(self._base_args())
+        self.assertEqual(cm.exception.code, 1)
+
+    @patch.object(inbox_cli, "_delete", return_value={"ok": True})
+    @patch.object(inbox_cli, "_get", return_value=None)
+    @patch.object(inbox_cli, "_post", return_value={"ok": True, "id": "card_abc"})
+    def test_unreachable_mid_wait_still_removes(self, mock_post, mock_get, mock_delete):
+        # Sidebar goes down mid-wait — exit 1 but still clean up the card so
+        # it doesn't leak in the server's inbox.
+        with self.assertRaises(SystemExit):
+            with patch("builtins.print"):
+                inbox_cli.cmd_prompt(self._base_args())
+        mock_delete.assert_called_with("/inbox/card_abc")
+
+
 if __name__ == "__main__":
     unittest.main()

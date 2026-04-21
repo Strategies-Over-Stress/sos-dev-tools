@@ -23,6 +23,11 @@ Usage:
     sos-inbox reply CARD_ID "text"       # append a reply to a card
     sos-inbox replies CARD_ID [--json]   # list replies on a card
     sos-inbox wait CARD_ID [--timeout SEC] [--since TS]  # block until a reply arrives
+    sos-inbox prompt "Question" --ticket T \\
+        --actions '[{"label":"A","kind":"reply","text":"use A"}, ...]' \\
+        --timeout 1800
+        # ↑ the blocker primitive: posts an action card, long-polls for a reply,
+        #   auto-removes the card, prints the reply text. One line per blocker.
     sos-inbox status
 
 All network errors except HTTP 4xx/5xx silently no-op and exit 0 — a missing
@@ -190,6 +195,60 @@ def cmd_remove(args):
     print(f"removed {args.card_id}")
 
 
+def cmd_prompt(args):
+    """The blocker primitive: post an action card, wait for a reply, remove it.
+
+    One line per blocker. Returns the reply text on stdout; non-zero exit if
+    the wait times out or the sidebar is unreachable.
+    """
+    # 1. Post the card (kind is always "action" for a prompt).
+    card = build_card("action", args)
+    result = _post("/inbox", card)
+    if result is None:
+        print("inbox unreachable", file=sys.stderr)
+        sys.exit(1)
+    card_id = result.get("id")
+    if not card_id:
+        print(f"unexpected response from POST /inbox: {result!r}", file=sys.stderr)
+        sys.exit(1)
+
+    # 2. Long-poll for the first reply.
+    deadline = time.time() + args.timeout
+    since = 0
+    reply = None
+    try:
+        while reply is None:
+            remaining_s = deadline - time.time()
+            if remaining_s <= 0:
+                print("prompt: timed out waiting for reply", file=sys.stderr)
+                sys.exit(2)
+            chunk_ms = min(int(remaining_s * 1000), SERVER_WAIT_CAP_MS)
+            http_timeout = (chunk_ms / 1000) + 5
+            got = _get(
+                f"/inbox/{card_id}/wait?since={since}&timeout_ms={chunk_ms}",
+                timeout=http_timeout,
+            )
+            if got is None:
+                print("inbox unreachable", file=sys.stderr)
+                sys.exit(1)
+            if "reply" in got:
+                reply = got["reply"]
+            elif got.get("timeout"):
+                since = int(time.time() * 1000)
+                continue
+            else:
+                print(f"prompt: unexpected response {got!r}", file=sys.stderr)
+                sys.exit(1)
+    finally:
+        # 3. Always clean the card — even if the user Ctrl-C's the prompt.
+        _delete(f"/inbox/{card_id}")
+
+    if args.json:
+        print(json.dumps(reply))
+    else:
+        print(reply.get("text", ""))
+
+
 def cmd_reply(args):
     """Append a reply to a card."""
     result = _post(f"/inbox/{args.card_id}/reply", {"text": args.text})
@@ -348,6 +407,23 @@ def main():
     p.add_argument("--json", action="store_true",
                    help="Output the full reply object as JSON instead of just text")
 
+    p = sub.add_parser(
+        "prompt",
+        help="Blocker primitive: post action card, wait for reply, remove card",
+        description=(
+            "Single command for subagent blockers. Posts an action card, "
+            "long-polls until a human replies (via the sidebar textarea or "
+            "a reply-kind action button), removes the card, prints the "
+            "reply text to stdout. Use this instead of manual "
+            "action/wait/remove chains."
+        ),
+    )
+    _add_card_args(p, with_actions=True)
+    p.add_argument("--timeout", type=int, default=3600,
+                   help="Max total wait in seconds (default: 3600)")
+    p.add_argument("--json", action="store_true",
+                   help="Output the full reply object as JSON")
+
     sub.add_parser("status", help="Show whether any browser tab is connected")
 
     args = parser.parse_args()
@@ -361,6 +437,7 @@ def main():
         "reply": cmd_reply,
         "replies": cmd_replies,
         "wait": cmd_wait,
+        "prompt": cmd_prompt,
         "status": cmd_status,
     }[args.command](args)
 
