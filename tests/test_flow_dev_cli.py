@@ -679,11 +679,12 @@ class TestPreviewCommand(SessionBase):
         self.assertIsNone(fd._preview_config_for_ticket("FOO-1"))
 
     def test_normalize_legacy_config(self):
+        # Port in config is IGNORED — runner assigns at runtime.
         cfg = {"command": "npm run storybook", "cwd": "packages/ui", "port": 6006}
         svcs = fd._normalize_preview_config(cfg)
         self.assertEqual(svcs, [{
             "name": "default", "command": "npm run storybook",
-            "cwd": "packages/ui", "port": 6006,
+            "cwd": "packages/ui", "port": None,
         }])
 
     def test_normalize_multi_service_config(self):
@@ -696,7 +697,9 @@ class TestPreviewCommand(SessionBase):
         self.assertEqual(len(svcs), 2)
         self.assertEqual(svcs[0]["name"], "app")
         self.assertEqual(svcs[1]["name"], "storybook")  # lower-cased
-        self.assertEqual(svcs[1]["port"], 6006)
+        # port ignored from config — always None
+        self.assertIsNone(svcs[0]["port"])
+        self.assertIsNone(svcs[1]["port"])
 
     def test_normalize_drops_services_without_command(self):
         cfg = {"services": [
@@ -720,15 +723,36 @@ class TestPreviewCommand(SessionBase):
         self.assertIsNone(results[0]["session"])
         self.assertIn("no worktree", results[0]["error"])
 
-    def test_start_preview_port_already_bound(self):
+    def test_start_preview_port_collision_falls_back(self):
+        """Configured port already bound → runner picks next free and warns."""
         wt = Path(self._tmp) / "wt-1"
         wt.mkdir()
         fd.session_set("FOO-1", worktree=str(wt))
-        with patch.object(fd, "_port_reachable", return_value=True):
+
+        # First call returns True (port 6006 bound), subsequent calls False.
+        reachable_calls = [True, False]
+        def fake_reachable(port, timeout=1.0):
+            if port == 6006:
+                return True
+            return False
+
+        with patch.object(fd, "_port_reachable", side_effect=fake_reachable), \
+             patch.object(fd, "_tmux_session_exists", return_value=False), \
+             patch.object(fd, "_next_free_port", return_value=6099), \
+             patch.object(fd.subprocess, "run",
+                          return_value=MagicMock(returncode=0, stderr="")):
             results = fd._start_preview_for(
-                "FOO-1", [{"name": "default", "command": "npm run dev",
-                           "cwd": "", "port": 6006}], wait=False)
-        self.assertIn("already in use", results[0]["error"])
+                "FOO-1",
+                [{"name": "default", "command": "npm run dev",
+                  "cwd": "", "port": 6006}],
+                wait=False)
+        r = results[0]
+        # Started successfully on the fallback port
+        self.assertEqual(r["url"], "http://localhost:6099")
+        self.assertIsNotNone(r["session"])
+        # Warning recorded
+        self.assertIn("6006", r["error"])
+        self.assertIn("6099", r["error"])
 
     def test_start_preview_spawns_tmux(self):
         wt = Path(self._tmp) / "wt-1"

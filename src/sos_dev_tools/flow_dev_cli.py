@@ -245,10 +245,12 @@ RESULT FILE: /tmp/flow-{ticket}-worktree.json  ← write your decision here
    - Ensure `{cwd}/claude/worktrees/` exists (`mkdir -p`).
    - Pick the lowest unused integer N for `wt-N` (scan existing pool).
    - Create:  `git -C {cwd} worktree add claude/worktrees/wt-N <parent_branch>`
-   - If CWD has a `.pm/config.json`, copy it into the new worktree's `.pm/` dir.
-     Then bump `preview.port` by (N — the new worktree's index) so each pool
-     entry has a unique port. If no config.json exists in CWD, skip this step
-     (flow will fall through to "no preview" per pm-start's handling).
+   - If CWD has a `.pm/config.json`, copy it into the new worktree's `.pm/`
+     dir **verbatim — do NOT modify ports or any other field**. Ports are a
+     runtime concern handled by `sos-flow-dev preview`, which picks free ports
+     from its pool (6006-6099) at start time. Copying the config unchanged
+     means every worktree inherits the same commands/services without the
+     allocator needing to coordinate port assignments.
    - Set `action: "created"`.
 
 5. **Write the result file** at `/tmp/flow-{ticket}-worktree.json`:
@@ -775,13 +777,16 @@ def _normalize_preview_config(cfg):
     """Return a list of service dicts [{name, command, cwd, port}] from any
     supported preview config shape.
 
-    Legacy:   {"command": "...", "cwd": "...", "port": N}
-              → one service named "default"
-    Multi:    {"services": [{"name": "...", "command": "...", "cwd": ..., "port": N}]}
-              → list as-is
+    Legacy:   {"command": "...", "cwd": "..."}         → one service named "default"
+    Multi:    {"services": [{"name": ..., "command": ..., "cwd": ...}]}
 
-    Services without a `command` are dropped. Ports left as None get auto-
-    assigned at start time.
+    `port` is INTENTIONALLY ignored from config. Ports are a runtime concern —
+    the preview runner assigns them from its free pool (6006-6099) each time
+    a service starts, so config stays portable across worktrees and never
+    collides with itself on parallel runs. Pass `--port N` on the CLI to force
+    a specific port for a one-off invocation.
+
+    Services without a `command` are dropped.
     """
     if not cfg or not isinstance(cfg, dict):
         return []
@@ -795,7 +800,7 @@ def _normalize_preview_config(cfg):
                 "name": (s.get("name") or f"svc{i}").lower(),
                 "command": s["command"],
                 "cwd": s.get("cwd") or "",
-                "port": int(s["port"]) if s.get("port") else None,
+                "port": None,  # always auto-assign at runtime
             })
         return out
     if cfg.get("command"):
@@ -803,7 +808,7 @@ def _normalize_preview_config(cfg):
             "name": "default",
             "command": cfg["command"],
             "cwd": cfg.get("cwd") or "",
-            "port": int(cfg["port"]) if cfg.get("port") else None,
+            "port": None,
         }]
     return []
 
@@ -895,9 +900,17 @@ def _start_preview_for(ticket, services, wait=True):
                             "error": f"already running (tmux: {tmux_session})"})
             continue
         if _port_reachable(port):
-            results.append({"name": name, "session": None, "url": None,
-                            "error": f"port {port} is already in use"})
-            continue
+            # Someone else is on this port; pick the next free one and keep going.
+            try:
+                fallback = _next_free_port(start=port + 1)
+            except RuntimeError as e:
+                results.append({"name": name, "session": None, "url": None,
+                                "error": f"port {port} in use and no free port: {e}"})
+                continue
+            results_warn = f"port {port} in use, switched to {fallback}"
+            port = fallback
+        else:
+            results_warn = None
 
         log_path = worktree / ".pm" / f"preview-{name}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -919,7 +932,7 @@ def _start_preview_for(ticket, services, wait=True):
         preview_urls[name] = url
         preview_sessions[name] = tmux_session
         results.append({"name": name, "session": tmux_session, "url": url,
-                        "error": None})
+                        "error": results_warn})
 
     # Persist consolidated state. `preview_url` (singular) stays populated with
     # the primary — first service that started cleanly — so existing
