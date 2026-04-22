@@ -3453,12 +3453,159 @@ def _stop_ticket(ticket, include_preview=False, include_worktree=False):
         except Exception as e:
             result["errors"].append(f"worktree removal: {e}")
 
-    # Record the stop in session state so the UI can see it
+    # Record the stop in session state. Preserve the prior phase as
+    # `stopped_from_phase` so `sos-flow-dev resume` can pick up from the
+    # right place — otherwise resume would have to restart from alloc.
     sess = session_get(ticket)
     if sess:
-        session_set(ticket, phase="stopped", stopped_at=now_iso())
+        prior = sess.get("phase") or ""
+        fields = {"phase": "stopped", "stopped_at": now_iso()}
+        if prior and prior != "stopped":
+            fields["stopped_from_phase"] = prior
+        session_set(ticket, **fields)
 
     return result
+
+
+def cmd_resume(args):
+    """Pick up a stopped ticket from where it left off.
+
+    Dispatches based on observable state + `stopped_from_phase`:
+      - No PR on record → restart from `sos-flow-dev start` (goes through
+        alloc which reuses the existing worktree, then pm-start which
+        has its own resume logic via .pm/failed.json)
+      - PR exists but no review result → run `phase_review`
+      - Review verdict was changes-requested → run work-2 loop (which
+        auto-retries + re-reviews)
+      - Review verdict was approve → post QA card
+      - stopped_from_phase in (review-2-*, review-3-*): treat as halted
+        after re-review; operator should qa-reject if they want work-4+
+
+    Idempotent: safe to call repeatedly; each invocation resolves to the
+    deepest unfinished phase.
+    """
+    ticket = args.ticket
+    sess = session_get(ticket)
+    if not sess:
+        fail(f"no session for {ticket}")
+
+    # Clear the stopped flag up-front so any cards we post reflect "running"
+    from_phase = sess.get("stopped_from_phase") or sess.get("phase", "")
+    pr_num = sess.get("pr_num") or extract_pr_num(sess.get("pr_url") or "")
+    wt_path = sess.get("worktree")
+
+    step(f"Resuming {ticket} (was at phase={from_phase!r})")
+
+    # Case 1: never got a PR → rewind to `start`
+    if not pr_num:
+        session_set(ticket, phase=from_phase or "alloc")
+        # os.chdir sometimes needed by _run_start_blocking; safest to
+        # re-dispatch through cmd_start with the right args shape.
+        start_args = argparse.Namespace(
+            tickets=[ticket],
+            base=sess.get("parent_branch") or None,
+            iteration="first-pass",
+            max_retries=3,
+            pause_after=None,
+            detach=False,
+            watch=False,
+        )
+        return cmd_start(start_args)
+
+    # PR exists — pick up from wherever review/work left off.
+    wt = Path(wt_path) if wt_path else None
+    if wt and not wt.is_dir():
+        fail(f"worktree {wt} no longer exists; cleanup the ticket or "
+             f"`sos-flow-dev start {ticket}` to re-alloc")
+
+    os.chdir(wt)
+    rf = wt / ".pm" / "review-result.json"
+    review_result = None
+    if rf.exists():
+        try:
+            review_result = json.loads(rf.read_text())
+        except (json.JSONDecodeError, OSError):
+            review_result = None
+
+    # Case 2: no review yet → run it
+    if review_result is None:
+        session_set(ticket, phase="review")
+        r = phase_review(ticket, pr_num)
+        verdict = r.get("verdict")
+        comments = r.get("comments", 0)
+        post_card(
+            "info", f"Review posted — {comments} comments",
+            ticket=ticket, url=sess.get("pr_url") or None,
+            ctx=f"Verdict: {verdict}",
+        )
+        if verdict == "changes-requested":
+            # Fall through to work-2 loop below
+            review_result = r
+        else:
+            session_set(ticket, review_verdict=verdict,
+                        review_comments=comments, phase="awaiting-qa")
+            post_card("action", "Ready for QA", ticket=ticket,
+                      url=sess.get("pr_url") or None,
+                      ctx=f"PR #{pr_num} · see PR description for QA steps",
+                      actions=qa_card_actions(ticket, sess.get("pr_url", ""),
+                                              sess.get("preview_url", "")))
+            check(f"{ticket} resumed → awaiting QA")
+            return
+
+    verdict = review_result.get("verdict")
+    comments_n = review_result.get("comments", 0)
+
+    # Case 3: review said approve → straight to QA card
+    if verdict == "approve":
+        session_set(ticket, phase="awaiting-qa",
+                    review_verdict=verdict, review_comments=comments_n)
+        post_card("action", "Ready for QA", ticket=ticket,
+                  url=sess.get("pr_url") or None,
+                  ctx=f"PR #{pr_num} · resumed from stopped",
+                  actions=qa_card_actions(ticket, sess.get("pr_url", ""),
+                                          sess.get("preview_url", "")))
+        check(f"{ticket} resumed → awaiting QA (review was already approve)")
+        return
+
+    # Case 4: changes-requested → work-2 loop (auto-retries re-review)
+    def work2_worker(attempt):
+        cur_n = comments_n if attempt == 0 else _count_pr_comments(pr_num)
+        w = phase_work2(ticket, pr_num, cur_n)
+        if "failed" in w:
+            fail(f"work-2 failed on resume: {w.get('failed')}")
+        session_set(ticket, preview_url=w.get("url") or sess.get("preview_url", ""),
+                    phase=f"review-2-attempt-{attempt + 1}")
+
+    def on_cap(last, attempts):
+        session_set(ticket, review_verdict=last.get("verdict"),
+                    review_comments=last.get("comments", 0),
+                    phase="review-2-failed")
+        post_card("action", f"⊘ {ticket} halted after resume — cap hit",
+                  ticket=ticket, url=sess.get("pr_url") or None,
+                  ctx=f"Ran {attempts} cycles after resume; still "
+                      f"{last.get('comments', 0)} issues.",
+                  actions=[
+                      {"label": "Open PR", "kind": "openUrl"},
+                      {"label": "Retry", "kind": "exec",
+                       "cmd": f"sos-flow-dev qa-reject {ticket} \"resume retry\""},
+                      {"label": "Approve anyway", "kind": "exec",
+                       "cmd": f"sos-flow-dev qa-approve {ticket}"},
+                  ])
+
+    r2 = _work_rereview_loop(
+        ticket, pr_num, work2_worker,
+        max_retries=getattr(args, "max_retries", 3),
+        on_cap_halt=on_cap,
+    )
+    session_set(ticket, review_verdict=r2.get("verdict"),
+                review_comments=r2.get("comments", 0),
+                phase="awaiting-qa")
+    post_card("action", "Ready for QA", ticket=ticket,
+              url=sess.get("pr_url") or None,
+              ctx=f"PR #{pr_num} · resumed + re-review approved",
+              actions=qa_card_actions(ticket, sess.get("pr_url", ""),
+                                      sess.get("preview_url", "")))
+    check(f"{ticket} resumed → awaiting QA")
 
 
 def cmd_stop(args):
@@ -3712,6 +3859,17 @@ def main():
                    help="Pretty-print JSON output (default: compact)")
 
     p = sub.add_parser(
+        "resume",
+        help="Pick up a stopped ticket from its last phase. Dispatches "
+             "to review / work-2 / QA based on observable state + the "
+             "recorded stopped_from_phase. Safe to call repeatedly.",
+    )
+    p.add_argument("ticket")
+    p.add_argument("--max-retries", type=int, default=3,
+                   help="Max work-2 retries on resume (same semantics as "
+                        "`start --max-retries`). Default 3.")
+
+    p = sub.add_parser(
         "stop",
         help="Kill every running process for a ticket (flow-runner + phase "
              "subagents + activity watcher). Optionally kill previews + "
@@ -3774,6 +3932,7 @@ def main():
         "config": cmd_config,
         "cleanup": cmd_cleanup,
         "stop": cmd_stop,
+        "resume": cmd_resume,
     }[args.subcommand](args)
 
 
