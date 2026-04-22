@@ -624,14 +624,11 @@ def _run_verifier(ticket, phase, worktree):
             pass
     step(f"Phase {phase} — verify")
 
-    # Watcher around the verifier so operator can see "it's running" in the
-    # sidebar even though verifiers typically don't touch the worktree.
-    watcher = spawn_watcher(ticket, f"verify-{phase}")
-    verifier_rc = 1
-    try:
-        verifier_rc = run_subagent(session, prompt)
-    finally:
-        stop_watcher(watcher, error=(verifier_rc != 0))
+    # No sidebar watcher for the verifier: it's short-lived (30-60s), does
+    # not touch the worktree, and its card would show metrics identical to
+    # the worker's final state (same worktree, no new commits). Just log
+    # start/end to the console; operator sees it in their terminal.
+    verifier_rc = run_subagent(session, prompt)
 
     if verifier_rc != 0:
         print(f"  ✗ verifier subagent exited {verifier_rc}", file=sys.stderr)
@@ -2131,22 +2128,32 @@ def _inbox_post(path, body):
         return None
 
 
-def _git_snapshot(worktree, base_ref):
-    """Snapshot (working-tree changes, commits ahead of base_ref).
+def _git_snapshot(worktree, base_ref, phase_start_head=None):
+    """Cumulative snapshot: (files-touched-this-phase, commits-this-phase).
 
-    Working-tree changes come from `git status --porcelain` — captures new
-    files (before `git add`), modifications, renames, deletions. This is the
-    richest signal during scaffolding.
+    "Files touched this phase" = union of
+      - currently-uncommitted files in the working tree (porcelain)
+      - files in the diff from phase_start_head..HEAD (i.e., files
+        changed by any commits the agent has landed since the phase began)
 
-    Commits ahead of base_ref captures when the dev agent actually commits.
+    Without the second set, the file count would non-monotonically
+    decrease as the agent commits work — porcelain stops reporting a
+    file once it's committed, so the watcher would see "removed". That's
+    technically correct for "uncommitted changes" but misleading as a
+    progress signal: the agent did MORE work and the count WENT DOWN.
+
+    Cumulative union gives a monotonically non-decreasing file count that
+    matches operator intuition ("how many files has this phase touched?").
+
+    Commits count comes from phase_start_head..HEAD when provided, else
+    base_ref..HEAD as a fallback. phase_start_head is preferred because
+    it filters out commits that existed at phase entry (e.g., base branch
+    already ahead of the remote).
     """
     try:
-        # --untracked-files=all: when a new directory is untracked, plain
-        # `git status --porcelain` collapses its entire contents into a
-        # single "?? dir/" entry and no further diff ever fires for files
-        # added inside — the watcher then reports 0 changes and falsely
-        # triggers silence warnings while the agent is actively scaffolding.
-        # -uall forces per-file listing even under untracked dirs.
+        # --untracked-files=all: without it, an untracked directory is
+        # collapsed to a single "?? dir/" entry and the watcher never sees
+        # files added inside — false silence warnings during scaffolding.
         status = subprocess.run(
             ["git", "-C", str(worktree), "status", "--porcelain",
              "--untracked-files=all"],
@@ -2160,17 +2167,34 @@ def _git_snapshot(worktree, base_ref):
         if len(line) < 3:
             continue
         path = line[3:]
-        # "R  old -> new" — we only care about the destination.
         if " -> " in path:
             path = path.split(" -> ")[-1]
         files.add(path.strip('"'))
 
+    # Add files changed via commits since phase started. This keeps the
+    # set from shrinking when the agent commits — the file moves out of
+    # porcelain but is still "touched this phase."
+    commits_ref = phase_start_head or base_ref
+    if phase_start_head:
+        try:
+            diff_out = subprocess.run(
+                ["git", "-C", str(worktree), "diff", "--name-only",
+                 f"{phase_start_head}..HEAD"],
+                capture_output=True, text=True, timeout=10, check=False,
+            ).stdout
+            for p in diff_out.splitlines():
+                p = p.strip()
+                if p:
+                    files.add(p)
+        except subprocess.SubprocessError:
+            pass
+
     n_commits = 0
-    if base_ref:
+    if commits_ref:
         try:
             out = subprocess.run(
                 ["git", "-C", str(worktree), "rev-list", "--count",
-                 f"{base_ref}..HEAD"],
+                 f"{commits_ref}..HEAD"],
                 capture_output=True, text=True, timeout=10, check=False,
             ).stdout.strip()
             if out.isdigit():
@@ -2289,11 +2313,13 @@ def _diff_review_snapshot(prev, cur):
     return lines
 
 
-def _make_phase_tracker(phase, worktree, base_ref, pr_num):
+def _make_phase_tracker(phase, worktree, base_ref, pr_num,
+                        phase_start_head=None):
     """Pick the right snapshot/diff pair for the phase.
 
     Review phase watches GitHub PR comment state (file/commit tracking is
-    zero-signal during review). Other phases default to git-based tracking.
+    zero-signal during review). Other phases default to git-based tracking
+    with cumulative file + commit counting scoped to phase_start_head.
     """
     if phase == "review":
         return {
@@ -2308,7 +2334,7 @@ def _make_phase_tracker(phase, worktree, base_ref, pr_num):
             ),
         }
     return {
-        "snapshot": lambda: _git_snapshot(worktree, base_ref),
+        "snapshot": lambda: _git_snapshot(worktree, base_ref, phase_start_head),
         "diff": lambda p, c: _diff_to_log_lines(p[0], c[0], p[1], c[1], worktree),
         "metrics": lambda sig: {
             "files_changed": len(sig[0]),
@@ -2339,7 +2365,11 @@ def cmd_activity(args):
     silence_s = max(30, args.silence_threshold)
 
     started = time.time()
-    tracker = _make_phase_tracker(phase, worktree, base_ref, pr_num)
+    # Pin HEAD at watcher-start so file + commit counts are scoped to THIS
+    # phase, not "whatever the branch has been doing since it was created."
+    phase_start_head = _capture_head(worktree)
+    tracker = _make_phase_tracker(phase, worktree, base_ref, pr_num,
+                                  phase_start_head=phase_start_head)
     prev_signal = tracker["snapshot"]()
 
     title = f"{ticket} · {phase}"

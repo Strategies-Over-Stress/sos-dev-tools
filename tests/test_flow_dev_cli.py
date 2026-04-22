@@ -1590,6 +1590,54 @@ class TestActivitySnapshot(unittest.TestCase):
         status_call = next(c for c in captured if "status" in c)
         self.assertIn("--untracked-files=all", status_call)
 
+    def test_snapshot_cumulative_includes_committed_files(self):
+        """Regression: when an agent commits a file it drops from
+        porcelain. Without cumulative tracking, the watcher would see the
+        file COUNT DECREASE when the agent did MORE work — misleading
+        progress signal. With phase_start_head passed in, _git_snapshot
+        unions the porcelain set with `git diff --name-only <head>..HEAD`
+        so the count is monotonic for the life of the phase."""
+        def fake_run(cmd, **kw):
+            if "status" in cmd:
+                # Currently uncommitted: one modified file
+                return MagicMock(stdout=" M src/active.ts\n")
+            if "diff" in cmd and "--name-only" in cmd:
+                # Already-committed in this phase: two files
+                return MagicMock(stdout="src/done1.ts\nsrc/done2.ts\n")
+            if "rev-list" in cmd:
+                return MagicMock(stdout="2\n")
+            return MagicMock(stdout="")
+        with patch.object(fd.subprocess, "run", side_effect=fake_run):
+            files, commits = fd._git_snapshot(
+                Path("/wt"), "main", phase_start_head="abc123")
+        # Union of uncommitted + committed-this-phase
+        self.assertEqual(files, {"src/active.ts", "src/done1.ts", "src/done2.ts"})
+        self.assertEqual(commits, 2)
+
+    def test_snapshot_no_phase_start_head_falls_back_to_base(self):
+        """When phase_start_head is None (legacy callers), commit count
+        falls back to base_ref..HEAD and no diff-based cumulative files
+        are added (only porcelain). Preserves old behavior for callers
+        that don't pin a phase start."""
+        diff_called = []
+        def fake_run(cmd, **kw):
+            if "status" in cmd:
+                return MagicMock(stdout=" M a.ts\n")
+            if "diff" in cmd and "--name-only" in cmd:
+                diff_called.append(cmd)
+                return MagicMock(stdout="")
+            if "rev-list" in cmd:
+                # Verify base_ref is used, not phase_start_head
+                self.assertIn("main..HEAD", " ".join(cmd))
+                return MagicMock(stdout="1\n")
+            return MagicMock(stdout="")
+        with patch.object(fd.subprocess, "run", side_effect=fake_run):
+            files, commits = fd._git_snapshot(Path("/wt"), "main", phase_start_head=None)
+        # diff --name-only never called when phase_start_head is absent
+        self.assertEqual(diff_called, [])
+        self.assertEqual(files, {"a.ts"})
+        self.assertEqual(commits, 1)
+
 
 class TestInboxPost(unittest.TestCase):
     """_inbox_post is a thin urllib wrapper — validate payload shape and error
