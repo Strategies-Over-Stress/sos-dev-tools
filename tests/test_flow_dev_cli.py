@@ -223,7 +223,7 @@ class TestCmdStartHappyPath(SessionBase):
             review.return_value = {"comments": 0, "verdict": "approve"}
             fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after=None, base=None, detach=False, watch=False))
 
-            pm.assert_called_once_with("FOO-1")
+            pm.assert_called_once_with("FOO-1", iteration="first-pass")
             review.assert_called_once()
             work2.assert_not_called()
 

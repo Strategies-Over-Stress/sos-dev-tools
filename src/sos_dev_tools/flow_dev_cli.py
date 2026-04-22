@@ -469,12 +469,12 @@ blocks on that file.
 """
 
 
-def phase_pm_start(ticket):
-    step(f"Phase 1/5 — pm-start {ticket}")
+def phase_pm_start(ticket, iteration="first-pass"):
+    step(f"Phase 1/5 — pm-start {ticket} {iteration}")
     if not PM_START_SKILL.exists():
         fail(f"pm-start skill not found at {PM_START_SKILL}")
     prefix = _FLOW_DEV_PREFIX_TEMPLATE.format(ticket=ticket)
-    body = prefix + PM_START_SKILL.read_text() + f"\n\n{ticket} first-pass\n"
+    body = prefix + PM_START_SKILL.read_text() + f"\n\n{ticket} {iteration}\n"
     rc = run_subagent(f"flow-{ticket}-work1", body)
     if rc != 0:
         fail(f"pm-start subagent exited {rc}")
@@ -545,7 +545,7 @@ def gate(ticket, question):
 
 # ─── Top-level subcommands ─────────────────────────────────────────────────
 
-def _launch_runner(ticket, base=None, pause_after=None):
+def _launch_runner(ticket, base=None, pause_after=None, iteration=None):
     """Spawn a detached tmux session running `sos-flow-dev start <ticket>`.
 
     Returns (session_name, log_path) on success, (None, error_message) on failure.
@@ -561,6 +561,8 @@ def _launch_runner(ticket, base=None, pause_after=None):
     cmd_parts = ["sos-flow-dev", "start", ticket]
     if base:
         cmd_parts += ["--base", base]
+    if iteration and iteration != "first-pass":
+        cmd_parts += ["--iteration", iteration]
     if pause_after:
         cmd_parts += ["--pause-after", pause_after]
     log_path = f"/tmp/flow-runner-{ticket}.log"
@@ -580,13 +582,14 @@ def _launch_runner(ticket, base=None, pause_after=None):
     return session, log_path
 
 
-def _fanout(tickets, base, pause_after):
+def _fanout(tickets, base, pause_after, iteration=None):
     """Launch one detached runner per ticket. Print the resulting tmux IDs."""
     if shutil.which("tmux") is None:
         fail("tmux is required for multi-ticket or --detach runs (not on PATH)")
     results = []
     for t in tickets:
-        session, info = _launch_runner(t, base=base, pause_after=pause_after)
+        session, info = _launch_runner(t, base=base, pause_after=pause_after,
+                                       iteration=iteration)
         results.append((t, session, info))
 
     ok = [(t, s, log) for t, s, log in results if s is not None]
@@ -628,7 +631,8 @@ def cmd_start(args):
     # Multi-ticket OR explicit --detach → fan out to detached tmux runners
     # and return immediately. Single-ticket without --detach blocks (legacy).
     if len(args.tickets) > 1 or args.detach:
-        _fanout(args.tickets, args.base, args.pause_after)
+        _fanout(args.tickets, args.base, args.pause_after,
+                iteration=getattr(args, "iteration", "first-pass"))
         if args.watch:
             # Drop into watch mode filtered to just the tickets we launched.
             print()
@@ -654,7 +658,7 @@ def _run_start_blocking(ticket, args):
     check(f"worktree {action}: {wt_path} (parent: {parent_branch})")
 
     # Phase 1 — pm-start
-    pm = phase_pm_start(ticket)
+    pm = phase_pm_start(ticket, iteration=getattr(args, "iteration", "first-pass"))
     pr_url = pm.get("pr_url") or ""
     preview_url = pm.get("preview_url") or ""
     pr_num = extract_pr_num(pr_url)
@@ -1781,6 +1785,10 @@ def main():
     p.add_argument("--base", default=None,
                    help="Hint to the worktree-alloc subagent about the parent branch (e.g. 'sbook/epic'). "
                         "If omitted, the subagent infers from context and asks via sos-inbox prompt if ambiguous.")
+    p.add_argument("--iteration", default="first-pass",
+                   help="Iteration name passed to pm-start. Drives branch name "
+                        "(feature/<TICKET>-<iteration>). Use a fresh name to restart a ticket "
+                        "without colliding with an existing branch (e.g. 'iteration-2').")
     p.add_argument("--pause-after", choices=["work1", "review", "work2"], default=None,
                    help="Post a gate card after the named phase; requires a reply to continue")
     p.add_argument("--detach", action="store_true",
