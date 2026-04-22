@@ -794,12 +794,59 @@ class TestPreviewCommand(SessionBase):
 
     def test_normalize_legacy_config(self):
         # Port in config is IGNORED — runner assigns at runtime.
+        # Routes default to a single "Open preview" → / when omitted.
         cfg = {"command": "npm run storybook", "cwd": "packages/ui", "port": 6006}
         svcs = fd._normalize_preview_config(cfg)
         self.assertEqual(svcs, [{
             "name": "default", "command": "npm run storybook",
             "cwd": "packages/ui", "port": None,
+            "routes": [{"label": "Open preview", "path": "/"}],
         }])
+
+    def test_normalize_routes_explicit(self):
+        cfg = {
+            "command": "npm run dev",
+            "cwd": "apps/web",
+            "routes": [
+                {"label": "Home", "path": "/"},
+                {"label": "FX Gallery", "path": "/fx"},
+            ],
+        }
+        svcs = fd._normalize_preview_config(cfg)
+        self.assertEqual(svcs[0]["routes"], [
+            {"label": "Home", "path": "/"},
+            {"label": "FX Gallery", "path": "/fx"},
+        ])
+
+    def test_normalize_routes_adds_leading_slash(self):
+        cfg = {
+            "command": "npm run dev",
+            "routes": [{"label": "Gallery", "path": "fx"}],
+        }
+        svcs = fd._normalize_preview_config(cfg)
+        self.assertEqual(svcs[0]["routes"], [
+            {"label": "Gallery", "path": "/fx"},
+        ])
+
+    def test_normalize_routes_drop_empty_label(self):
+        cfg = {
+            "command": "npm run dev",
+            "routes": [
+                {"label": "", "path": "/a"},
+                {"label": "B", "path": "/b"},
+            ],
+        }
+        svcs = fd._normalize_preview_config(cfg)
+        self.assertEqual(svcs[0]["routes"], [{"label": "B", "path": "/b"}])
+
+    def test_normalize_routes_all_invalid_fallback_to_default(self):
+        cfg = {
+            "command": "npm run dev",
+            "routes": [{"not_a_route": True}, {"label": "", "path": "/x"}],
+        }
+        svcs = fd._normalize_preview_config(cfg)
+        self.assertEqual(svcs[0]["routes"],
+                         [{"label": "Open preview", "path": "/"}])
 
     def test_normalize_multi_service_config(self):
         cfg = {"services": [
@@ -945,32 +992,15 @@ class TestPreviewCommand(SessionBase):
         self.assertEqual(sessions["app"], "preview-FOO-1-app")
         self.assertEqual(sessions["storybook"], "preview-FOO-1-storybook")
 
-    def test_post_preview_card_excludes_errored_services(self):
-        """A service with a warning (e.g. port-wait timeout) must NOT get an
-        'Open' button — the port may not be answering."""
-        results = [
-            {"name": "app",       "session": "preview-X-app",
-             "url": "http://localhost:3000", "error": None},
-            {"name": "storybook", "session": "preview-X-storybook",
-             "url": "http://localhost:6006",
-             "error": "warning: port 6006 didn't respond in 60s"},
-        ]
-        with patch.object(fd, "post_card") as mock_post:
-            fd._post_preview_card("X-1", results)
-        mock_post.assert_called_once()
-        call = mock_post.call_args
-        actions = call.kwargs.get("actions") or []
-        open_labels = [a["label"] for a in actions if a["kind"] == "openUrl"]
-        self.assertIn("Open app", open_labels)
-        self.assertNotIn("Open storybook", open_labels)
-
-    def test_post_preview_card_all_errored_posts_nothing(self):
-        """If every service failed or warned, don't post a misleading card."""
+    def test_post_preview_card_is_no_op(self):
+        """Deprecated: _post_preview_card used to post an info card with
+        Open/Stop buttons after preview start. That pattern is replaced by
+        persistent per-route buttons in the sidebar group header (driven by
+        `sos-flow-dev previews` + WS broadcast). The function is now a
+        no-op, kept for callsite compatibility until full cleanup."""
         results = [
             {"name": "app", "session": "preview-X-app",
-             "url": "http://localhost:3000", "error": "port didn't respond"},
-            {"name": "storybook", "session": None, "url": None,
-             "error": "cwd not found"},
+             "url": "http://localhost:3000", "error": None},
         ]
         with patch.object(fd, "post_card") as mock_post:
             fd._post_preview_card("X-1", results)
@@ -1353,7 +1383,10 @@ class TestResync(SessionBase):
         self.assertEqual(n, 0)
         mock_post.assert_not_called()
 
-    def test_resync_preview_cards_when_services_running(self):
+    def test_resync_does_not_post_preview_card(self):
+        """The 'Preview ready' info-card is deprecated — the sidebar's per-
+        route buttons replace it. Resync must no longer post such a card
+        even when preview sessions are live."""
         fd.session_set("FOO-1",
                        phase="awaiting-qa", pr_url="https://x/pull/42", pr_num="42",
                        preview_urls={"app": "http://localhost:3001"},
@@ -1361,19 +1394,6 @@ class TestResync(SessionBase):
                        review_verdict="approve", review_comments=0)
         with patch.object(fd, "_existing_card_titles", return_value=set()), \
              patch.object(fd, "_tmux_session_exists", return_value=True), \
-             patch.object(fd, "post_card", return_value="card_x") as mock_post:
-            fd._resync_cards_for("FOO-1")
-        titles = [c.args[1] for c in mock_post.call_args_list]
-        self.assertIn("Preview ready · FOO-1", titles)
-
-    def test_resync_skips_preview_cards_when_sessions_dead(self):
-        fd.session_set("FOO-1",
-                       phase="awaiting-qa", pr_url="https://x/pull/42", pr_num="42",
-                       preview_urls={"app": "http://localhost:3001"},
-                       preview_sessions={"app": "preview-FOO-1-app"},
-                       review_verdict="approve", review_comments=0)
-        with patch.object(fd, "_existing_card_titles", return_value=set()), \
-             patch.object(fd, "_tmux_session_exists", return_value=False), \
              patch.object(fd, "post_card", return_value="card_x") as mock_post:
             fd._resync_cards_for("FOO-1")
         titles = [c.args[1] for c in mock_post.call_args_list]

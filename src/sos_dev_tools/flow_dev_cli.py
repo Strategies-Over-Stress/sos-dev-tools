@@ -1154,18 +1154,40 @@ def _preview_config_for_ticket(ticket):
     return _read_preview_suggested(worktree / ".pm" / "preview-suggested.json")
 
 
-def _normalize_preview_config(cfg):
-    """Return a list of service dicts [{name, command, cwd, port}] from any
-    supported preview config shape.
+def _sanitize_routes(raw):
+    """Normalize a service's routes list. Each route is {label, path}."""
+    if not isinstance(raw, list) or not raw:
+        return [{"label": "Open preview", "path": "/"}]
+    out = []
+    for r in raw:
+        if not isinstance(r, dict):
+            continue
+        label = str(r.get("label") or "").strip()
+        path = str(r.get("path") or "/").strip()
+        if not label:
+            continue
+        if not path.startswith("/"):
+            path = "/" + path
+        out.append({"label": label[:40], "path": path[:200]})
+    return out or [{"label": "Open preview", "path": "/"}]
 
-    Legacy:   {"command": "...", "cwd": "..."}         → one service named "default"
-    Multi:    {"services": [{"name": ..., "command": ..., "cwd": ...}]}
+
+def _normalize_preview_config(cfg):
+    """Return a list of service dicts [{name, command, cwd, port, routes}]
+    from any supported preview config shape.
+
+    Legacy:   {"command": "...", "cwd": "...", "routes": [...]}  → one "default"
+    Multi:    {"services": [{"name": ..., "command": ..., "cwd": ..., "routes": [...]}]}
 
     `port` is INTENTIONALLY ignored from config. Ports are a runtime concern —
     the preview runner assigns them from its free pool (6006-6099) each time
     a service starts, so config stays portable across worktrees and never
     collides with itself on parallel runs. Pass `--port N` on the CLI to force
     a specific port for a one-off invocation.
+
+    `routes` drives the sidebar's per-ticket preview buttons. Each entry is
+    {label, path}. Omitted or empty → defaults to [{"label": "Open preview",
+    "path": "/"}] so there's always at least one button per service.
 
     Services without a `command` are dropped.
     """
@@ -1182,6 +1204,7 @@ def _normalize_preview_config(cfg):
                 "command": s["command"],
                 "cwd": s.get("cwd") or "",
                 "port": None,  # always auto-assign at runtime
+                "routes": _sanitize_routes(s.get("routes")),
             })
         return out
     if cfg.get("command"):
@@ -1190,6 +1213,7 @@ def _normalize_preview_config(cfg):
             "command": cfg["command"],
             "cwd": cfg.get("cwd") or "",
             "port": None,
+            "routes": _sanitize_routes(cfg.get("routes")),
         }]
     return []
 
@@ -1374,43 +1398,67 @@ def _stop_preview_for(ticket, service_names=None):
 
 
 def _post_preview_card(ticket, results):
-    """Post one info card summarizing services that started CLEANLY.
-
-    Deliberately skips services with a non-None `error` — that field holds
-    either a hard failure (session=None) or a soft warning (e.g. "port
-    didn't respond in 60s"). Posting an "Open preview" button pointing at a
-    port that isn't actually answering is worse than no card at all. The
-    warning has already been printed to stderr by the caller.
-
-    If NO service started cleanly for this ticket, no card is posted.
+    """Deprecated — was a one-shot info card posted after preview start.
+    Replaced by persistent per-route buttons in the ghostty-mini sidebar
+    group header (driven by `sos-flow-dev previews` + server WS broadcast).
+    Kept as a no-op so existing call sites keep working; scheduled for
+    deletion once resync + any external callers are cleaned up.
     """
-    running = [r for r in results if r["session"] and r["url"] and not r["error"]]
-    if not running:
-        return
-    primary = running[0]["url"]
-    ctx_parts = []
-    for r in running:
-        try:
-            port = r["url"].rsplit(":", 1)[-1]
-        except Exception:
-            port = "?"
-        ctx_parts.append(f"{r['name']}→{port}")
-    sess = session_get(ticket) or {}
-    pr_url = sess.get("pr_url") or "(none)"
-    ctx = f"Services: {' · '.join(ctx_parts)} · PR {pr_url}"
+    return
 
-    actions = []
-    for r in running:
-        label = "Open preview" if r["name"] == "default" else f"Open {r['name']}"
-        actions.append({"label": label, "kind": "openUrl", "url": r["url"]})
-    actions.append({
-        "label": "Stop all" if len(running) > 1 else "Stop",
-        "kind": "inject",
-        "text": f"sos-flow-dev preview --stop {ticket}\n",
-        "execute": True,
-    })
-    post_card("info", f"Preview ready · {ticket}", ticket=ticket,
-              url=primary, ctx=ctx, actions=actions)
+
+def _previews_state():
+    """Walk all session files, resolve each ticket's preview services
+    (via the same config chain cmd_preview uses), and report current
+    running status + route list.
+
+    Returns a list of {ticket, phase, services: [{name, routes, status,
+    url}]} — one entry per active ticket that has any preview config.
+    Tickets without any preview config (no worktree config, no source
+    config, no agent suggestion) are omitted so the UI can render
+    "nothing to show" cleanly.
+    """
+    sessions_dir = STATE_DIR / "sessions"
+    if not sessions_dir.is_dir():
+        return []
+    out = []
+    for p in sorted(sessions_dir.glob("*.json")):
+        try:
+            sess = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        ticket = sess.get("ticket") or p.stem
+        cfg = _preview_config_for_ticket(ticket)
+        services = _normalize_preview_config(cfg)
+        if not services:
+            continue
+        urls = sess.get("preview_urls") or {}
+        # Legacy: preview_url (single) + preview_session (single) maps to default.
+        if not urls and sess.get("preview_url") and sess.get("preview_session"):
+            urls = {"default": sess["preview_url"]}
+        svc_out = []
+        for svc in services:
+            name = svc["name"]
+            tmux = _preview_tmux_name(ticket, name)
+            running = _tmux_session_exists(tmux) if shutil.which("tmux") else False
+            svc_out.append({
+                "name": name,
+                "routes": svc["routes"],
+                "status": "running" if running else "stopped",
+                "url": urls.get(name) if running else None,
+                "tmux": tmux,
+            })
+        out.append({
+            "ticket": ticket,
+            "phase": sess.get("phase") or "",
+            "services": svc_out,
+        })
+    return out
+
+
+def cmd_previews(args):
+    """Dump preview state as JSON for the ghostty-mini UI to consume."""
+    print(json.dumps(_previews_state(), indent=2 if args.pretty else None))
 
 
 def cmd_preview(args):
@@ -2422,6 +2470,20 @@ def main():
                    help="Don't block waiting for the port to come up")
 
     p = sub.add_parser(
+        "previews",
+        help="Dump preview state for all active tickets as JSON (consumed "
+             "by ghostty-mini's sidebar preview buttons).",
+        description=(
+            "One-shot JSON of every active ticket's preview services: "
+            "name, routes (label + path), running status, URL if up. "
+            "ghostty-mini's server polls this and renders per-route "
+            "buttons in the ticket's sidebar group header."
+        ),
+    )
+    p.add_argument("--pretty", action="store_true",
+                   help="Pretty-print JSON output (default: compact)")
+
+    p = sub.add_parser(
         "cleanup",
         help="Reset the ticket's worktree for reuse (default) or remove it outright",
     )
@@ -2458,6 +2520,7 @@ def main():
         "watch": cmd_watch,
         "activity": cmd_activity,
         "preview": cmd_preview,
+        "previews": cmd_previews,
         "resync": cmd_resync,
         "config": cmd_config,
         "cleanup": cmd_cleanup,
