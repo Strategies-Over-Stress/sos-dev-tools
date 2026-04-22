@@ -464,9 +464,27 @@ the basis of "another agent is already working on this ticket". Do not
 call `sos-flow-dev cleanup`. Do not try to attach to `flow-{ticket}-work1`
 (you are already in it).
 
-Just execute the pm-start skill below. On success, write
-`/tmp/pm-complete-{ticket}.json` per the skill's final step — flow-dev
-blocks on that file.
+⛔ **CRITICAL EXIT CONDITION.** The ONLY acceptable way to exit this
+skill is AFTER writing `/tmp/pm-complete-{ticket}.json` per step 10.
+flow-dev blocks on that file; if you exit without it, the whole ticket
+fails with the message:
+
+    ✗ missing /tmp/pm-complete-{ticket}.json — did pm-start run?
+
+— even though you may have done all the upstream work. The skill has 10
+steps. Step 5 launches the dev agent and blocks until it exits (possibly
+for 10-30 minutes). AFTER step 5 returns, you still need to run steps 6
+through 10. Do NOT interpret "the dev agent tmux session ended" as
+"pm-start is done" — it means "the dev agent finished and it is now
+YOUR turn to run steps 6-10". The last instruction in the skill is
+literally `ls -la /tmp/pm-complete-{ticket}.json`; only exit after that
+succeeds.
+
+If step 5's Bash tool times out (sos-claude-print --tmux can run longer
+than Bash's default 2-min timeout), re-invoke with `timeout=600000` (10
+min) and a polling loop:
+    `while tmux has-session -t pm-{ticket} 2>/dev/null; do sleep 30; done`
+Repeat the poll call until the session is gone, THEN proceed to step 6.
 
 ---
 
@@ -480,56 +498,88 @@ def phase_pm_start(ticket, iteration="first-pass"):
     prefix = _FLOW_DEV_PREFIX_TEMPLATE.format(ticket=ticket)
     body = prefix + PM_START_SKILL.read_text() + f"\n\n{ticket} {iteration}\n"
     watcher = spawn_watcher(ticket, "work-1")
+    error = False
+    completion_missing = False
+    rc = None
     try:
         rc = run_subagent(f"flow-{ticket}-work1", body)
+        if rc != 0:
+            error = True
+        # Check completion marker while watcher still alive so status flips
+        # to "error" on the card rather than lingering as "working → done".
+        elif not Path(f"/tmp/pm-complete-{ticket}.json").exists():
+            error = True
+            completion_missing = True
     finally:
-        stop_watcher(watcher)
+        stop_watcher(watcher, error=error)
     if rc != 0:
         fail(f"pm-start subagent exited {rc}")
+    if completion_missing:
+        fail(f"missing /tmp/pm-complete-{ticket}.json — pm-start exited "
+             f"without writing the completion marker (check tmux pm-{ticket} "
+             f"to see if the dev agent is still running)")
     return read_pm_complete(ticket)
+
+
+def _run_subagent_with_watcher(ticket, phase_label, session, prompt,
+                               deliverable_path):
+    """Run a subagent with an activity watcher, flipping the card to 'error'
+    if either the subagent exits non-zero OR the expected deliverable file
+    is missing when the subagent returns."""
+    watcher = spawn_watcher(ticket, phase_label)
+    error = False
+    rc = None
+    missing = False
+    try:
+        rc = run_subagent(session, prompt)
+        if rc != 0:
+            error = True
+        elif deliverable_path is not None and not Path(deliverable_path).exists():
+            error = True
+            missing = True
+    finally:
+        stop_watcher(watcher, error=error)
+    return rc, missing
 
 
 def phase_review(ticket, pr_num):
     step(f"Phase 2/5 — review PR #{pr_num}")
-    watcher = spawn_watcher(ticket, "review")
-    try:
-        rc = run_subagent(f"flow-{ticket}-review", review_prompt(ticket, pr_num))
-    finally:
-        stop_watcher(watcher)
+    rf = worktree_root() / ".pm" / "review-result.json"
+    rc, missing = _run_subagent_with_watcher(
+        ticket, "review", f"flow-{ticket}-review",
+        review_prompt(ticket, pr_num), rf,
+    )
     if rc != 0:
         fail(f"review subagent exited {rc}")
-    rf = worktree_root() / ".pm" / "review-result.json"
-    if not rf.exists():
+    if missing:
         fail(f"review subagent did not write {rf} — check `tmux attach -t flow-{ticket}-review` for last state")
     return json.loads(rf.read_text())
 
 
 def phase_work2(ticket, pr_num, comments_n):
     step(f"Phase 3/5 — address {comments_n} review comments")
-    watcher = spawn_watcher(ticket, "work-2")
-    try:
-        rc = run_subagent(f"flow-{ticket}-work2", work2_prompt(ticket, pr_num, comments_n))
-    finally:
-        stop_watcher(watcher)
+    rf = worktree_root() / ".pm" / "work-2-result.json"
+    rc, missing = _run_subagent_with_watcher(
+        ticket, "work-2", f"flow-{ticket}-work2",
+        work2_prompt(ticket, pr_num, comments_n), rf,
+    )
     if rc != 0:
         fail(f"work-2 subagent exited {rc}")
-    rf = worktree_root() / ".pm" / "work-2-result.json"
-    if not rf.exists():
+    if missing:
         fail(f"work-2 subagent did not write {rf}")
     return json.loads(rf.read_text())
 
 
 def phase_work3(ticket, pr_num, reason):
     step(f"Phase 3/5 (re-QA) — address reviewer feedback")
-    watcher = spawn_watcher(ticket, "work-3")
-    try:
-        rc = run_subagent(f"flow-{ticket}-work3", work3_prompt(ticket, pr_num, reason))
-    finally:
-        stop_watcher(watcher)
+    rf = worktree_root() / ".pm" / "work-3-result.json"
+    rc, missing = _run_subagent_with_watcher(
+        ticket, "work-3", f"flow-{ticket}-work3",
+        work3_prompt(ticket, pr_num, reason), rf,
+    )
     if rc != 0:
         fail(f"work-3 subagent exited {rc}")
-    rf = worktree_root() / ".pm" / "work-3-result.json"
-    if not rf.exists():
+    if missing:
         fail(f"work-3 subagent did not write {rf}")
     return json.loads(rf.read_text())
 
@@ -1717,11 +1767,20 @@ def cmd_activity(args):
             pass
     _write_file_log([f"=== watcher start · {worktree} · base={base_ref} ==="])
 
-    stopping = {"flag": False, "reason": "signal"}
-    def _stop(signum, _frame):
+    # Two stop paths:
+    #   SIGTERM / SIGINT → graceful stop, card status=done
+    #   SIGUSR1          → phase failed, card status=error (flow-dev uses
+    #                      this when run_subagent returns non-zero OR the
+    #                      expected deliverable file is missing)
+    stopping = {"flag": False, "status": "done"}
+    def _stop_ok(signum, _frame):
         stopping["flag"] = True
-    signal.signal(signal.SIGTERM, _stop)
-    signal.signal(signal.SIGINT, _stop)
+    def _stop_err(signum, _frame):
+        stopping["flag"] = True
+        stopping["status"] = "error"
+    signal.signal(signal.SIGTERM, _stop_ok)
+    signal.signal(signal.SIGINT, _stop_ok)
+    signal.signal(signal.SIGUSR1, _stop_err)
 
     last_activity = started
     silence_warned = False
@@ -1766,7 +1825,7 @@ def cmd_activity(args):
                     })
     finally:
         end = int(time.time() * 1000)
-        status = "error" if stopping.get("reason") == "error" else "done"
+        status = stopping.get("status", "done")
         _write_file_log([f"=== watcher stopped ({status}) ==="])
         if card_id:
             _inbox_post(f"/inbox/{card_id}/progress", {
@@ -1814,15 +1873,23 @@ def spawn_watcher(ticket, phase):
         return None
 
 
-def stop_watcher(proc, timeout=10):
-    """SIGTERM the watcher so it flips status to 'done' gracefully, then wait.
+def stop_watcher(proc, timeout=10, error=False):
+    """Signal the watcher to exit and wait for it.
+
+    error=False → SIGTERM → card status flips to "done"
+    error=True  → SIGUSR1 → card status flips to "error" so the UI surfaces
+                   the failure instead of showing a green checkmark on a
+                   phase that actually wedged.
 
     Forces kill on timeout so a wedged watcher doesn't block the phase exit.
     """
     if proc is None:
         return
     try:
-        proc.terminate()
+        if error:
+            proc.send_signal(signal.SIGUSR1)
+        else:
+            proc.terminate()
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         try:
