@@ -1210,8 +1210,13 @@ def qa_card_actions(ticket, pr_url, preview_url):
     if pr_url:
         actions.append({"label": "Open PR", "kind": "openUrl", "url": pr_url})
     actions += [
-        {"label": "Approve & merge", "kind": "inject",
-         "text": f"sos-flow-dev qa-approve {ticket}\n", "execute": True},
+        # `exec` runs on the server via /exec endpoint, isolated from
+        # the main PTY so it doesn't collide with operator typing.
+        {"label": "Approve & merge", "kind": "exec",
+         "cmd": f"sos-flow-dev qa-approve {ticket}"},
+        # "Request changes" uses `inject` deliberately — operator needs
+        # to type the rejection reason before pressing Enter. The inject
+        # text is pre-filled but not executed (execute=False).
         {"label": "Request changes", "kind": "inject",
          "text": f"sos-flow-dev qa-reject {ticket} ", "execute": False},
     ]
@@ -1409,13 +1414,11 @@ def _run_start_blocking(ticket, args):
                      f"PR #{pr_num} — force-approve, retry, or fix manually."),
                 actions=[
                     {"label": "Open PR", "kind": "openUrl"},
-                    {"label": "Retry anyway", "kind": "inject",
-                     "text": (f"sos-flow-dev qa-reject {ticket} "
-                              f"\"address re-review feedback on PR #{pr_num}\"\n"),
-                     "execute": True},
-                    {"label": "Approve anyway", "kind": "inject",
-                     "text": f"sos-flow-dev qa-approve {ticket}\n",
-                     "execute": True},
+                    {"label": "Retry anyway", "kind": "exec",
+                     "cmd": (f"sos-flow-dev qa-reject {ticket} "
+                             f"\"address re-review feedback on PR #{pr_num}\"")},
+                    {"label": "Approve anyway", "kind": "exec",
+                     "cmd": f"sos-flow-dev qa-approve {ticket}"},
                 ],
             )
 
@@ -1569,8 +1572,8 @@ def cmd_qa_approve(args):
         ctx=f"PR #{pr_num} merged · {strategy} → {sess.get('parent_branch', 'parent')}",
         actions=[
             {"label": "Open PR", "kind": "openUrl"},
-            {"label": "Cleanup worktree", "kind": "inject",
-             "text": f"sos-flow-dev cleanup {ticket}\n", "execute": True},
+            {"label": "Cleanup worktree", "kind": "exec",
+             "cmd": f"sos-flow-dev cleanup {ticket}"},
         ],
     )
     session_set(ticket, phase="merged", merged_at=now_iso(),
@@ -1623,13 +1626,11 @@ def cmd_qa_reject(args):
                  f"fix manually."),
             actions=[
                 {"label": "Open PR", "kind": "openUrl"},
-                {"label": f"Retry (work-{next_work_n})", "kind": "inject",
-                 "text": (f"sos-flow-dev qa-reject {ticket} "
-                          f"\"address re-review feedback on PR #{pr_num}\"\n"),
-                 "execute": True},
-                {"label": "Approve anyway", "kind": "inject",
-                 "text": f"sos-flow-dev qa-approve {ticket}\n",
-                 "execute": True},
+                {"label": f"Retry (work-{next_work_n})", "kind": "exec",
+                 "cmd": (f"sos-flow-dev qa-reject {ticket} "
+                         f"\"address re-review feedback on PR #{pr_num}\"")},
+                {"label": "Approve anyway", "kind": "exec",
+                 "cmd": f"sos-flow-dev qa-approve {ticket}"},
             ],
         )
 

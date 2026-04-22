@@ -147,13 +147,15 @@ class TestQaCardActions(unittest.TestCase):
         self.assertIn("Open PR", labels)
         self.assertIn("Approve & merge", labels)
         self.assertIn("Request changes", labels)
-        # Approve button injects the right command
+        # Approve button uses the isolated exec channel so it doesn't
+        # collide with operator typing in the PTY
         approve = next(a for a in actions if a["label"] == "Approve & merge")
-        self.assertEqual(approve["kind"], "inject")
-        self.assertIn("sos-flow-dev qa-approve FOO-1", approve["text"])
-        self.assertTrue(approve["execute"])
-        # Reject is non-executing so user can append a reason
+        self.assertEqual(approve["kind"], "exec")
+        self.assertIn("sos-flow-dev qa-approve FOO-1", approve["cmd"])
+        # Reject still uses inject+execute=False so operator can type the
+        # reason before pressing Enter
         reject = next(a for a in actions if a["label"] == "Request changes")
+        self.assertEqual(reject["kind"], "inject")
         self.assertFalse(reject["execute"])
 
     def test_without_preview(self):
