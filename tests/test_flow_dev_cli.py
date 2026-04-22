@@ -1830,6 +1830,71 @@ class TestVerifierLoop(SessionBase):
         self.assertEqual(result["ready"], True)
 
 
+class TestWorkRereviewLoop(SessionBase):
+    """Auto-retry loop: work → re-review → if changes-requested, retry up
+    to max_retries. Eliminates the 'operator must dismiss halt card +
+    re-invoke qa-reject' human bottleneck for common convergence cases."""
+
+    def test_approve_on_first_try_runs_worker_once(self):
+        """Happy path: re-review approves the first work cycle."""
+        worker = MagicMock()
+        review = MagicMock(return_value={"verdict": "approve", "comments": 0})
+        with patch.object(fd, "phase_review", review):
+            r = fd._work_rereview_loop("FOO-1", "42", worker, max_retries=3)
+        self.assertEqual(worker.call_count, 1)
+        self.assertEqual(review.call_count, 1)
+        self.assertEqual(r["verdict"], "approve")
+
+    def test_retries_on_changes_requested_until_approve(self):
+        """2 changes-requested → 1 approve: loop stops after the approve."""
+        worker = MagicMock()
+        review = MagicMock(side_effect=[
+            {"verdict": "changes-requested", "comments": 3},
+            {"verdict": "changes-requested", "comments": 1},
+            {"verdict": "approve", "comments": 0},
+        ])
+        with patch.object(fd, "phase_review", review):
+            r = fd._work_rereview_loop("FOO-1", "42", worker, max_retries=3)
+        self.assertEqual(worker.call_count, 3)
+        self.assertEqual(review.call_count, 3)
+        self.assertEqual(r["verdict"], "approve")
+        # Worker got attempt numbers 0, 1, 2
+        attempts_seen = [c.args[0] for c in worker.call_args_list]
+        self.assertEqual(attempts_seen, [0, 1, 2])
+
+    def test_cap_hit_calls_halt_and_fails(self):
+        """All retries exhausted → on_cap_halt called + fail()."""
+        worker = MagicMock()
+        cr = {"verdict": "changes-requested", "comments": 2}
+        review = MagicMock(side_effect=[cr, cr, cr, cr])  # always bad
+        halt = MagicMock()
+        with patch.object(fd, "phase_review", review):
+            with self.assertRaises(SystemExit):
+                fd._work_rereview_loop("FOO-1", "42", worker,
+                                       max_retries=3,
+                                       on_cap_halt=halt)
+        # Worker called max_retries + 1 = 4 times
+        self.assertEqual(worker.call_count, 4)
+        # on_cap_halt called once with last review + attempt count
+        halt.assert_called_once()
+        last_review, attempts = halt.call_args.args
+        self.assertEqual(last_review["comments"], 2)
+        self.assertEqual(attempts, 4)
+
+    def test_max_retries_zero_disables_loop(self):
+        """max_retries=0 → single worker call; halt on any non-approve."""
+        worker = MagicMock()
+        review = MagicMock(return_value={"verdict": "changes-requested", "comments": 1})
+        halt = MagicMock()
+        with patch.object(fd, "phase_review", review):
+            with self.assertRaises(SystemExit):
+                fd._work_rereview_loop("FOO-1", "42", worker,
+                                       max_retries=0,
+                                       on_cap_halt=halt)
+        self.assertEqual(worker.call_count, 1)
+        halt.assert_called_once()
+
+
 class TestVerdictSchemaValidation(unittest.TestCase):
     """_validate_verdict_schema rejects malformed verifier output."""
 

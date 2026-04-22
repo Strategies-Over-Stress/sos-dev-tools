@@ -1149,6 +1149,60 @@ def phase_work3(ticket, pr_num, reason):
     return _run_phase_with_verifier(ticket, "work-3", worker, wt)
 
 
+def _count_pr_comments(pr_num):
+    """Count review comments currently on the PR. Used on retry loops to
+    refresh the worker's comment-count argument with the latest state
+    (e.g., re-review added new comments the retry must also address)."""
+    try:
+        out = run_capture([
+            "gh", "api",
+            f"repos/:owner/:repo/pulls/{pr_num}/comments",
+            "--jq", ". | length",
+        ])
+        return int(out) if out.isdigit() else 0
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        return 0
+
+
+def _work_rereview_loop(ticket, pr_num, worker_fn, max_retries=3,
+                        on_cap_halt=None):
+    """Run worker → re-review until re-review approves or cap is hit.
+
+    Worker is any callable that does a full work-N cycle (worker subagent
+    + verifier, writing commits to the branch). After each worker call
+    we run phase_review(is_rereview=True). If re-review approves, return
+    the final review result. If it requests changes, re-invoke the worker
+    (attempt counter increments). On cap-hit, call on_cap_halt with the
+    last review result + attempt count, then fail().
+
+    Rationale: re-review deciding "changes-requested" should NOT require
+    operator intervention — the whole point of the agent chain is to
+    drive convergence without a human bottleneck. The cap exists to
+    bound runaway token budgets, not to force human review of every
+    round. Default 3 retries = up to 4 work cycles per invocation.
+    """
+    last_review = None
+    for attempt in range(max_retries + 1):
+        worker_fn(attempt)
+        last_review = phase_review(ticket, pr_num, is_rereview=True)
+        verdict = last_review.get("verdict")
+        comments = last_review.get("comments", 0)
+        if verdict != "changes-requested":
+            if attempt > 0:
+                check(f"re-review approved after {attempt + 1} work cycle(s)")
+            return last_review
+        if attempt < max_retries:
+            step(f"↻ re-review found {comments} issues — auto-retrying "
+                 f"work (attempt {attempt + 2} of {max_retries + 1})")
+            continue
+    # Cap exhausted
+    if on_cap_halt:
+        on_cap_halt(last_review, max_retries + 1)
+    fail(f"auto-retry cap hit ({max_retries + 1} work cycles); re-review "
+         f"still found {last_review.get('comments', 0)} issues after the "
+         f"final pass. Operator action required — see halt card.")
+
+
 def qa_card_actions(ticket, pr_url, preview_url):
     actions = []
     if preview_url:
@@ -1323,69 +1377,65 @@ def _run_start_blocking(ticket, args):
     if args.pause_after == "review":
         gate(ticket, f"Review verdict: {verdict} — continue?")
 
-    # Phase 3 — work-2 (only if changes were requested)
+    # Phase 3 — work-2 loop (only if changes were requested).
+    # Auto-retries work-2 → re-review on each changes-requested verdict,
+    # up to --max-retries. Halt card fires only when the cap is hit.
     if verdict == "changes-requested":
-        w = phase_work2(ticket, pr_num, comments_n)
-        if "failed" in w:
-            post_card("action", f"Work 2 failed — {ticket}",
-                      ticket=ticket, ctx=w.get("failed", ""))
-            fail(f"work-2 failed: {w.get('failed')}")
-        preview_url = w.get("url") or preview_url
-        session_set(ticket, preview_url=preview_url, phase="review-2")
+        def work2_worker(attempt):
+            # On attempt 0, comments_n comes from the initial review.
+            # On subsequent attempts, comments_n is updated per PR state
+            # (re-review posted new comments that the retry must address).
+            cur_n = comments_n if attempt == 0 else _count_pr_comments(pr_num)
+            w = phase_work2(ticket, pr_num, cur_n)
+            if "failed" in w:
+                post_card("action", f"Work 2 failed — {ticket}",
+                          ticket=ticket, ctx=w.get("failed", ""))
+                fail(f"work-2 failed: {w.get('failed')}")
+            nonlocal preview_url
+            preview_url = w.get("url") or preview_url
+            session_set(ticket, preview_url=preview_url,
+                        phase=f"review-2-attempt-{attempt + 1}")
 
-        # Re-review after work-2 closes the quality loop: the original
-        # review found N issues, work-2 addressed them, and now we run
-        # the reviewer AGAIN to confirm the fixes are real. The re-review
-        # is SCOPE-NARROWED via is_rereview=True — it only verifies the
-        # prior round's comments + catches regressions, doesn't expand
-        # scope to new nits. Without that narrowing, re-review tends to
-        # invent fresh findings and the flow never converges.
-        step(f"Phase 3.5/5 — re-review after work-2")
-        r2 = phase_review(ticket, pr_num, is_rereview=True)
-        verdict2 = r2.get("verdict")
-        comments2 = r2.get("comments", 0)
-        # Record the re-review's findings first — but gate the phase
-        # transition on the verdict. Previously we unconditionally set
-        # phase="awaiting-qa" before checking verdict, which left the
-        # session in a "looks like QA, no QA card" inconsistent state
-        # when the re-review flagged issues and fail() fired afterward.
-        post_card(
-            "info", f"Re-review posted — {comments2} comments",
-            ticket=ticket, url=pr_url or None,
-            ctx=f"Verdict: {verdict2} (after work-2)",
-        )
-        if verdict2 == "changes-requested":
-            session_set(ticket, review_verdict=verdict2,
-                        review_comments=comments2,
+        def on_work2_cap_halt(last_review, attempts):
+            session_set(ticket,
+                        review_verdict=last_review.get("verdict"),
+                        review_comments=last_review.get("comments", 0),
                         phase="review-2-failed")
-            # Explicit, unmissable action card — "flow halted here"
-            # shouldn't have to be inferred from absence-of-QA-card.
             post_card(
-                "action", f"⊘ {ticket} halted at re-review",
+                "action", f"⊘ {ticket} halted — {attempts} work cycles exhausted",
                 ticket=ticket, url=pr_url or None,
-                ctx=(f"Re-review after work-2 still found {comments2} issues "
-                     f"(verdict: {verdict2}). Inspect PR #{pr_num} and decide: "
-                     f"force-approve, retry, or escalate."),
+                ctx=(f"Ran {attempts} work-2/re-review cycles; re-review still "
+                     f"flags {last_review.get('comments', 0)} issues. Inspect "
+                     f"PR #{pr_num} — force-approve, retry, or fix manually."),
                 actions=[
                     {"label": "Open PR", "kind": "openUrl"},
+                    {"label": "Retry anyway", "kind": "inject",
+                     "text": (f"sos-flow-dev qa-reject {ticket} "
+                              f"\"address re-review feedback on PR #{pr_num}\"\n"),
+                     "execute": True},
                     {"label": "Approve anyway", "kind": "inject",
                      "text": f"sos-flow-dev qa-approve {ticket}\n",
                      "execute": True},
-                    {"label": "Retry via qa-reject", "kind": "inject",
-                     "text": f"sos-flow-dev qa-reject {ticket} ",
-                     "execute": False},
                 ],
             )
-            fail(f"re-review still found {comments2} issues after work-2 — "
-                 f"flow halts. Operator: action card posted; choose "
-                 f"approve-anyway, retry, or manual fix.")
-        # Verdict is approve (or anything non-changes-requested); flow
-        # advances to Phase 4's QA gate.
+
+        r2 = _work_rereview_loop(
+            ticket, pr_num, work2_worker,
+            max_retries=getattr(args, "max_retries", 3),
+            on_cap_halt=on_work2_cap_halt,
+        )
+        verdict2 = r2.get("verdict")
+        comments2 = r2.get("comments", 0)
+        post_card(
+            "info", f"Re-review posted — {comments2} comments",
+            ticket=ticket, url=pr_url or None,
+            ctx=f"Verdict: {verdict2} (after work-2 loop)",
+        )
         session_set(ticket, review_verdict=verdict2,
                     review_comments=comments2,
                     phase="awaiting-qa")
         if args.pause_after == "work2":
-            gate(ticket, "Work 2 + re-review done — continue to QA card?")
+            gate(ticket, "Work 2 loop + re-review done — continue to QA card?")
 
     # Phase 4 — QA card
     step("Phase 4/5 — post QA gate")
@@ -1533,48 +1583,44 @@ def cmd_qa_reject(args):
     reason = args.reason or ""
     sess = session_get(ticket) or {}
     pr_num = sess.get("pr_num") or fail("no PR number on record")
-    # Track retries so each invocation is its own work-N attempt. First
-    # qa-reject = work-3 (original), second = work-4, third = work-5, etc.
     prior_count = sess.get("qa_reject_count") or 0
     iteration = prior_count + 1
     session_set(ticket, reject_reason=reason, phase="work-3",
                 qa_reject_count=iteration)
-    w = phase_work3(ticket, pr_num, reason)
-    if "failed" in w:
-        fail(f"work-3 failed: {w.get('failed')}")
-    preview_url = w.get("url") or sess.get("preview_url", "")
-    session_set(ticket, preview_url=preview_url, phase="review-3")
 
-    # Re-review after work-3 for the same reason work-2 gets one:
-    # work-3 introduced code changes and the operator rejection may not
-    # have caught everything. Scope-narrowed (is_rereview=True) so it
-    # only verifies the operator's rejection reasons are addressed +
-    # catches regressions, doesn't expand scope.
-    step(f"Phase 3.5 (re-QA) — review after work-3")
-    r3 = phase_review(ticket, pr_num, is_rereview=True)
-    verdict3 = r3.get("verdict")
-    comments3 = r3.get("comments", 0)
-    post_card(
-        "info", f"Re-review posted — {comments3} comments",
-        ticket=ticket, url=sess.get("pr_url") or None,
-        ctx=f"Verdict: {verdict3} (after work-3)",
-    )
-    if verdict3 == "changes-requested":
-        # Track how many work-3 / re-review cycles have been attempted
-        # so the halt card can label the retry accurately ("Retry (work-4)"
-        # on the first retry, "Retry (work-5)" on the next, etc).
-        prior_retries = sess.get("qa_reject_count") or 1
-        next_work_n = prior_retries + 3  # work-3 was attempt 1, work-4 is retry 1
-        session_set(ticket, review_verdict=verdict3,
-                    review_comments=comments3,
-                    phase="review-3-failed",
-                    qa_reject_count=prior_retries)
+    preview_url = sess.get("preview_url", "")
+
+    def work3_worker(attempt):
+        # On retry, the operator's original reason is stale — re-review
+        # has posted its own comments that work-3 must now address.
+        # Use a synthesized reason so work-3 knows to read the latest
+        # PR feedback rather than stick to the original reject text.
+        effective_reason = (
+            reason if attempt == 0
+            else f"address the latest re-review feedback on PR #{pr_num} "
+                 f"(attempt {attempt + 1} of this qa-reject cycle)"
+        )
+        w = phase_work3(ticket, pr_num, effective_reason)
+        if "failed" in w:
+            fail(f"work-3 failed: {w.get('failed')}")
+        nonlocal preview_url
+        preview_url = w.get("url") or preview_url
+        session_set(ticket, preview_url=preview_url,
+                    phase=f"review-3-attempt-{attempt + 1}")
+
+    def on_work3_cap_halt(last_review, attempts):
+        next_work_n = iteration + attempts + 2  # human-friendly label
+        session_set(ticket,
+                    review_verdict=last_review.get("verdict"),
+                    review_comments=last_review.get("comments", 0),
+                    phase="review-3-failed")
         post_card(
-            "action", f"⊘ {ticket} halted at re-review (after work-3)",
+            "action", f"⊘ {ticket} halted — {attempts} work-3 cycles exhausted",
             ticket=ticket, url=sess.get("pr_url") or None,
-            ctx=(f"Re-review after work-3 still found {comments3} issues "
-                 f"(verdict: {verdict3}). Inspect PR #{pr_num}: "
-                 f"retry another work cycle, force-approve, or fix manually."),
+            ctx=(f"Ran {attempts} work-3/re-review cycles; re-review still "
+                 f"flags {last_review.get('comments', 0)} issues. Inspect "
+                 f"PR #{pr_num}: retry another cycle, force-approve, or "
+                 f"fix manually."),
             actions=[
                 {"label": "Open PR", "kind": "openUrl"},
                 {"label": f"Retry (work-{next_work_n})", "kind": "inject",
@@ -1586,8 +1632,19 @@ def cmd_qa_reject(args):
                  "execute": True},
             ],
         )
-        fail(f"re-review still found {comments3} issues after work-3 — "
-             f"flow halts. Action card posted.")
+
+    r3 = _work_rereview_loop(
+        ticket, pr_num, work3_worker,
+        max_retries=getattr(args, "max_retries", 3),
+        on_cap_halt=on_work3_cap_halt,
+    )
+    verdict3 = r3.get("verdict")
+    comments3 = r3.get("comments", 0)
+    post_card(
+        "info", f"Re-review posted — {comments3} comments",
+        ticket=ticket, url=sess.get("pr_url") or None,
+        ctx=f"Verdict: {verdict3} (after work-3 loop)",
+    )
     session_set(ticket, review_verdict=verdict3,
                 review_comments=comments3,
                 phase="awaiting-qa-2")
@@ -3069,6 +3126,11 @@ def main():
                    help="Iteration name passed to pm-start. Drives branch name "
                         "(feature/<TICKET>-<iteration>). Use a fresh name to restart a ticket "
                         "without colliding with an existing branch (e.g. 'iteration-2').")
+    p.add_argument("--max-retries", type=int, default=3,
+                   help="Max auto-retries of the work-2 → re-review loop. "
+                        "0 disables auto-retry (halts on first re-review changes-"
+                        "requested). Default 3 = up to 4 work cycles per run "
+                        "before the halt card forces operator attention.")
     p.add_argument("--pause-after", choices=["work1", "review", "work2"], default=None,
                    help="Post a gate card after the named phase; requires a reply to continue")
     p.add_argument("--detach", action="store_true",
@@ -3092,6 +3154,9 @@ def main():
     p = sub.add_parser("qa-reject", help="Kick off work-3 with an optional reason")
     p.add_argument("ticket")
     p.add_argument("reason", nargs="?", default="")
+    p.add_argument("--max-retries", type=int, default=3,
+                   help="Max auto-retries of the work-3 → re-review loop "
+                        "within this qa-reject invocation. Default 3.")
 
     p = sub.add_parser(
         "config",
