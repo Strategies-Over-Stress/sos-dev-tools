@@ -1533,7 +1533,12 @@ def cmd_qa_reject(args):
     reason = args.reason or ""
     sess = session_get(ticket) or {}
     pr_num = sess.get("pr_num") or fail("no PR number on record")
-    session_set(ticket, reject_reason=reason, phase="work-3")
+    # Track retries so each invocation is its own work-N attempt. First
+    # qa-reject = work-3 (original), second = work-4, third = work-5, etc.
+    prior_count = sess.get("qa_reject_count") or 0
+    iteration = prior_count + 1
+    session_set(ticket, reject_reason=reason, phase="work-3",
+                qa_reject_count=iteration)
     w = phase_work3(ticket, pr_num, reason)
     if "failed" in w:
         fail(f"work-3 failed: {w.get('failed')}")
@@ -1555,17 +1560,27 @@ def cmd_qa_reject(args):
         ctx=f"Verdict: {verdict3} (after work-3)",
     )
     if verdict3 == "changes-requested":
+        # Track how many work-3 / re-review cycles have been attempted
+        # so the halt card can label the retry accurately ("Retry (work-4)"
+        # on the first retry, "Retry (work-5)" on the next, etc).
+        prior_retries = sess.get("qa_reject_count") or 1
+        next_work_n = prior_retries + 3  # work-3 was attempt 1, work-4 is retry 1
         session_set(ticket, review_verdict=verdict3,
                     review_comments=comments3,
-                    phase="review-3-failed")
+                    phase="review-3-failed",
+                    qa_reject_count=prior_retries)
         post_card(
             "action", f"⊘ {ticket} halted at re-review (after work-3)",
             ticket=ticket, url=sess.get("pr_url") or None,
             ctx=(f"Re-review after work-3 still found {comments3} issues "
                  f"(verdict: {verdict3}). Inspect PR #{pr_num}: "
-                 f"force-approve if findings are nits, or inspect manually."),
+                 f"retry another work cycle, force-approve, or fix manually."),
             actions=[
                 {"label": "Open PR", "kind": "openUrl"},
+                {"label": f"Retry (work-{next_work_n})", "kind": "inject",
+                 "text": (f"sos-flow-dev qa-reject {ticket} "
+                          f"\"address re-review feedback on PR #{pr_num}\"\n"),
+                 "execute": True},
                 {"label": "Approve anyway", "kind": "inject",
                  "text": f"sos-flow-dev qa-approve {ticket}\n",
                  "execute": True},
