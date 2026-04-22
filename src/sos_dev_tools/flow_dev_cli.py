@@ -2191,8 +2191,44 @@ def _assign_ports(services):
         _RUNTIME_CLAIMED_PORTS.add(p)
 
 
-def _start_preview_for(ticket, services, wait=True):
+def _kill_process_on_port(port, timeout=5):
+    """Kill any process listening on localhost:<port>. Uses lsof to find
+    the PID; falls back to silent no-op if lsof isn't available.
+
+    Used by force-restart paths to clear orphan dev-servers that survive
+    their tmux session (Storybook in particular keeps the node process
+    after its parent shell exits). Without this, a re-launch fails with
+    'port already in use.'
+    """
+    if shutil.which("lsof") is None:
+        return False
+    try:
+        r = subprocess.run(
+            ["lsof", "-tiTCP:" + str(port), "-sTCP:LISTEN", "-n", "-P"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except subprocess.SubprocessError:
+        return False
+    pids = [p.strip() for p in r.stdout.splitlines() if p.strip().isdigit()]
+    if not pids:
+        return False
+    for pid in pids:
+        subprocess.run(["kill", pid], capture_output=True, check=False)
+    # Give the kernel a moment to release the socket
+    time.sleep(0.5)
+    return True
+
+
+def _start_preview_for(ticket, services, wait=True, force=False):
     """Start one or more preview services for a ticket.
+
+    force=True  → kill any existing preview-<T>-<svc> tmux session
+                  (and any process bound to its old port) before
+                  spawning fresh. Makes the "Play" button idempotent:
+                  a stale tmux session or orphan Storybook holding a
+                  port never blocks a restart.
+    force=False → if the tmux session already exists, return with
+                  error="already running" and leave it alone.
 
     Returns a list of dicts: [{name, session, url, error}, ...].
     On success error is None; on failure session/url may be None.
@@ -2227,10 +2263,26 @@ def _start_preview_for(ticket, services, wait=True):
                             "error": f"cwd {full_cwd} not found"})
             continue
         if _tmux_session_exists(tmux_session):
-            results.append({"name": name, "session": tmux_session,
-                            "url": preview_urls.get(name),
-                            "error": f"already running (tmux: {tmux_session})"})
-            continue
+            if force:
+                # Idempotent restart: kill the existing session (and any
+                # orphan process holding its port) before spawning fresh.
+                subprocess.run(["tmux", "kill-session", "-t", tmux_session],
+                               capture_output=True, check=False)
+                # Clean up stale port binding if we recorded its URL.
+                stale_url = preview_urls.get(name, "")
+                if stale_url:
+                    try:
+                        stale_port = int(stale_url.rsplit(":", 1)[-1])
+                        _kill_process_on_port(stale_port)
+                    except (ValueError, IndexError):
+                        pass
+                preview_urls.pop(name, None)
+                preview_sessions.pop(name, None)
+            else:
+                results.append({"name": name, "session": tmux_session,
+                                "url": preview_urls.get(name),
+                                "error": f"already running (tmux: {tmux_session})"})
+                continue
         if _port_reachable(port):
             try:
                 fallback = _next_free_port(start=port + 1)
@@ -2465,7 +2517,8 @@ def cmd_preview(args):
                 continue
 
         step(f"starting {len(services)} preview service(s) for {t}")
-        results = _start_preview_for(t, services, wait=args.wait)
+        results = _start_preview_for(t, services, wait=args.wait,
+                                     force=getattr(args, "force", False))
         for r in results:
             if r["session"] is None:
                 print(f"  ✗ {r['name']}: {r['error']}", file=sys.stderr)
@@ -3636,6 +3689,13 @@ def main():
                         "Default: next free port in 6006–6099.")
     p.add_argument("--no-wait", dest="wait", action="store_false", default=True,
                    help="Don't block waiting for the port to come up")
+    p.add_argument("--force", action="store_true",
+                   help="If a preview tmux session already exists for a "
+                        "service, kill it (and any orphan process holding "
+                        "its old port) before spawning fresh. Makes the "
+                        "start operation idempotent — useful for the UI's "
+                        "Play button where the operator expects a clean "
+                        "restart on every click.")
 
     p = sub.add_parser(
         "previews",
