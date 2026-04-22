@@ -1492,6 +1492,22 @@ class TestActivitySnapshot(unittest.TestCase):
         self.assertEqual(files, set())
         self.assertEqual(commits, 0)
 
+    def test_snapshot_passes_untracked_files_all(self):
+        """Regression: plain `git status --porcelain` collapses an untracked
+        dir to a single entry, so the watcher never sees files created
+        inside it and fires false silence warnings. Must pass -uall so
+        every untracked file lists individually."""
+        captured = []
+        def fake_run(cmd, **kw):
+            captured.append(list(cmd))
+            if "status" in cmd:
+                return MagicMock(stdout="")
+            return MagicMock(stdout="0\n")
+        with patch.object(fd.subprocess, "run", side_effect=fake_run):
+            fd._git_snapshot(Path("/wt"), "main")
+        status_call = next(c for c in captured if "status" in c)
+        self.assertIn("--untracked-files=all", status_call)
+
 
 class TestInboxPost(unittest.TestCase):
     """_inbox_post is a thin urllib wrapper — validate payload shape and error

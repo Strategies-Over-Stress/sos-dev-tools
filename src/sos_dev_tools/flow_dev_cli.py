@@ -1621,8 +1621,15 @@ def _git_snapshot(worktree, base_ref):
     Commits ahead of base_ref captures when the dev agent actually commits.
     """
     try:
+        # --untracked-files=all: when a new directory is untracked, plain
+        # `git status --porcelain` collapses its entire contents into a
+        # single "?? dir/" entry and no further diff ever fires for files
+        # added inside — the watcher then reports 0 changes and falsely
+        # triggers silence warnings while the agent is actively scaffolding.
+        # -uall forces per-file listing even under untracked dirs.
         status = subprocess.run(
-            ["git", "-C", str(worktree), "status", "--porcelain"],
+            ["git", "-C", str(worktree), "status", "--porcelain",
+             "--untracked-files=all"],
             capture_output=True, text=True, timeout=10, check=False,
         ).stdout
     except subprocess.SubprocessError:
