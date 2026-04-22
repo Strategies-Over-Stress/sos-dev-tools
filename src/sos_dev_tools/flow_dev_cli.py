@@ -905,10 +905,13 @@ def _resolve_source_repo():
 
     Order:
       1. $SOS_FLOW_DEV_SOURCE env var, if set and exists.
-      2. CWD's git context — handles both "CWD is the main repo" AND "CWD
-         is itself a worktree"; in the worktree case, walks up to the
-         shared main via `git rev-parse --git-common-dir`.
-      3. `source_repo` from ~/.ghostty-mini/config.json.
+      2. `source_repo` from ~/.ghostty-mini/config.json. The ghostty-mini UI's
+         project picker writes this key when the operator switches projects,
+         so it represents an *intentional* pin and must beat whatever repo
+         the shell happens to be sitting in.
+      3. CWD's git context — fallback for operators who haven't configured
+         a source_repo yet; handles both "CWD is the main repo" AND "CWD is
+         itself a worktree" (walks up to the shared main).
 
     Returns an absolute Path or None. None means the operator is outside
     any git context AND has no config — they need to `cd` into the source
@@ -917,6 +920,13 @@ def _resolve_source_repo():
     env = os.environ.get("SOS_FLOW_DEV_SOURCE")
     if env:
         p = Path(env).expanduser()
+        if p.is_dir():
+            return p.resolve()
+
+    cfg = _load_global_config()
+    src = cfg.get("source_repo")
+    if src:
+        p = Path(src).expanduser()
         if p.is_dir():
             return p.resolve()
 
@@ -929,16 +939,9 @@ def _resolve_source_repo():
         toplevel = ""
     if toplevel:
         top = Path(toplevel).resolve()
-        # If CWD is a worktree, walk up to the shared main.
         source = _source_repo_for_worktree(top)
         return source or top
 
-    cfg = _load_global_config()
-    src = cfg.get("source_repo")
-    if src:
-        p = Path(src).expanduser()
-        if p.is_dir():
-            return p.resolve()
     return None
 
 

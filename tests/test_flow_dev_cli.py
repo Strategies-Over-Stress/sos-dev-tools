@@ -1111,7 +1111,13 @@ class TestCmdQaApprove(SessionBase):
 
 
 class TestSourceRepoResolution(SessionBase):
-    """_resolve_source_repo chain: env → CWD git → config."""
+    """_resolve_source_repo chain: env → config → CWD git.
+
+    The config pin beats CWD because the ghostty-mini project picker writes
+    it as an intentional "this is my active project" declaration — a caller
+    sitting in a different repo (e.g. a Claude Code session) must still use
+    it, even though its own CWD would otherwise be a valid git repo.
+    """
 
     def test_env_var_wins(self):
         src = Path(self._tmp) / "source"
@@ -1134,6 +1140,28 @@ class TestSourceRepoResolution(SessionBase):
             fd._save_global_config({"source_repo": str(cfg_src)})
             result = fd._resolve_source_repo()
         self.assertEqual(result, cfg_src.resolve())
+
+    def test_config_beats_cwd_git(self):
+        """Regression: the project picker writes source_repo into config;
+        a caller whose CWD happens to be a different git repo must still
+        honor that pin. (The ghostty-mini project picker cds the user's
+        terminal but other callers — background processes, other sessions —
+        see only the config.)"""
+        cfg_src = Path(self._tmp) / "configured"
+        cfg_src.mkdir()
+        cwd_src = Path(self._tmp) / "elsewhere"
+        cwd_src.mkdir()
+        fd._save_global_config({"source_repo": str(cfg_src)})
+        os.environ.pop("SOS_FLOW_DEV_SOURCE", None)
+        # If the CWD git call were reached, it'd return cwd_src. It must not
+        # be reached — config takes precedence, so mock_run should not fire.
+        with patch.object(fd.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(stdout=str(cwd_src) + "\n", returncode=0),
+            ]
+            result = fd._resolve_source_repo()
+        self.assertEqual(result, cfg_src.resolve())
+        mock_run.assert_not_called()
 
     def test_cwd_is_source_repo(self):
         src = Path(self._tmp) / "source"
