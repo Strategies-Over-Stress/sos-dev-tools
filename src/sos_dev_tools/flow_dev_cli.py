@@ -1706,6 +1706,98 @@ def _diff_to_log_lines(prev_files, cur_files, prev_commits, cur_commits,
     return lines
 
 
+def _review_snapshot(pr_num):
+    """Review-phase signal: PR review comment set + latest review state.
+
+    Returns (comments_dict, review_state_str). comments_dict maps a stable
+    comment id to {path, line, body_preview, author}. review_state is the
+    latest submitted review state ('APPROVED', 'CHANGES_REQUESTED',
+    'COMMENTED', or None if no review submitted yet).
+
+    File/commit tracking is useless during review — the reviewer doesn't
+    modify the working tree, only posts GitHub comments. Activity = new
+    comments on the PR.
+    """
+    if not pr_num:
+        return {}, None
+    try:
+        out = subprocess.run(
+            ["gh", "pr", "view", str(pr_num), "--json", "reviews,comments"],
+            capture_output=True, text=True, timeout=15, check=False,
+        ).stdout
+        data = json.loads(out) if out.strip() else {}
+    except (subprocess.SubprocessError, json.JSONDecodeError):
+        return {}, None
+
+    comments = {}
+    for c in data.get("comments") or []:
+        # Prefer GitHub's node_id for stability; fall back to a path/line/time
+        # composite so new comments still register even if the JSON schema shifts.
+        cid = (c.get("id") or c.get("node_id")
+               or f"{c.get('path','')}:{c.get('line','')}:{c.get('createdAt','')}")
+        comments[str(cid)] = {
+            "path": c.get("path") or "",
+            "line": c.get("line") or c.get("position") or "",
+            "body": (c.get("body") or "").strip(),
+            "author": (c.get("author") or {}).get("login", ""),
+        }
+
+    review_state = None
+    for r in data.get("reviews") or []:
+        s = r.get("state")
+        if s in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
+            review_state = s  # list is chronological; last one wins
+
+    return comments, review_state
+
+
+def _diff_review_snapshot(prev, cur):
+    """Turn two review snapshots into log lines. prev/cur are the tuples
+    returned by _review_snapshot: (comments_dict, review_state)."""
+    prev_comments, prev_state = prev
+    cur_comments, cur_state = cur
+    lines = []
+    new_ids = set(cur_comments) - set(prev_comments)
+    for cid in sorted(new_ids, key=lambda x: (cur_comments[x].get("path", ""),
+                                              cur_comments[x].get("line", 0))):
+        c = cur_comments[cid]
+        loc = f"{c['path']}:{c['line']}" if (c['path'] and c['line']) else (c['path'] or "PR body")
+        snip = " ".join(c['body'].split())[:80]
+        lines.append(f"● comment on {loc} — {snip}")
+    if cur_state and cur_state != prev_state:
+        lines.append(f"● review submitted · {cur_state} · {len(cur_comments)} comments")
+    return lines
+
+
+def _make_phase_tracker(phase, worktree, base_ref, pr_num):
+    """Pick the right snapshot/diff pair for the phase.
+
+    Review phase watches GitHub PR comment state (file/commit tracking is
+    zero-signal during review). Other phases default to git-based tracking.
+    """
+    if phase == "review":
+        return {
+            "snapshot": lambda: _review_snapshot(pr_num),
+            "diff": _diff_review_snapshot,
+            "metrics": lambda sig: {
+                "comments": len(sig[0]),
+                "review_state": sig[1] or "pending",
+            },
+            "initial_summary": lambda sig: (
+                f"{len(sig[0])} comments" + (f" · {sig[1]}" if sig[1] else "")
+            ),
+        }
+    return {
+        "snapshot": lambda: _git_snapshot(worktree, base_ref),
+        "diff": lambda p, c: _diff_to_log_lines(p[0], c[0], p[1], c[1], worktree),
+        "metrics": lambda sig: {
+            "files_changed": len(sig[0]),
+            "commits": sig[1],
+        },
+        "initial_summary": lambda sig: f"{len(sig[0])} files · {sig[1]} commits",
+    }
+
+
 def cmd_activity(args):
     """Watch a ticket's worktree, post progress-card updates to the inbox.
 
@@ -1722,11 +1814,13 @@ def cmd_activity(args):
 
     phase = args.phase or sess.get("phase", "unknown")
     base_ref = sess.get("parent_branch") or "HEAD"
+    pr_num = sess.get("pr_num") or extract_pr_num(sess.get("pr_url", "") or "")
     interval = max(2, args.interval)
     silence_s = max(30, args.silence_threshold)
 
     started = time.time()
-    prev_files, prev_commits = _git_snapshot(worktree, base_ref)
+    tracker = _make_phase_tracker(phase, worktree, base_ref, pr_num)
+    prev_signal = tracker["snapshot"]()
 
     title = f"{ticket} · {phase}"
     links = [
@@ -1743,18 +1837,18 @@ def cmd_activity(args):
     if preview_url:
         links.append({"label": "Preview", "url": preview_url})
 
+    initial_metrics = {
+        **tracker["metrics"](prev_signal),
+        "started_at": int(started * 1000),
+        "last_activity_at": int(started * 1000),
+    }
     resp = _inbox_post("/inbox", {
         "kind": "progress",
         "ticket": ticket,
         "phase": phase,
         "title": title,
         "status": "working",
-        "metrics": {
-            "files_changed": len(prev_files),
-            "commits": prev_commits,
-            "started_at": int(started * 1000),
-            "last_activity_at": int(started * 1000),
-        },
+        "metrics": initial_metrics,
         "links": links,
     })
     card_id = (resp or {}).get("id")
@@ -1802,9 +1896,8 @@ def cmd_activity(args):
             if stopping["flag"]:
                 break
 
-            cur_files, cur_commits = _git_snapshot(worktree, base_ref)
-            delta = _diff_to_log_lines(prev_files, cur_files,
-                                       prev_commits, cur_commits, worktree)
+            cur_signal = tracker["snapshot"]()
+            delta = tracker["diff"](prev_signal, cur_signal)
             now = time.time()
 
             if delta:
@@ -1816,12 +1909,11 @@ def cmd_activity(args):
                         "log_append": [{"ts": int(now * 1000), "text": l}
                                        for l in delta],
                         "metrics_patch": {
-                            "files_changed": len(cur_files),
-                            "commits": cur_commits,
+                            **tracker["metrics"](cur_signal),
                             "last_activity_at": int(now * 1000),
                         },
                     })
-                prev_files, prev_commits = cur_files, cur_commits
+                prev_signal = cur_signal
             elif not silence_warned and (now - last_activity) > silence_s:
                 silence_warned = True
                 text = f"⚠ {int((now - last_activity) / 60)}m of silence"
@@ -1838,8 +1930,7 @@ def cmd_activity(args):
             _inbox_post(f"/inbox/{card_id}/progress", {
                 "status": status,
                 "metrics_patch": {
-                    "files_changed": len(prev_files),
-                    "commits": prev_commits,
+                    **tracker["metrics"](prev_signal),
                     "last_activity_at": end,
                 },
                 "log_append": [{"ts": end, "text": f"watcher stopped · {status}"}],
