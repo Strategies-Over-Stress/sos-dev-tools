@@ -1321,21 +1321,79 @@ def _fanout(tickets, base, pause_after, iteration=None):
         sys.exit(1)
 
 
+_TICKET_RANGE_RE = re.compile(r"^([A-Z][A-Z0-9]+)-(\d+)-(\d+)$")
+
+
+def _ticket_exists(ticket):
+    """Check if a ticket exists in Jira by running `sos-jira view TICKET`.
+    Returns True if the command succeeds, False otherwise."""
+    try:
+        r = subprocess.run(
+            ["sos-jira", "view", ticket],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        return r.returncode == 0
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
+
+
+def _expand_ticket_specs(specs):
+    """Expand ticket specs with optional range syntax PROJ-N-Y.
+
+    Each spec is either:
+      - "PROJ-N"   (single ticket — trusted verbatim, not validated)
+      - "PROJ-N-Y" (range from N to Y inclusive — validated via sos-jira,
+                   non-existent tickets are silently skipped with a log line)
+
+    The validation-only-on-range design keeps single-ticket invocations
+    fast (no Jira round-trip) while still giving ranges the "skip missing"
+    semantics operators expect when typing a span.
+    """
+    out = []
+    for spec in specs:
+        m = _TICKET_RANGE_RE.match(spec)
+        if not m:
+            out.append(spec)
+            continue
+        prefix, start_s, end_s = m.group(1), m.group(2), m.group(3)
+        start, end = int(start_s), int(end_s)
+        if start > end:
+            print(f"skipping malformed range {spec!r}: start > end",
+                  file=sys.stderr)
+            continue
+        print(f"expanding range {spec} → {prefix}-{start}..{prefix}-{end} "
+              f"(validating each via sos-jira)", flush=True)
+        for n in range(start, end + 1):
+            candidate = f"{prefix}-{n}"
+            if _ticket_exists(candidate):
+                out.append(candidate)
+                print(f"  ✓ {candidate}", flush=True)
+            else:
+                print(f"  ⊘ {candidate} — not found in Jira, skipping",
+                      flush=True)
+    return out
+
+
 def cmd_start(args):
+    # Expand range syntax (FX-3-7 → FX-3, FX-4, ...) and validate existence.
+    # Singles stay untouched; ranges get sos-jira view per candidate.
+    tickets = _expand_ticket_specs(args.tickets)
+    if not tickets:
+        fail("no tickets to start (after range expansion + existence check)")
     # Multi-ticket OR explicit --detach → fan out to detached tmux runners
     # and return immediately. Single-ticket without --detach blocks (legacy).
-    if len(args.tickets) > 1 or args.detach:
-        _fanout(args.tickets, args.base, args.pause_after,
+    if len(tickets) > 1 or args.detach:
+        _fanout(tickets, args.base, args.pause_after,
                 iteration=getattr(args, "iteration", "first-pass"))
         if args.watch:
             # Drop into watch mode filtered to just the tickets we launched.
             print()
             print("Entering watch mode (Ctrl+C to detach — runs keep going):")
             print()
-            watch_args = argparse.Namespace(tickets=args.tickets, interval=3)
+            watch_args = argparse.Namespace(tickets=tickets, interval=3)
             cmd_watch(watch_args)
         return
-    _run_start_blocking(args.tickets[0], args)
+    _run_start_blocking(tickets[0], args)
 
 
 def _run_start_blocking(ticket, args):

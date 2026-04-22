@@ -1832,6 +1832,54 @@ class TestVerifierLoop(SessionBase):
         self.assertEqual(result["ready"], True)
 
 
+class TestTicketRangeExpansion(unittest.TestCase):
+    """Range syntax PROJ-N-Y expands to PROJ-N..PROJ-Y, validating each via
+    sos-jira view and skipping non-existent ones. Singles pass through."""
+
+    def test_single_ticket_untouched(self):
+        out = fd._expand_ticket_specs(["FOO-1"])
+        self.assertEqual(out, ["FOO-1"])
+
+    def test_multiple_singles_untouched(self):
+        out = fd._expand_ticket_specs(["FOO-1", "BAR-2"])
+        self.assertEqual(out, ["FOO-1", "BAR-2"])
+
+    def test_range_expanded_all_existing(self):
+        with patch.object(fd, "_ticket_exists", return_value=True):
+            out = fd._expand_ticket_specs(["FX-3-5"])
+        self.assertEqual(out, ["FX-3", "FX-4", "FX-5"])
+
+    def test_range_skips_missing(self):
+        def exists(t):
+            return t != "FX-4"  # FX-4 doesn't exist in Jira
+        with patch.object(fd, "_ticket_exists", side_effect=exists):
+            out = fd._expand_ticket_specs(["FX-3-5"])
+        self.assertEqual(out, ["FX-3", "FX-5"])
+
+    def test_range_start_greater_than_end_skipped(self):
+        with patch.object(fd, "_ticket_exists", return_value=True):
+            out = fd._expand_ticket_specs(["FX-7-3"])
+        self.assertEqual(out, [])
+
+    def test_mixed_singles_and_range(self):
+        with patch.object(fd, "_ticket_exists", return_value=True):
+            out = fd._expand_ticket_specs(["BAR-1", "FX-2-4", "HG-9"])
+        self.assertEqual(out, ["BAR-1", "FX-2", "FX-3", "FX-4", "HG-9"])
+
+    def test_single_ticket_not_validated(self):
+        """Perf: singles are passed through without hitting sos-jira."""
+        check = MagicMock(return_value=True)
+        with patch.object(fd, "_ticket_exists", check):
+            fd._expand_ticket_specs(["BAR-1", "BAZ-2"])
+        check.assert_not_called()
+
+    def test_range_validates_every_candidate(self):
+        check = MagicMock(return_value=True)
+        with patch.object(fd, "_ticket_exists", check):
+            fd._expand_ticket_specs(["FX-1-3"])
+        self.assertEqual(check.call_count, 3)
+
+
 class TestWorkRereviewLoop(SessionBase):
     """Auto-retry loop: work → re-review → if changes-requested, retry up
     to max_retries. Eliminates the 'operator must dismiss halt card +
