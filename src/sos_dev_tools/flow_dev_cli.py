@@ -1325,16 +1325,36 @@ _TICKET_RANGE_RE = re.compile(r"^([A-Z][A-Z0-9]+)-(\d+)-(\d+)$")
 
 
 def _ticket_exists(ticket):
-    """Check if a ticket exists in Jira by running `sos-jira view TICKET`.
-    Returns True if the command succeeds, False otherwise."""
+    """Tri-state existence check: True | False | None (unknown).
+
+    Runs `sos-jira view TICKET`:
+      - rc=0                     → True   (confirmed exists)
+      - rc!=0 + "not found" msg  → False  (confirmed 404 / deleted)
+      - rc!=0 any other reason   → None   (infra error: JIRA_BASE_URL
+                                            missing, network down,
+                                            sos-jira not installed, etc.)
+      - subprocess itself failed → None
+
+    Caller can choose to pass through tickets whose existence is
+    UNKNOWN rather than silently dropping them — better to let
+    pm-start surface a specific error than for the operator's input
+    to disappear into the void.
+    """
     try:
         r = subprocess.run(
             ["sos-jira", "view", ticket],
             capture_output=True, text=True, timeout=30, check=False,
         )
-        return r.returncode == 0
     except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    if r.returncode == 0:
+        return True
+    combined = ((r.stderr or "") + (r.stdout or "")).lower()
+    not_found_markers = ("not found", "does not exist", "no issue",
+                         "404", "issue does not exist")
+    if any(m in combined for m in not_found_markers):
         return False
+    return None  # ambiguous — infra error, don't confidently drop the ticket
 
 
 def _expand_ticket_specs(specs):
@@ -1363,14 +1383,28 @@ def _expand_ticket_specs(specs):
             continue
         print(f"expanding range {spec} → {prefix}-{start}..{prefix}-{end} "
               f"(validating each via sos-jira)", flush=True)
+        unknown_run = False  # stop retrying sos-jira after the first
+                             # infra failure — it'll almost certainly
+                             # fail for every remaining candidate too.
         for n in range(start, end + 1):
             candidate = f"{prefix}-{n}"
-            if _ticket_exists(candidate):
+            if unknown_run:
+                exists = None  # already decided to pass through
+            else:
+                exists = _ticket_exists(candidate)
+            if exists is True:
                 out.append(candidate)
                 print(f"  ✓ {candidate}", flush=True)
-            else:
+            elif exists is False:
                 print(f"  ⊘ {candidate} — not found in Jira, skipping",
                       flush=True)
+            else:  # None — infra error
+                out.append(candidate)
+                print(f"  ? {candidate} — could not verify (sos-jira infra "
+                      f"error); including anyway, downstream will fail "
+                      f"with specifics if it's a real miss",
+                      flush=True)
+                unknown_run = True
     return out
 
 

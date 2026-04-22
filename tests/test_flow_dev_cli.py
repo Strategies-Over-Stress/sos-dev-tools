@@ -1879,6 +1879,53 @@ class TestTicketRangeExpansion(unittest.TestCase):
             fd._expand_ticket_specs(["FX-1-3"])
         self.assertEqual(check.call_count, 3)
 
+    def test_range_passes_through_on_infra_error(self):
+        """When sos-jira is broken (returns None = unknown), the validator
+        MUST pass the ticket through, not silently drop it. Regression for
+        the 'JIRA_BASE_URL not set' case where every candidate was being
+        skipped and the operator's input vanished."""
+        with patch.object(fd, "_ticket_exists", return_value=None):
+            out = fd._expand_ticket_specs(["FX-3-5"])
+        self.assertEqual(out, ["FX-3", "FX-4", "FX-5"])
+
+    def test_range_short_circuits_after_first_infra_error(self):
+        """Perf: once sos-jira fails once, don't retry it for the remaining
+        candidates in the range — it'll fail for those too."""
+        check = MagicMock(return_value=None)
+        with patch.object(fd, "_ticket_exists", check):
+            fd._expand_ticket_specs(["FX-1-10"])
+        # Called exactly once — first candidate failed, rest pass-through
+        self.assertEqual(check.call_count, 1)
+
+    def test_ticket_exists_tri_state_success(self):
+        """Integration-ish: _ticket_exists returns True on rc=0."""
+        with patch.object(fd.subprocess, "run",
+                          return_value=MagicMock(returncode=0,
+                                                 stdout="ticket data",
+                                                 stderr="")):
+            self.assertTrue(fd._ticket_exists("FX-1") is True)
+
+    def test_ticket_exists_tri_state_not_found(self):
+        """False only when the error message is recognizable as 404."""
+        with patch.object(fd.subprocess, "run",
+                          return_value=MagicMock(returncode=1,
+                                                 stdout="",
+                                                 stderr="Error: issue not found")):
+            self.assertFalse(fd._ticket_exists("FX-99"))
+
+    def test_ticket_exists_tri_state_infra_error(self):
+        """None on rc!=0 with non-404 error (JIRA_BASE_URL not set, etc)."""
+        with patch.object(fd.subprocess, "run",
+                          return_value=MagicMock(returncode=1,
+                                                 stdout="",
+                                                 stderr="Error: JIRA_BASE_URL not set")):
+            self.assertIsNone(fd._ticket_exists("FX-1"))
+
+    def test_ticket_exists_tri_state_subprocess_fails(self):
+        with patch.object(fd.subprocess, "run",
+                          side_effect=FileNotFoundError("sos-jira not found")):
+            self.assertIsNone(fd._ticket_exists("FX-1"))
+
 
 class TestWorkRereviewLoop(SessionBase):
     """Auto-retry loop: work → re-review → if changes-requested, retry up
