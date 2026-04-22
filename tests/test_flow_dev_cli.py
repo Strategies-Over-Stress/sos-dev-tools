@@ -1390,5 +1390,139 @@ class TestWatchRendering(SessionBase):
         self.assertIn("no active flow-dev sessions", printed)
 
 
+class TestActivityDiff(unittest.TestCase):
+    """Delta detection for the activity watcher."""
+
+    def test_small_additions_listed_individually(self):
+        prev = {"a.txt"}
+        cur = {"a.txt", "b.txt", "c.txt"}
+        with patch.object(fd.subprocess, "run"):
+            lines = fd._diff_to_log_lines(prev, cur, 0, 0, Path("/wt"))
+        self.assertEqual(sorted(lines), ["+ b.txt", "+ c.txt"])
+
+    def test_bulk_addition_grouped_by_top_dir(self):
+        prev = set()
+        cur = {f"apps/web/src/app/fx/variants/v{i}.tsx" for i in range(40)}
+        with patch.object(fd.subprocess, "run"):
+            lines = fd._diff_to_log_lines(prev, cur, 0, 0, Path("/wt"))
+        self.assertEqual(len(lines), 1)
+        self.assertIn("+40 in apps/", lines[0])
+        self.assertIn("(e.g.", lines[0])
+
+    def test_mixed_topdirs_each_grouped(self):
+        prev = set()
+        cur = set()
+        for i in range(10):
+            cur.add(f"apps/web/x{i}.ts")
+        for i in range(10):
+            cur.add(f"packages/ui/y{i}.ts")
+        with patch.object(fd.subprocess, "run"):
+            lines = fd._diff_to_log_lines(prev, cur, 0, 0, Path("/wt"))
+        joined = "\n".join(lines)
+        self.assertIn("+10 in apps/", joined)
+        self.assertIn("+10 in packages/", joined)
+
+    def test_removals_capped_with_summary(self):
+        prev = {f"f{i}.txt" for i in range(10)}
+        cur = {"f0.txt"}
+        with patch.object(fd.subprocess, "run"):
+            lines = fd._diff_to_log_lines(prev, cur, 0, 0, Path("/wt"))
+        removal_lines = [l for l in lines if l.startswith("-")]
+        # 3 individual removals + "-N more removed" summary
+        self.assertEqual(len(removal_lines), 4)
+        self.assertTrue(any("6 more removed" in l for l in removal_lines))
+
+    def test_new_commits_fetched_via_git_log(self):
+        mock_log = MagicMock(stdout="abc1234 FX-1: scaffolding\ndef5678 FX-1: fix typo\n",
+                             returncode=0)
+        with patch.object(fd.subprocess, "run", return_value=mock_log):
+            lines = fd._diff_to_log_lines(set(), set(), 0, 2, Path("/wt"))
+        self.assertEqual(len(lines), 2)
+        self.assertIn("● commit abc1234 FX-1: scaffolding", lines[0])
+
+    def test_no_delta_returns_empty(self):
+        prev = {"a.txt", "b.txt"}
+        with patch.object(fd.subprocess, "run"):
+            lines = fd._diff_to_log_lines(prev, prev, 5, 5, Path("/wt"))
+        self.assertEqual(lines, [])
+
+
+class TestActivitySnapshot(unittest.TestCase):
+    """git status + rev-list parsing."""
+
+    def test_snapshot_parses_porcelain_flags(self):
+        # Typical porcelain output: "XY filename"
+        porcelain = (
+            " M src/app.js\n"       # modified
+            "?? new/file.txt\n"     # untracked
+            "A  src/new.js\n"       # staged add
+            "D  deleted.js\n"       # deleted
+            "R  old.js -> new.js\n" # rename
+        )
+        def fake_run(cmd, **kw):
+            if "status" in cmd:
+                return MagicMock(stdout=porcelain)
+            if "rev-list" in cmd:
+                return MagicMock(stdout="3\n")
+            return MagicMock(stdout="")
+
+        with patch.object(fd.subprocess, "run", side_effect=fake_run):
+            files, commits = fd._git_snapshot(Path("/wt"), "main")
+        self.assertEqual(files,
+                         {"src/app.js", "new/file.txt", "src/new.js",
+                          "deleted.js", "new.js"})
+        self.assertEqual(commits, 3)
+
+    def test_snapshot_handles_git_failure(self):
+        with patch.object(fd.subprocess, "run",
+                          side_effect=fd.subprocess.SubprocessError("boom")):
+            files, commits = fd._git_snapshot(Path("/wt"), "main")
+        self.assertEqual(files, set())
+        self.assertEqual(commits, 0)
+
+    def test_snapshot_handles_empty_porcelain(self):
+        def fake_run(cmd, **kw):
+            if "status" in cmd:
+                return MagicMock(stdout="")
+            if "rev-list" in cmd:
+                return MagicMock(stdout="0\n")
+            return MagicMock(stdout="")
+        with patch.object(fd.subprocess, "run", side_effect=fake_run):
+            files, commits = fd._git_snapshot(Path("/wt"), "main")
+        self.assertEqual(files, set())
+        self.assertEqual(commits, 0)
+
+
+class TestInboxPost(unittest.TestCase):
+    """_inbox_post is a thin urllib wrapper — validate payload shape and error
+    handling (server offline should not crash the watcher)."""
+
+    def setUp(self):
+        # Reset the once-per-process warning flag between tests.
+        fd._inbox_post._warned = False
+
+    def test_posts_json_payload(self):
+        fake_resp = MagicMock()
+        fake_resp.__enter__ = MagicMock(return_value=MagicMock(
+            read=lambda: b'{"ok":true,"id":"card_1"}'))
+        fake_resp.__exit__ = MagicMock(return_value=False)
+        with patch.object(fd.urllib.request, "urlopen", return_value=fake_resp):
+            with patch("json.load", return_value={"ok": True, "id": "card_1"}):
+                resp = fd._inbox_post("/inbox", {"kind": "progress", "title": "t"})
+        self.assertEqual(resp, {"ok": True, "id": "card_1"})
+
+    def test_server_offline_returns_none(self):
+        with patch.object(fd.urllib.request, "urlopen",
+                          side_effect=fd.urllib.error.URLError("nope")):
+            resp = fd._inbox_post("/inbox", {"kind": "info"})
+        self.assertIsNone(resp)
+
+    def test_connection_error_returns_none(self):
+        with patch.object(fd.urllib.request, "urlopen",
+                          side_effect=ConnectionError("refused")):
+            resp = fd._inbox_post("/inbox", {"kind": "info"})
+        self.assertIsNone(resp)
+
+
 if __name__ == "__main__":
     unittest.main()

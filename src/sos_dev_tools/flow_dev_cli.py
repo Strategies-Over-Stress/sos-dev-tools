@@ -30,9 +30,13 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 STATE_DIR = Path(os.environ.get("GHOSTTY_MINI_STATE", str(Path.home() / ".ghostty-mini")))
@@ -475,7 +479,11 @@ def phase_pm_start(ticket, iteration="first-pass"):
         fail(f"pm-start skill not found at {PM_START_SKILL}")
     prefix = _FLOW_DEV_PREFIX_TEMPLATE.format(ticket=ticket)
     body = prefix + PM_START_SKILL.read_text() + f"\n\n{ticket} {iteration}\n"
-    rc = run_subagent(f"flow-{ticket}-work1", body)
+    watcher = spawn_watcher(ticket, "work-1")
+    try:
+        rc = run_subagent(f"flow-{ticket}-work1", body)
+    finally:
+        stop_watcher(watcher)
     if rc != 0:
         fail(f"pm-start subagent exited {rc}")
     return read_pm_complete(ticket)
@@ -483,7 +491,11 @@ def phase_pm_start(ticket, iteration="first-pass"):
 
 def phase_review(ticket, pr_num):
     step(f"Phase 2/5 — review PR #{pr_num}")
-    rc = run_subagent(f"flow-{ticket}-review", review_prompt(ticket, pr_num))
+    watcher = spawn_watcher(ticket, "review")
+    try:
+        rc = run_subagent(f"flow-{ticket}-review", review_prompt(ticket, pr_num))
+    finally:
+        stop_watcher(watcher)
     if rc != 0:
         fail(f"review subagent exited {rc}")
     rf = worktree_root() / ".pm" / "review-result.json"
@@ -494,7 +506,11 @@ def phase_review(ticket, pr_num):
 
 def phase_work2(ticket, pr_num, comments_n):
     step(f"Phase 3/5 — address {comments_n} review comments")
-    rc = run_subagent(f"flow-{ticket}-work2", work2_prompt(ticket, pr_num, comments_n))
+    watcher = spawn_watcher(ticket, "work-2")
+    try:
+        rc = run_subagent(f"flow-{ticket}-work2", work2_prompt(ticket, pr_num, comments_n))
+    finally:
+        stop_watcher(watcher)
     if rc != 0:
         fail(f"work-2 subagent exited {rc}")
     rf = worktree_root() / ".pm" / "work-2-result.json"
@@ -505,7 +521,11 @@ def phase_work2(ticket, pr_num, comments_n):
 
 def phase_work3(ticket, pr_num, reason):
     step(f"Phase 3/5 (re-QA) — address reviewer feedback")
-    rc = run_subagent(f"flow-{ticket}-work3", work3_prompt(ticket, pr_num, reason))
+    watcher = spawn_watcher(ticket, "work-3")
+    try:
+        rc = run_subagent(f"flow-{ticket}-work3", work3_prompt(ticket, pr_num, reason))
+    finally:
+        stop_watcher(watcher)
     if rc != 0:
         fail(f"work-3 subagent exited {rc}")
     rf = worktree_root() / ".pm" / "work-3-result.json"
@@ -1491,7 +1511,6 @@ def cmd_watch(args):
     """Live dashboard of all active flow-dev sessions. Ctrl+C to exit."""
     interval = max(1, args.interval)
     tickets_filter = set(args.tickets) if args.tickets else None
-    import time
     first = True
     try:
         while True:
@@ -1501,6 +1520,318 @@ def cmd_watch(args):
             time.sleep(interval)
     except KeyboardInterrupt:
         print("\n(detached — runs continue. `sos-flow-dev watch` to resume.)")
+
+
+# ─── Activity watcher ──────────────────────────────────────────────────────
+#
+# Claude --print buffers stdout until exit, so tmux scrollback + pipe-pane
+# give us nothing while a 10-minute dev-agent run is in flight. File + git
+# activity in the worktree is the real ground-truth signal: if new files are
+# appearing, the agent is alive; if nothing has changed for N minutes, it's
+# stuck.
+#
+# cmd_activity polls the worktree every INTERVAL seconds, computes a diff
+# against the previous snapshot, and POSTs progress-card updates to the
+# ghostty-mini inbox. Also tees each event to /tmp/flow-<TICKET>-<PHASE>-
+# activity.log so post-mortem inspection survives a dead ghostty-mini server.
+
+INBOX_BASE_URL = os.environ.get("GHOSTTY_MINI_URL", "http://localhost:3030")
+
+
+def _inbox_post(path, body):
+    """POST JSON to the ghostty-mini inbox. Returns parsed response or None.
+
+    Inbox-unreachable (server down) is deliberately non-fatal — watcher keeps
+    polling so the file log survives even when the UI is gone.
+    """
+    try:
+        req = urllib.request.Request(
+            INBOX_BASE_URL + path,
+            data=json.dumps(body).encode(),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.load(resp)
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        # Print once then stop spamming — the watcher stays alive either way.
+        if not getattr(_inbox_post, "_warned", False):
+            print(f"[watcher] inbox unreachable: {e}", file=sys.stderr, flush=True)
+            _inbox_post._warned = True
+        return None
+
+
+def _git_snapshot(worktree, base_ref):
+    """Snapshot (working-tree changes, commits ahead of base_ref).
+
+    Working-tree changes come from `git status --porcelain` — captures new
+    files (before `git add`), modifications, renames, deletions. This is the
+    richest signal during scaffolding.
+
+    Commits ahead of base_ref captures when the dev agent actually commits.
+    """
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(worktree), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10, check=False,
+        ).stdout
+    except subprocess.SubprocessError:
+        return set(), 0
+
+    files = set()
+    for line in status.splitlines():
+        if len(line) < 3:
+            continue
+        path = line[3:]
+        # "R  old -> new" — we only care about the destination.
+        if " -> " in path:
+            path = path.split(" -> ")[-1]
+        files.add(path.strip('"'))
+
+    n_commits = 0
+    if base_ref:
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(worktree), "rev-list", "--count",
+                 f"{base_ref}..HEAD"],
+                capture_output=True, text=True, timeout=10, check=False,
+            ).stdout.strip()
+            if out.isdigit():
+                n_commits = int(out)
+        except subprocess.SubprocessError:
+            pass
+
+    return files, n_commits
+
+
+def _diff_to_log_lines(prev_files, cur_files, prev_commits, cur_commits,
+                      worktree):
+    """Turn two snapshots into human-readable log lines. Groups bulk changes."""
+    added = cur_files - prev_files
+    removed = prev_files - cur_files
+    lines = []
+
+    if added:
+        # Group by top-level path segment so "+40 files in apps/" beats 40
+        # individual lines during scaffolding bursts.
+        by_top = {}
+        for f in added:
+            top = f.split("/", 1)[0] if "/" in f else f
+            by_top.setdefault(top, []).append(f)
+        for top, fs in sorted(by_top.items()):
+            if len(fs) <= 3:
+                for f in sorted(fs):
+                    lines.append(f"+ {f}")
+            else:
+                sample = sorted(fs)[0]
+                lines.append(f"+{len(fs)} in {top}/ (e.g. {sample})")
+    if removed:
+        for f in sorted(removed)[:3]:
+            lines.append(f"- {f}")
+        if len(removed) > 3:
+            lines.append(f"-{len(removed) - 3} more removed")
+
+    new_commits = cur_commits - prev_commits
+    if new_commits > 0:
+        try:
+            log = subprocess.run(
+                ["git", "-C", str(worktree), "log", "--oneline",
+                 f"-{new_commits}"],
+                capture_output=True, text=True, timeout=10, check=False,
+            ).stdout.strip().splitlines()
+            for l in log[:5]:
+                lines.append(f"● commit {l}")
+            if new_commits > 5:
+                lines.append(f"● ...and {new_commits - 5} more commits")
+        except subprocess.SubprocessError:
+            lines.append(f"● {new_commits} new commit(s)")
+
+    return lines
+
+
+def cmd_activity(args):
+    """Watch a ticket's worktree, post progress-card updates to the inbox.
+
+    Run in a foreground process or as subprocess.Popen; SIGTERM/SIGINT cause
+    a graceful exit that flips the card status to 'done'.
+    """
+    ticket = args.ticket
+    sess = session_get(ticket)
+    if not sess:
+        fail(f"no session for {ticket} — run `sos-flow-dev start` first")
+    worktree = Path(sess.get("worktree", ""))
+    if not worktree.is_dir():
+        fail(f"worktree missing: {worktree}")
+
+    phase = args.phase or sess.get("phase", "unknown")
+    base_ref = sess.get("parent_branch") or "HEAD"
+    interval = max(2, args.interval)
+    silence_s = max(30, args.silence_threshold)
+
+    started = time.time()
+    prev_files, prev_commits = _git_snapshot(worktree, base_ref)
+
+    title = f"{ticket} · {phase}"
+    links = [
+        {"label": f"tmux flow-{ticket}-{_phase_to_session_suffix(phase)}",
+         "command": f"tmux attach -t flow-{ticket}-{_phase_to_session_suffix(phase)}"},
+        {"label": "worktree", "path": str(worktree)},
+        {"label": "activity log",
+         "command": f"tail -f /tmp/flow-{ticket}-{phase}-activity.log"},
+    ]
+    pr_url = sess.get("pr_url")
+    preview_url = sess.get("preview_url")
+    if pr_url:
+        links.append({"label": "PR", "url": pr_url})
+    if preview_url:
+        links.append({"label": "Preview", "url": preview_url})
+
+    resp = _inbox_post("/inbox", {
+        "kind": "progress",
+        "ticket": ticket,
+        "phase": phase,
+        "title": title,
+        "status": "working",
+        "metrics": {
+            "files_changed": len(prev_files),
+            "commits": prev_commits,
+            "started_at": int(started * 1000),
+            "last_activity_at": int(started * 1000),
+        },
+        "links": links,
+    })
+    card_id = (resp or {}).get("id")
+    if not card_id:
+        # Inbox unreachable — keep going with file log only.
+        print(f"[watcher] no card (inbox down?); file log still active",
+              file=sys.stderr, flush=True)
+
+    log_path = Path(f"/tmp/flow-{ticket}-{phase}-activity.log")
+    def _write_file_log(lines):
+        try:
+            with log_path.open("a") as f:
+                ts = time.strftime("%H:%M:%S")
+                for l in lines:
+                    f.write(f"[{ts}] {l}\n")
+        except OSError:
+            pass
+    _write_file_log([f"=== watcher start · {worktree} · base={base_ref} ==="])
+
+    stopping = {"flag": False, "reason": "signal"}
+    def _stop(signum, _frame):
+        stopping["flag"] = True
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    last_activity = started
+    silence_warned = False
+
+    try:
+        while not stopping["flag"]:
+            # Sleep in small chunks so SIGTERM takes effect within ~1s.
+            slept = 0
+            while slept < interval and not stopping["flag"]:
+                time.sleep(min(1.0, interval - slept))
+                slept += 1.0
+            if stopping["flag"]:
+                break
+
+            cur_files, cur_commits = _git_snapshot(worktree, base_ref)
+            delta = _diff_to_log_lines(prev_files, cur_files,
+                                       prev_commits, cur_commits, worktree)
+            now = time.time()
+
+            if delta:
+                last_activity = now
+                silence_warned = False
+                _write_file_log(delta)
+                if card_id:
+                    _inbox_post(f"/inbox/{card_id}/progress", {
+                        "log_append": [{"ts": int(now * 1000), "text": l}
+                                       for l in delta],
+                        "metrics_patch": {
+                            "files_changed": len(cur_files),
+                            "commits": cur_commits,
+                            "last_activity_at": int(now * 1000),
+                        },
+                    })
+                prev_files, prev_commits = cur_files, cur_commits
+            elif not silence_warned and (now - last_activity) > silence_s:
+                silence_warned = True
+                text = f"⚠ {int((now - last_activity) / 60)}m of silence"
+                _write_file_log([text])
+                if card_id:
+                    _inbox_post(f"/inbox/{card_id}/progress", {
+                        "log_append": [{"ts": int(now * 1000), "text": text}],
+                    })
+    finally:
+        end = int(time.time() * 1000)
+        status = "error" if stopping.get("reason") == "error" else "done"
+        _write_file_log([f"=== watcher stopped ({status}) ==="])
+        if card_id:
+            _inbox_post(f"/inbox/{card_id}/progress", {
+                "status": status,
+                "metrics_patch": {
+                    "files_changed": len(prev_files),
+                    "commits": prev_commits,
+                    "last_activity_at": end,
+                },
+                "log_append": [{"ts": end, "text": f"watcher stopped · {status}"}],
+            })
+
+
+def _phase_to_session_suffix(phase):
+    """Map session-state phase names to the tmux suffix the subagent uses."""
+    return {
+        "alloc": "alloc",
+        "work-1": "work1",
+        "review": "review",
+        "work-2": "work2",
+        "work-3": "work3",
+        "awaiting-qa": "qa",
+    }.get(phase, phase)
+
+
+def spawn_watcher(ticket, phase):
+    """Launch `sos-flow-dev activity TICKET --phase PHASE` as a background
+    subprocess. Returns a Popen — caller calls .terminate() when the phase
+    ends. Logs go to /tmp/watcher-<TICKET>-<PHASE>.stderr so they don't pollute
+    the main orchestrator's output.
+    """
+    stderr_path = f"/tmp/watcher-{ticket}-{phase}.stderr"
+    try:
+        stderr = open(stderr_path, "ab")
+    except OSError:
+        stderr = subprocess.DEVNULL
+    try:
+        return subprocess.Popen(
+            ["sos-flow-dev", "activity", ticket, "--phase", phase],
+            stdout=subprocess.DEVNULL, stderr=stderr,
+            start_new_session=True,  # so our SIGINT doesn't cascade
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[watcher] could not spawn: {e}", file=sys.stderr, flush=True)
+        return None
+
+
+def stop_watcher(proc, timeout=10):
+    """SIGTERM the watcher so it flips status to 'done' gracefully, then wait.
+
+    Forces kill on timeout so a wedged watcher doesn't block the phase exit.
+    """
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except (subprocess.SubprocessError, OSError):
+            pass
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def _existing_card_titles(ticket):
@@ -1901,6 +2232,22 @@ def main():
                    help="Destroy the worktree (git worktree remove --force) instead of "
                         "resetting it for reuse. Use when you want to shrink the pool.")
 
+    p = sub.add_parser(
+        "activity",
+        help="Watch a ticket's worktree for file/commit activity; post a "
+             "progress card to the inbox. Auto-spawned by flow-dev during "
+             "work phases; invoke manually for ad-hoc visibility.",
+    )
+    p.add_argument("ticket")
+    p.add_argument("--phase", default=None,
+                   help="Phase label for the progress card (default: reads "
+                        "session state). Use work-1, review, work-2, work-3.")
+    p.add_argument("--interval", type=int, default=10,
+                   help="Poll interval in seconds (default 10, min 2)")
+    p.add_argument("--silence-threshold", type=int, default=120,
+                   help="Emit a silence warning after this many idle seconds "
+                        "(default 120)")
+
     args = parser.parse_args()
 
     {
@@ -1911,6 +2258,7 @@ def main():
         "qa-reject": cmd_qa_reject,
         "status": cmd_status,
         "watch": cmd_watch,
+        "activity": cmd_activity,
         "preview": cmd_preview,
         "resync": cmd_resync,
         "config": cmd_config,
