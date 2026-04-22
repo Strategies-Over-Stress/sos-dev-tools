@@ -443,11 +443,38 @@ def phase_worktree_alloc(ticket, hint_base=None):
     return data  # {worktree, parent_branch, action, reason, preview_port?}
 
 
+_FLOW_DEV_PREFIX_TEMPLATE = """## Invocation context — READ FIRST
+
+You are being invoked as Phase 1/5 ("work-1") of `sos-flow-dev` for ticket
+{ticket}. This is NOT a standalone pm-start — flow-dev has already:
+
+- Allocated the worktree you're running in (see `.pm/active-ticket.json`).
+- Written session state at `~/.ghostty-mini/sessions/{ticket}.json` with
+  `phase: "work-1"`.
+- Spawned YOU inside tmux session `flow-{ticket}-work1`.
+
+The session file, the `.pm/active-ticket.json` "claimed" marker, and the
+`flow-{ticket}-work1` tmux session you may discover via `tmux ls` are ALL
+YOUR OWN context — not a separate racing process. Do not refuse to run on
+the basis of "another agent is already working on this ticket". Do not
+call `sos-flow-dev cleanup`. Do not try to attach to `flow-{ticket}-work1`
+(you are already in it).
+
+Just execute the pm-start skill below. On success, write
+`/tmp/pm-complete-{ticket}.json` per the skill's final step — flow-dev
+blocks on that file.
+
+---
+
+"""
+
+
 def phase_pm_start(ticket):
     step(f"Phase 1/5 — pm-start {ticket}")
     if not PM_START_SKILL.exists():
         fail(f"pm-start skill not found at {PM_START_SKILL}")
-    body = PM_START_SKILL.read_text() + f"\n\n{ticket} first-pass\n"
+    prefix = _FLOW_DEV_PREFIX_TEMPLATE.format(ticket=ticket)
+    body = prefix + PM_START_SKILL.read_text() + f"\n\n{ticket} first-pass\n"
     rc = run_subagent(f"flow-{ticket}-work1", body)
     if rc != 0:
         fail(f"pm-start subagent exited {rc}")
