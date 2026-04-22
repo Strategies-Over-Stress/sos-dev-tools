@@ -240,6 +240,57 @@ class TestTmuxMode(unittest.TestCase):
         self.assertEqual(result, 1)
 
     @patch.object(claude_print_cli.shutil, "which", return_value="/usr/bin/tmux")
+    @patch.object(claude_print_cli.time, "sleep")
+    @patch.object(claude_print_cli.subprocess, "check_call")
+    @patch.object(claude_print_cli.subprocess, "run")
+    @patch.object(claude_print_cli.tempfile, "mktemp")
+    def test_long_prompt_detached_to_stdin_file(self, mock_mktemp, mock_run,
+                                                 mock_check_call, mock_sleep,
+                                                 mock_which):
+        """A >4KB prompt must be written to a temp file and read via stdin
+        redirect, not embedded in the shell -c wrapper. macOS ARG_MAX is
+        ~256KB and shlex.quote's escaping pushes long prompts over that."""
+        # mock_mktemp replaces claude_print_cli.tempfile.mktemp — any call
+        # inside the module under test returns one of these paths. The test
+        # itself uses plain string paths (not mktemp) to avoid draining the
+        # side_effect pool.
+        tmpdir = tempfile.mkdtemp()
+        exit_path = os.path.join(tmpdir, "exit")
+        prompt_path = os.path.join(tmpdir, "prompt")
+        with open(exit_path, "w") as f:
+            f.write("0")
+        mock_mktemp.side_effect = [exit_path, prompt_path]
+        mock_run.side_effect = [
+            MagicMock(returncode=0),  # pipe-pane
+            MagicMock(returncode=1),  # has-session: dead immediately
+        ]
+        big_prompt = "X" * 10_000  # well past the 4000-byte threshold
+
+        # The prompt file is cleaned up in run_in_tmux's finally, so snapshot
+        # its contents at the moment tmux new-session is "invoked".
+        captured = {"prompt_content": None}
+        def on_tmux_call(*_args, **_kw):
+            with open(prompt_path) as f:
+                captured["prompt_content"] = f.read()
+            return 0
+        mock_check_call.side_effect = on_tmux_call
+
+        try:
+            claude_print_cli.run_in_tmux("sess", ["claude", "--print", big_prompt])
+            new_session_cmd = mock_check_call.call_args[0][0]
+            wrapper = new_session_cmd[-1]
+            # Wrapper should NOT contain the inlined prompt.
+            self.assertNotIn("X" * 100, wrapper)
+            # It SHOULD redirect from the prompt file.
+            self.assertIn(prompt_path, wrapper)
+            self.assertIn("<", wrapper)
+            # Prompt file content at invocation time matched the full prompt.
+            self.assertEqual(captured["prompt_content"], big_prompt)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @patch.object(claude_print_cli.shutil, "which", return_value="/usr/bin/tmux")
     @patch.object(claude_print_cli.subprocess, "check_call",
                   side_effect=subprocess.CalledProcessError(1, "tmux"))
     def test_tmux_new_session_failure_exits_1(self, mock_check_call, mock_which):

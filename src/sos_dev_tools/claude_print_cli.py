@@ -84,9 +84,30 @@ def run_in_tmux(session, cmd_argv):
         sys.exit(127)
 
     exit_file = tempfile.mktemp(suffix=".exit", prefix=f"sos-claude-{session}-")
+
+    # The prompt is the last argv; for long prompts (pm-start + its flow-dev
+    # prefix clocks at 20-30 KB), inlining the prompt into a `sh -c` wrapper
+    # blows through macOS ARG_MAX (~256 KB after shlex.quote's backslash-
+    # escaping overhead) and tmux new-session dies with "command too long".
+    # Detach prompts above a safety threshold to a temp file and redirect via
+    # stdin — wrapper stays short, claude reads the same content.
+    STDIN_THRESHOLD = 4000
+    prompt_file = None
+    if cmd_argv and len(cmd_argv[-1]) > STDIN_THRESHOLD:
+        prompt_file = tempfile.mktemp(suffix=".prompt",
+                                      prefix=f"sos-claude-{session}-")
+        with open(prompt_file, "w") as f:
+            f.write(cmd_argv[-1])
+        cmd_argv = cmd_argv[:-1]
+
     unset_cmd = "unset " + " ".join(STRIP_ENV)
     cmd_str = " ".join(shlex.quote(a) for a in cmd_argv)
-    wrapper = f'{unset_cmd}; {cmd_str}; echo $? > {shlex.quote(exit_file)}'
+    if prompt_file:
+        stdin_redirect = f"< {shlex.quote(prompt_file)}"
+    else:
+        stdin_redirect = ""
+    wrapper = (f"{unset_cmd}; {cmd_str} {stdin_redirect}; "
+               f"rc=$?; echo $rc > {shlex.quote(exit_file)}")
 
     # new-session -d: detached. -A: attach to existing session with this name
     # instead of erroring, so re-runs are idempotent.
@@ -97,6 +118,9 @@ def run_in_tmux(session, cmd_argv):
         ], env=stripped_env())
     except subprocess.CalledProcessError as e:
         print(f"sos-claude-print: tmux new-session failed: {e}", file=sys.stderr)
+        if prompt_file:
+            try: os.unlink(prompt_file)
+            except OSError: pass
         sys.exit(1)
 
     # Tee the tmux pane to a log file so post-mortem debugging is possible.
@@ -138,6 +162,11 @@ def run_in_tmux(session, cmd_argv):
             os.unlink(exit_file)
         except OSError:
             pass
+        if prompt_file:
+            try:
+                os.unlink(prompt_file)
+            except OSError:
+                pass
 
     return exit_code
 
