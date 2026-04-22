@@ -367,29 +367,111 @@ ends. If you see unrelated findings, trust the backlog, not this PR.
 
 Ticket context: read `.pm/active-ticket.json` for summary + acceptance criteria.
 
+## This is your ONLY thorough pass
+
+The re-review after work-N is DELIBERATELY scope-locked: it verifies
+your specific comments are resolved and catches regressions, nothing
+else. It cannot post new findings to discover issues you missed here.
+That means every real concern in this PR has to be caught NOW. Treat
+this as the only review that will happen.
+
 ## Steps
 
-1. Read the PR diff:          `gh pr diff {pr_num}`
-2. Read the PR description:   `gh pr view {pr_num}`
-3. Check for:
-   - Logic bugs and edge cases
-   - Security concerns
-   - Test coverage gaps
-   - Deviation from acceptance criteria
-   - Style inconsistencies (per the repo's existing conventions)
-   - Dead code, leftover debug prints, stray TODOs
-4. For each concrete issue, post an inline review comment:
-      gh pr review {pr_num} --comment -F <feedback-file>
-5. When done, write `.pm/review-result.json` in the worktree root:
-      {{"comments": N, "verdict": "changes-requested" | "approve"}}
+1. Read the full PR diff:          `gh pr diff {pr_num}`
+2. Read the PR description:         `gh pr view {pr_num}`
+3. Read the ticket and ACs:         `.pm/active-ticket.json`
+4. For EVERY file in the diff, read the COMPLETE updated file (not just
+   the hunk). Context outside the diff often reveals the bug.
+
+## Check all of these categories
+
+### Correctness (highest priority — these block merge)
+- Logic bugs, incorrect conditionals, off-by-one, wrong operator
+- Edge cases: empty arrays, null/undefined, zero, negative, huge N
+- Race conditions between async operations, unordered promise resolves
+- State management bugs: stale closures, unmounted-component updates,
+  effect dependency omissions
+- Error handling: missing try/catch, unhandled promise rejections,
+  thrown errors that surface to the user as "undefined"
+- Data loss: async-overwritten user input, lost-update patterns on
+  shared state
+
+### Acceptance criteria (mechanically verify each one)
+For each AC in `.pm/active-ticket.json`:
+- Identify the code that implements it (file + line range)
+- Confirm it actually satisfies the criterion as written (not "looks
+  like it would")
+- If the ticket specifies a numeric target (N variants, K fps, etc.),
+  count/measure mechanically in the diff — don't trust agent claims
+
+### Security
+- Unvalidated input on routes / API handlers (path injection, huge
+  bodies, missing auth)
+- Secrets in code or env-leakage into logs
+- XSS (innerHTML, dangerouslySetInnerHTML with user input)
+- CSRF on state-changing endpoints
+
+### Accessibility (when UI code)
+- Missing alt text, aria-labels, keyboard handlers
+- `prefers-reduced-motion` ignored on new animations
+- Contrast, focus rings, tab order
+
+### Performance (when the ticket is UI/perf-sensitive)
+- Unnecessary re-renders (unstable keys, inline object/function props
+  passed to memoized children)
+- N+1 queries, sync XHR, blocking main thread
+- Memory leaks: uncleaned intervals/listeners, growing caches
+- Large bundle imports where a smaller one would do
+
+### Hygiene
+- Dead code, commented-out blocks, leftover debug prints
+- Stray TODO/FIXME comments without a ticket reference
+- New dev dependencies not noted in work-summary
+- Style inconsistencies with the repo's existing conventions
+
+## Anti-over-engineering — important
+
+This pass is exhaustive about CORRECTNESS, not about "could be better."
+For every comment you're about to post, ask: does this BLOCK merge, or
+is it a preference? If it's a preference — a cleaner abstraction, a
+different pattern, "consider using X" — DO NOT post it as a review
+comment. Add it to `.pm/followups.md` as a one-line note instead.
+
+Post review comments for:
+- ✅ Bugs that would surface in production
+- ✅ Security / privacy holes
+- ✅ Missed acceptance criteria
+- ✅ Regressions (functionality worse than before)
+- ✅ Accessibility blockers
+- ✅ Memory/perf issues on hot paths
+
+Do NOT post review comments for:
+- ❌ "This could be extracted into a helper"
+- ❌ "Consider using a reducer instead of useState"
+- ❌ "This pattern differs from other files" (unless it actively breaks)
+- ❌ "Add a comment explaining X"
+- ❌ Style preferences not codified in the repo's linter/formatter
+- ❌ Speculative improvements ("if we wanted to add Y later, this
+  structure would make it easier")
+
+The cost of a false-positive review comment is high: work-N spends
+effort addressing something that didn't need addressing, and the
+re-review may catch regressions introduced by the over-fix. Be
+specific, be concrete, and tie every comment to an ACTUAL problem,
+not a hypothetical one.
+
+## Posting comments + submitting the review
+
+5. For each concrete issue, post an inline review comment on the
+   relevant line:
+       gh pr review {pr_num} --comment -F <feedback-file>
+6. When done, write `.pm/review-result.json` in the worktree root:
+       {{"comments": N, "verdict": "changes-requested" | "approve"}}
    Do NOT print the JSON to stdout — the orchestrator reads the file.
 
-Review phase has no separate verifier — the natural signal is the next
-phase. If you found zero issues (verdict=approve), flow routes straight
-to QA. If you found issues (verdict=changes-requested), work-2 reads
-your comments and addresses them, then review runs AGAIN to confirm
-the fixes. That second review is scope-narrowed: it verifies YOUR
-specific comments are resolved rather than expanding scope to new nits.
+Verdict rules:
+- Zero review comments posted → `approve`
+- Any review comment posted → `changes-requested`
 
 {_blocker_for(ticket)}
 """
@@ -1236,18 +1318,28 @@ def _run_start_blocking(ticket, args):
         r2 = phase_review(ticket, pr_num, is_rereview=True)
         verdict2 = r2.get("verdict")
         comments2 = r2.get("comments", 0)
-        session_set(ticket, review_verdict=verdict2,
-                    review_comments=comments2,
-                    phase="awaiting-qa")
+        # Record the re-review's findings first — but gate the phase
+        # transition on the verdict. Previously we unconditionally set
+        # phase="awaiting-qa" before checking verdict, which left the
+        # session in a "looks like QA, no QA card" inconsistent state
+        # when the re-review flagged issues and fail() fired afterward.
         post_card(
             "info", f"Re-review posted — {comments2} comments",
             ticket=ticket, url=pr_url or None,
             ctx=f"Verdict: {verdict2} (after work-2)",
         )
         if verdict2 == "changes-requested":
+            session_set(ticket, review_verdict=verdict2,
+                        review_comments=comments2,
+                        phase="review-2-failed")
             fail(f"re-review still found {comments2} issues after work-2 — "
                  f"flow halts. Operator: inspect PR #{pr_num} and re-run "
                  f"with `sos-flow-dev work2 {ticket}` or qa-reject as appropriate.")
+        # Verdict is approve (or anything non-changes-requested); flow
+        # advances to Phase 4's QA gate.
+        session_set(ticket, review_verdict=verdict2,
+                    review_comments=comments2,
+                    phase="awaiting-qa")
         if args.pause_after == "work2":
             gate(ticket, "Work 2 + re-review done — continue to QA card?")
 
@@ -1413,17 +1505,20 @@ def cmd_qa_reject(args):
     r3 = phase_review(ticket, pr_num, is_rereview=True)
     verdict3 = r3.get("verdict")
     comments3 = r3.get("comments", 0)
-    session_set(ticket, review_verdict=verdict3,
-                review_comments=comments3,
-                phase="awaiting-qa-2")
     post_card(
         "info", f"Re-review posted — {comments3} comments",
         ticket=ticket, url=sess.get("pr_url") or None,
         ctx=f"Verdict: {verdict3} (after work-3)",
     )
     if verdict3 == "changes-requested":
+        session_set(ticket, review_verdict=verdict3,
+                    review_comments=comments3,
+                    phase="review-3-failed")
         fail(f"re-review still found {comments3} issues after work-3 — "
              f"flow halts. Operator: inspect PR #{pr_num}.")
+    session_set(ticket, review_verdict=verdict3,
+                review_comments=comments3,
+                phase="awaiting-qa-2")
 
     post_card(
         "action", f"Re-QA on {ticket}",

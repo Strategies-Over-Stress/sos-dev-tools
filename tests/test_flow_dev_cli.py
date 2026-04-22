@@ -83,8 +83,22 @@ class TestPromptTemplates(unittest.TestCase):
         checklist, not the narrow re-review scope."""
         p = fd.review_prompt("FOO-1", "42")  # default
         self.assertNotIn("RE-REVIEW", p)
+        # New prompt uses "Logic bugs" under Correctness category
         self.assertIn("Logic bugs", p)
-        self.assertIn("Security concerns", p)
+        # Security is now under its own heading
+        self.assertIn("Security", p)
+
+    def test_review_prompt_full_review_has_anti_over_engineering_guard(self):
+        """First-pass is the only exhaustive review — but it must explicitly
+        warn against AI over-engineering (flagging hypothetical improvements
+        as if they were correctness blockers). Re-review can't compensate for
+        a review that turned every diff into a 40-comment refactor wishlist."""
+        p = fd.review_prompt("FOO-1", "42")
+        self.assertIn("Anti-over-engineering", p)
+        self.assertIn("Do NOT post", p)
+        # Specific examples of what NOT to comment on
+        self.assertIn("preference", p.lower())
+        self.assertIn("followups.md", p)
 
     def test_review_prompt_rereview_skips_full_checklist(self):
         """Re-review must NOT include the full-sweep checklist — that
