@@ -1332,9 +1332,27 @@ def _run_start_blocking(ticket, args):
             session_set(ticket, review_verdict=verdict2,
                         review_comments=comments2,
                         phase="review-2-failed")
+            # Explicit, unmissable action card — "flow halted here"
+            # shouldn't have to be inferred from absence-of-QA-card.
+            post_card(
+                "action", f"⊘ {ticket} halted at re-review",
+                ticket=ticket, url=pr_url or None,
+                ctx=(f"Re-review after work-2 still found {comments2} issues "
+                     f"(verdict: {verdict2}). Inspect PR #{pr_num} and decide: "
+                     f"force-approve, retry, or escalate."),
+                actions=[
+                    {"label": "Open PR", "kind": "openUrl"},
+                    {"label": "Approve anyway", "kind": "inject",
+                     "text": f"sos-flow-dev qa-approve {ticket}\n",
+                     "execute": True},
+                    {"label": "Retry via qa-reject", "kind": "inject",
+                     "text": f"sos-flow-dev qa-reject {ticket} ",
+                     "execute": False},
+                ],
+            )
             fail(f"re-review still found {comments2} issues after work-2 — "
-                 f"flow halts. Operator: inspect PR #{pr_num} and re-run "
-                 f"with `sos-flow-dev work2 {ticket}` or qa-reject as appropriate.")
+                 f"flow halts. Operator: action card posted; choose "
+                 f"approve-anyway, retry, or manual fix.")
         # Verdict is approve (or anything non-changes-requested); flow
         # advances to Phase 4's QA gate.
         session_set(ticket, review_verdict=verdict2,
@@ -1514,8 +1532,21 @@ def cmd_qa_reject(args):
         session_set(ticket, review_verdict=verdict3,
                     review_comments=comments3,
                     phase="review-3-failed")
+        post_card(
+            "action", f"⊘ {ticket} halted at re-review (after work-3)",
+            ticket=ticket, url=sess.get("pr_url") or None,
+            ctx=(f"Re-review after work-3 still found {comments3} issues "
+                 f"(verdict: {verdict3}). Inspect PR #{pr_num}: "
+                 f"force-approve if findings are nits, or inspect manually."),
+            actions=[
+                {"label": "Open PR", "kind": "openUrl"},
+                {"label": "Approve anyway", "kind": "inject",
+                 "text": f"sos-flow-dev qa-approve {ticket}\n",
+                 "execute": True},
+            ],
+        )
         fail(f"re-review still found {comments3} issues after work-3 — "
-             f"flow halts. Operator: inspect PR #{pr_num}.")
+             f"flow halts. Action card posted.")
     session_set(ticket, review_verdict=verdict3,
                 review_comments=comments3,
                 phase="awaiting-qa-2")
