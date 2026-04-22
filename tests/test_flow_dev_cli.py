@@ -59,6 +59,41 @@ class TestPromptTemplates(unittest.TestCase):
         self.assertIn("--ticket FOO-1", p)
         self.assertNotIn("<TICKET>", p)
 
+    def test_review_prompt_rereview_scope_narrow(self):
+        """Regression: re-review must explicitly narrow scope to the
+        prior round's comments + regressions. Without this, re-review
+        tends to invent new nits on each pass and the flow never
+        converges."""
+        p = fd.review_prompt("FOO-1", "42", is_rereview=True)
+        # Narrow-scope language present
+        self.assertIn("RE-REVIEW", p)
+        self.assertIn("narrow", p.lower())
+        self.assertIn("prior", p.lower())
+        # Regressions-only instruction for new findings
+        self.assertIn("REGRESSIONS ONLY", p)
+        # Explicit DO NOT expand scope
+        self.assertIn("DO NOT post comments about issues that", p)
+        # Style/nit scope creep guard
+        self.assertIn("nit", p.lower())
+        # Standard blocker contract still threaded in
+        self.assertIn("--ticket FOO-1", p)
+
+    def test_review_prompt_default_is_full_review(self):
+        """Default (is_rereview=False) gets the full quality-sweep
+        checklist, not the narrow re-review scope."""
+        p = fd.review_prompt("FOO-1", "42")  # default
+        self.assertNotIn("RE-REVIEW", p)
+        self.assertIn("Logic bugs", p)
+        self.assertIn("Security concerns", p)
+
+    def test_review_prompt_rereview_skips_full_checklist(self):
+        """Re-review must NOT include the full-sweep checklist — that
+        language is the source of scope expansion."""
+        p = fd.review_prompt("FOO-1", "42", is_rereview=True)
+        # The full-review checklist header is absent on re-review
+        self.assertNotIn("Security concerns", p)
+        self.assertNotIn("Dead code, leftover debug", p)
+
     def test_work2_prompt_has_blocker(self):
         p = fd.work2_prompt("BAR-7", "99", 3)
         self.assertIn("PR #99 has 3 review comments", p)

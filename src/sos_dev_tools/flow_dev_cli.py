@@ -312,7 +312,57 @@ of forking from the wrong branch: hours of rework downstream.
 """
 
 
-def review_prompt(ticket, pr_num):
+def review_prompt(ticket, pr_num, is_rereview=False):
+    if is_rereview:
+        return f"""You are a senior code reviewer on a RE-REVIEW of PR #{pr_num}.
+
+## Scope — narrow, do not expand
+
+A prior review cycle posted comments; a work-N agent has since pushed
+commits to address them. Your job is to verify those SPECIFIC issues
+are resolved. You are NOT doing a fresh full review of the diff.
+
+## Steps
+
+1. Read the existing PR review comments authored BEFORE work-N's push:
+       gh api repos/:owner/:repo/pulls/{pr_num}/comments
+   (Sort by createdAt; the prior-round comments are the ones that
+   pre-date the most recent few commits.)
+2. For each prior comment, read the relevant file in its current state
+   and the commit(s) that were supposed to address it. Decide:
+     a. RESOLVED — the issue is fixed. Do nothing; do not post.
+     b. STILL OUTSTANDING — the fix is missing, incomplete, or wrong.
+        Post a new comment that quotes the prior comment id and explains
+        the remaining gap concretely.
+3. REGRESSIONS ONLY — if work-N's fix for one issue BROKE something
+   else (e.g., reverted a previously-correct line, introduced a new
+   null deref), post that too. These are legitimate new findings
+   because they're caused by the work-N round itself.
+4. DO NOT post comments about issues that:
+     a. Existed in the original diff but weren't flagged in the prior
+        review (scope creep — those are a separate ticket's problem),
+     b. Are style/nit preferences you merely noticed this time around,
+     c. Are "things to consider" that don't block correctness.
+   If you think a finding belongs in a future ticket, write it to
+   `.pm/followups.md` (one bullet per item) instead of the PR.
+5. Submit the review:
+       gh pr review {pr_num} --approve -b "..."   # if no gaps/regressions
+       gh pr review {pr_num} --request-changes -b "..."   # otherwise
+6. Write `.pm/review-result.json`:
+       {{"comments": N, "verdict": "changes-requested" | "approve"}}
+   where N is the count of comments YOU posted in THIS review
+   (outstanding + regressions), not the cumulative total on the PR.
+
+Verdict rules:
+- ALL prior issues resolved AND no regressions → `approve`.
+- ANY prior issue still outstanding OR any regression → `changes-requested`.
+
+The goal is convergence. Expanding scope each round means work never
+ends. If you see unrelated findings, trust the backlog, not this PR.
+
+{_blocker_for(ticket)}
+"""
+
     return f"""You are a senior code reviewer. Review PR #{pr_num} in this repo.
 
 Ticket context: read `.pm/active-ticket.json` for summary + acceptance criteria.
@@ -338,7 +388,8 @@ Review phase has no separate verifier — the natural signal is the next
 phase. If you found zero issues (verdict=approve), flow routes straight
 to QA. If you found issues (verdict=changes-requested), work-2 reads
 your comments and addresses them, then review runs AGAIN to confirm
-the fixes. That second review is your quality check.
+the fixes. That second review is scope-narrowed: it verifies YOUR
+specific comments are resolved rather than expanding scope to new nits.
 
 {_blocker_for(ticket)}
 """
@@ -920,22 +971,35 @@ def _run_subagent_with_watcher(ticket, phase_label, session, prompt,
     return rc, missing
 
 
-def phase_review(ticket, pr_num):
+def phase_review(ticket, pr_num, is_rereview=False):
     """Review phase — no verifier. Review's output (comment count +
-    verdict written to .pm/review-result.json) is the next phase's input;
-    if the verdict is changes-requested, work-2 runs and review is
-    called AGAIN on the result (that second-pass is the real quality
-    check). If verdict is approve, flow routes to QA."""
-    step(f"Phase 2/5 — review PR #{pr_num}")
+    verdict written to .pm/review-result.json) is the next phase's input.
+
+    First-pass review: full quality sweep against the whole diff.
+    Re-review (is_rereview=True): narrow-scope, verifies the prior
+    round's comments are addressed + catches regressions, does NOT
+    expand scope to new findings. Without this narrowing, every
+    re-review tends to invent new nits and flow never converges.
+    """
+    label = "re-review" if is_rereview else "review"
+    step(f"Phase 2/5 — {label} PR #{pr_num}")
     rf = worktree_root() / ".pm" / "review-result.json"
+    # Clear any prior review-result.json so a stale file can't accidentally
+    # satisfy the next read (especially important on re-review).
+    if rf.exists():
+        try:
+            rf.unlink()
+        except OSError:
+            pass
+    session = f"flow-{ticket}-review-2" if is_rereview else f"flow-{ticket}-review"
     rc, missing = _run_subagent_with_watcher(
-        ticket, "review", f"flow-{ticket}-review",
-        review_prompt(ticket, pr_num), rf,
+        ticket, label.replace("-", "_"), session,
+        review_prompt(ticket, pr_num, is_rereview=is_rereview), rf,
     )
     if rc != 0:
-        fail(f"review subagent exited {rc}")
+        fail(f"{label} subagent exited {rc}")
     if missing:
-        fail(f"review subagent did not write {rf} — check `tmux attach -t flow-{ticket}-review` for last state")
+        fail(f"{label} subagent did not write {rf} — check `tmux attach -t {session}` for last state")
     return json.loads(rf.read_text())
 
 
@@ -1163,11 +1227,13 @@ def _run_start_blocking(ticket, args):
 
         # Re-review after work-2 closes the quality loop: the original
         # review found N issues, work-2 addressed them, and now we run
-        # the reviewer AGAIN to confirm the fixes are real. If this
-        # second review still finds issues, halt and surface them to
-        # the operator — no automatic third pass.
+        # the reviewer AGAIN to confirm the fixes are real. The re-review
+        # is SCOPE-NARROWED via is_rereview=True — it only verifies the
+        # prior round's comments + catches regressions, doesn't expand
+        # scope to new nits. Without that narrowing, re-review tends to
+        # invent fresh findings and the flow never converges.
         step(f"Phase 3.5/5 — re-review after work-2")
-        r2 = phase_review(ticket, pr_num)
+        r2 = phase_review(ticket, pr_num, is_rereview=True)
         verdict2 = r2.get("verdict")
         comments2 = r2.get("comments", 0)
         session_set(ticket, review_verdict=verdict2,
@@ -1340,10 +1406,11 @@ def cmd_qa_reject(args):
 
     # Re-review after work-3 for the same reason work-2 gets one:
     # work-3 introduced code changes and the operator rejection may not
-    # have caught everything. Run the reviewer against the new commits
-    # and halt if it still finds issues.
+    # have caught everything. Scope-narrowed (is_rereview=True) so it
+    # only verifies the operator's rejection reasons are addressed +
+    # catches regressions, doesn't expand scope.
     step(f"Phase 3.5 (re-QA) — review after work-3")
-    r3 = phase_review(ticket, pr_num)
+    r3 = phase_review(ticket, pr_num, is_rereview=True)
     verdict3 = r3.get("verdict")
     comments3 = r3.get("comments", 0)
     session_set(ticket, review_verdict=verdict3,
