@@ -316,49 +316,75 @@ def review_prompt(ticket, pr_num, is_rereview=False):
     if is_rereview:
         return f"""You are a senior code reviewer on a RE-REVIEW of PR #{pr_num}.
 
-## Scope — narrow, do not expand
+## Scope
 
 A prior review cycle posted comments; a work-N agent has since pushed
-commits to address them. Your job is to verify those SPECIFIC issues
-are resolved. You are NOT doing a fresh full review of the diff.
+commits to address them. Your job has three parts:
+
+1. **Verify prior comments are resolved.** For each comment from the
+   prior round, read the file in its current state and the commit(s)
+   that were supposed to address it. If any prior issue is still open
+   (unfixed, partially fixed, or wrongly fixed), post a new comment
+   quoting the prior comment id and pointing at the remaining gap.
+
+2. **Catch regressions.** If work-N's fixes broke anything that was
+   working before, post those too.
+
+3. **Catch BLOCKERS the first review missed.** Real bugs the initial
+   reviewer overlooked are legitimate findings — do not suppress them
+   just because they weren't raised last round. Apply the SAME
+   blocker-vs-preference standard as a first-pass review (below).
+
+## What counts as a BLOCKER (post it)
+
+- Logic bugs and edge-case breakage (null/empty/huge inputs,
+  off-by-one, race conditions, data loss, state desync)
+- Security holes (unvalidated input, XSS, secret leakage)
+- Missed acceptance criteria
+- Regressions (functionality worse than before work-N)
+- Accessibility blockers (prefers-reduced-motion ignored,
+  missing aria, broken keyboard nav)
+- Self-contradicting specs or docs that would mislead a downstream
+  consumer (type vs example mismatch, undefined reference, math error)
+
+## What does NOT count (do NOT post)
+
+- "This could be extracted into a helper"
+- "Consider using a reducer / hook / pattern X"
+- Style or naming preferences not codified in the repo's tooling
+- Pattern divergence from other files that doesn't actively break
+- "Add a comment explaining Y"
+- Speculative improvements for hypothetical future needs
+- Things the first review mentioned that work-N addressed well
+  enough — don't re-litigate
+
+If you see a non-blocker finding worth preserving, write it to
+`.pm/followups.md` (one bullet per item) instead of the PR. The
+backlog is for refactors; the PR is for blockers.
 
 ## Steps
 
-1. Read the existing PR review comments authored BEFORE work-N's push:
+1. Read prior review comments:
        gh api repos/:owner/:repo/pulls/{pr_num}/comments
-   (Sort by createdAt; the prior-round comments are the ones that
-   pre-date the most recent few commits.)
-2. For each prior comment, read the relevant file in its current state
-   and the commit(s) that were supposed to address it. Decide:
-     a. RESOLVED — the issue is fixed. Do nothing; do not post.
-     b. STILL OUTSTANDING — the fix is missing, incomplete, or wrong.
-        Post a new comment that quotes the prior comment id and explains
-        the remaining gap concretely.
-3. REGRESSIONS ONLY — if work-N's fix for one issue BROKE something
-   else (e.g., reverted a previously-correct line, introduced a new
-   null deref), post that too. These are legitimate new findings
-   because they're caused by the work-N round itself.
-4. DO NOT post comments about issues that:
-     a. Existed in the original diff but weren't flagged in the prior
-        review (scope creep — those are a separate ticket's problem),
-     b. Are style/nit preferences you merely noticed this time around,
-     c. Are "things to consider" that don't block correctness.
-   If you think a finding belongs in a future ticket, write it to
-   `.pm/followups.md` (one bullet per item) instead of the PR.
+2. For each prior comment, inspect current state. Post a new comment
+   ONLY if unresolved.
+3. Read work-N's commits for regressions.
+4. Scan the full diff for blocker-level issues the first reviewer
+   may have missed. Ignore nits.
 5. Submit the review:
-       gh pr review {pr_num} --approve -b "..."   # if no gaps/regressions
-       gh pr review {pr_num} --request-changes -b "..."   # otherwise
+       gh pr review {pr_num} --approve -b "..."          # all clear
+       gh pr review {pr_num} --request-changes -b "..."  # blockers found
 6. Write `.pm/review-result.json`:
-       {{"comments": N, "verdict": "changes-requested" | "approve"}}
-   where N is the count of comments YOU posted in THIS review
-   (outstanding + regressions), not the cumulative total on the PR.
+       {{"comments": N, "verdict": "approve" | "changes-requested"}}
+   Where N = count of comments YOU posted in THIS review.
 
 Verdict rules:
-- ALL prior issues resolved AND no regressions → `approve`.
-- ANY prior issue still outstanding OR any regression → `changes-requested`.
+- All prior resolved AND no regressions AND no missed blockers → `approve`
+- Any unresolved prior, regression, or missed blocker → `changes-requested`
 
-The goal is convergence. Expanding scope each round means work never
-ends. If you see unrelated findings, trust the backlog, not this PR.
+The anti-churn lever is the blocker-vs-preference rule, not a
+"prior-comments-only" rule. Real bugs the first review missed are
+real bugs; catching them is your job. Nits are nits; leave them.
 
 {_blocker_for(ticket)}
 """

@@ -59,24 +59,36 @@ class TestPromptTemplates(unittest.TestCase):
         self.assertIn("--ticket FOO-1", p)
         self.assertNotIn("<TICKET>", p)
 
-    def test_review_prompt_rereview_scope_narrow(self):
-        """Regression: re-review must explicitly narrow scope to the
-        prior round's comments + regressions. Without this, re-review
-        tends to invent new nits on each pass and the flow never
-        converges."""
+    def test_review_prompt_rereview_has_three_scope_parts(self):
+        """Re-review covers: (1) verify prior comments resolved,
+        (2) catch regressions from work-N, (3) catch blockers the first
+        review missed. The third part was initially excluded under a
+        stricter 'prior-comments-only' rule but that suppressed real
+        bugs — FX-2 case had 7 legitimate findings that all pre-existed
+        but were missed in round 1."""
         p = fd.review_prompt("FOO-1", "42", is_rereview=True)
-        # Narrow-scope language present
         self.assertIn("RE-REVIEW", p)
-        self.assertIn("narrow", p.lower())
-        self.assertIn("prior", p.lower())
-        # Regressions-only instruction for new findings
-        self.assertIn("REGRESSIONS ONLY", p)
-        # Explicit DO NOT expand scope
-        self.assertIn("DO NOT post comments about issues that", p)
-        # Style/nit scope creep guard
-        self.assertIn("nit", p.lower())
+        # Three explicit scope parts
+        self.assertIn("Verify prior comments are resolved", p)
+        self.assertIn("Catch regressions", p)
+        self.assertIn("Catch BLOCKERS the first review missed", p)
+        # Anti-churn lever is blocker-vs-preference, NOT prior-only
+        self.assertIn("blocker", p.lower())
+        self.assertIn("preference", p.lower())
         # Standard blocker contract still threaded in
         self.assertIn("--ticket FOO-1", p)
+
+    def test_review_prompt_rereview_anti_over_engineering_guard(self):
+        """Re-review must explicitly filter out over-engineering style
+        findings (extract helpers, 'consider using X', speculative
+        improvements) — the same guard as first-pass, not a separate
+        narrower scope."""
+        p = fd.review_prompt("FOO-1", "42", is_rereview=True)
+        self.assertIn("do not post", p.lower())
+        self.assertIn("extract", p.lower())
+        self.assertIn("consider using", p.lower())
+        self.assertIn("speculative", p.lower())
+        self.assertIn("followups.md", p)
 
     def test_review_prompt_default_is_full_review(self):
         """Default (is_rereview=False) gets the full quality-sweep
