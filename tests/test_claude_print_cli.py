@@ -179,10 +179,12 @@ class TestTmuxMode(unittest.TestCase):
             f.write("0")
             exit_path = f.name
         mock_mktemp.return_value = exit_path
-        # has-session: first call returncode=0 (alive), second returncode=1 (dead)
+        # First subprocess.run is pipe-pane (logging setup, non-fatal).
+        # Then has-session: first call returncode=0 (alive), second returncode=1 (dead).
         mock_run.side_effect = [
-            MagicMock(returncode=0),
-            MagicMock(returncode=1),
+            MagicMock(returncode=0),  # pipe-pane
+            MagicMock(returncode=0),  # has-session: alive
+            MagicMock(returncode=1),  # has-session: dead
         ]
         try:
             result = claude_print_cli.run_in_tmux("my-session", ["claude", "--print", "hi"])
@@ -211,7 +213,10 @@ class TestTmuxMode(unittest.TestCase):
             f.write("42")
             exit_path = f.name
         mock_mktemp.return_value = exit_path
-        mock_run.side_effect = [MagicMock(returncode=1)]  # session already dead on first check
+        mock_run.side_effect = [
+            MagicMock(returncode=0),  # pipe-pane
+            MagicMock(returncode=1),  # has-session: already dead
+        ]
         try:
             result = claude_print_cli.run_in_tmux("sess", ["claude", "hi"])
             self.assertEqual(result, 42)
@@ -227,7 +232,10 @@ class TestTmuxMode(unittest.TestCase):
     def test_missing_exit_file_treated_as_failure(self, mock_mktemp, mock_run, mock_check_call, mock_sleep, mock_which):
         # Session dies without writing the exit file (e.g., killed from outside).
         mock_mktemp.return_value = "/tmp/definitely-does-not-exist-zzzz.exit"
-        mock_run.side_effect = [MagicMock(returncode=1)]
+        mock_run.side_effect = [
+            MagicMock(returncode=0),  # pipe-pane
+            MagicMock(returncode=1),  # has-session: dead
+        ]
         result = claude_print_cli.run_in_tmux("sess", ["claude", "hi"])
         self.assertEqual(result, 1)
 

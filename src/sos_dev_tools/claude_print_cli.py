@@ -99,8 +99,22 @@ def run_in_tmux(session, cmd_argv):
         print(f"sos-claude-print: tmux new-session failed: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Tee the tmux pane to a log file so post-mortem debugging is possible.
+    # tmux scrollback dies with the session; when agents exit 0 silently the
+    # only way to find out *why* is to have captured the live output somewhere
+    # that survives. Failure here is non-fatal — logging is nice-to-have.
+    log_path = f"/tmp/sos-claude-{session}.log"
+    try:
+        subprocess.run(
+            ["tmux", "pipe-pane", "-t", session, f"cat >> {shlex.quote(log_path)}"],
+            check=False, capture_output=True,
+        )
+    except Exception:
+        pass
+
     print(f"[sos-claude-print] agent running in tmux session '{session}'", file=sys.stderr)
     print(f"[sos-claude-print] attach to watch live: tmux attach -t {session}", file=sys.stderr)
+    print(f"[sos-claude-print] tail post-mortem log: tail -f {log_path}", file=sys.stderr)
     print(f"[sos-claude-print] detach without killing: Ctrl+B then D", file=sys.stderr)
 
     # Poll until the session dies.
