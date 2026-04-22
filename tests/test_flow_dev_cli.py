@@ -239,7 +239,11 @@ class TestCmdStartHappyPath(SessionBase):
         self.assertEqual(kinds, ["info", "info", "action"])
         self.assertEqual(titles[-1], "Ready for QA")
 
-    def test_changes_requested_runs_work2(self):
+    def test_changes_requested_runs_work2_then_rereviews(self):
+        """After work-2, flow-dev runs the reviewer AGAIN to confirm fixes.
+        First review returns changes-requested (triggering work-2); second
+        review returns approve (confirming work-2 closed the issues) so
+        flow advances to QA."""
         self._stub_pm_complete("FOO-1")
         self._stub_alloc("FOO-1", Path(self._tmp))
 
@@ -253,15 +257,23 @@ class TestCmdStartHappyPath(SessionBase):
                 "preview_url": "",
                 "worktree": "repo",
             }
-            review.return_value = {"comments": 4, "verdict": "changes-requested"}
+            # First review → changes-requested; re-review after work-2 → approve
+            review.side_effect = [
+                {"comments": 4, "verdict": "changes-requested"},
+                {"comments": 0, "verdict": "approve"},
+            ]
             work2.return_value = {"ready": True, "url": "http://localhost:6006"}
 
             fd.cmd_start(args_ns(tickets=["FOO-1"], pause_after=None, base=None, detach=False, watch=False))
             work2.assert_called_once_with("FOO-1", "42", 4)
+            # Two reviews: initial + re-review
+            self.assertEqual(review.call_count, 2)
 
         self.assertEqual(fd.session_get("FOO-1", "preview_url"),
                          "http://localhost:6006")
         self.assertEqual(fd.session_get("FOO-1", "phase"), "awaiting-qa")
+        # After re-review approved, verdict is 'approve'
+        self.assertEqual(fd.session_get("FOO-1", "review_verdict"), "approve")
 
     def test_work2_failure_exits_and_posts_action_card(self):
         self._stub_pm_complete("FOO-1")
@@ -1628,51 +1640,48 @@ class TestVerifierLoop(SessionBase):
         return patch.object(fd, "_run_verifier",
                             side_effect=list(verdicts))
 
-    def test_complete_on_first_try(self):
+    def test_complete_verdict_returns_deliverable(self):
+        """Happy path: verifier says complete, orchestrator writes the
+        canonical deliverable file and returns the deliverable dict."""
         worker = MagicMock(return_value=0)
         verdict = {
             "state": "complete",
             "summary": "worker did the thing",
             "deliverable": {"branch": "feature/FOO-1-first-pass",
                             "pr_url": "https://x/pull/1"},
-            "feedback": [],
         }
         with self._stub_verifier([verdict]):
             result = fd._run_phase_with_verifier(
                 "FOO-1", "pm-start", worker, self.wt)
         worker.assert_called_once()
-        # Worker invoked with feedback=None on first attempt
-        self.assertIsNone(worker.call_args.kwargs.get("feedback"))
-        self.assertEqual(worker.call_args.kwargs.get("attempt"), 0)
         self.assertEqual(result["pr_url"], "https://x/pull/1")
-        # Deliverable file written at canonical path
-        marker = Path(f"/tmp/pm-complete-FOO-1.json")
+        marker = Path("/tmp/pm-complete-FOO-1.json")
         self.assertTrue(marker.exists())
         try: marker.unlink()
         except OSError: pass
 
-    def test_incomplete_then_complete_retries_with_feedback(self):
+    def test_incomplete_verdict_halts_no_retry(self):
+        """Retries removed — incomplete verdict halts the phase immediately
+        with the verifier's feedback surfaced to the operator."""
         worker = MagicMock(return_value=0)
         incomplete = {
             "state": "incomplete",
             "summary": "only 2 of 6 comments addressed",
             "deliverable": {},
-            "feedback": ["comment on Gallery.tsx:42 unaddressed",
-                         "comment on manifest.ts:7 unaddressed"],
+            "feedback": ["Gallery.tsx:42 unaddressed",
+                         "manifest.ts:7 unaddressed"],
         }
-        complete = {
-            "state": "complete", "summary": "all 6 addressed",
-            "deliverable": {"ready": True, "url": ""}, "feedback": [],
-        }
-        with self._stub_verifier([incomplete, complete]):
-            result = fd._run_phase_with_verifier(
-                "FOO-1", "work-2", worker, self.wt)
-        self.assertEqual(worker.call_count, 2)
-        # Second call received the incomplete verdict's feedback
-        second_call_feedback = worker.call_args_list[1].kwargs["feedback"]
-        self.assertIn("comment on Gallery.tsx:42 unaddressed",
-                      second_call_feedback)
-        self.assertEqual(result["ready"], True)
+        with self._stub_verifier([incomplete]), \
+             patch.object(fd, "post_card") as mock_post:
+            with self.assertRaises(SystemExit):
+                fd._run_phase_with_verifier(
+                    "FOO-1", "work-2", worker, self.wt)
+        # Worker called exactly once — no retry
+        worker.assert_called_once()
+        # Failure card posted with feedback visible to operator
+        mock_post.assert_called()
+        title = mock_post.call_args.args[1]
+        self.assertIn("incomplete", title)
 
     def test_failed_verdict_aborts(self):
         worker = MagicMock(return_value=0)
@@ -1680,129 +1689,108 @@ class TestVerifierLoop(SessionBase):
             "state": "failed",
             "summary": "committed to wrong branch",
             "deliverable": {"error": "on parent branch, should be feature/FOO-1"},
-            "feedback": [],
         }
-        with self._stub_verifier([failed]):
+        with self._stub_verifier([failed]), \
+             patch.object(fd, "post_card"):
             with self.assertRaises(SystemExit):
                 fd._run_phase_with_verifier("FOO-1", "work-2", worker, self.wt)
         worker.assert_called_once()
 
-    def test_max_retries_exhausted(self):
-        worker = MagicMock(return_value=0)
-        incomplete = {
-            "state": "incomplete", "summary": "still missing X",
-            "deliverable": {}, "feedback": ["still X"],
-        }
-        with self._stub_verifier([incomplete, incomplete, incomplete]):
-            with self.assertRaises(SystemExit):
-                fd._run_phase_with_verifier(
-                    "FOO-1", "work-2", worker, self.wt, max_retries=2)
-        # Worker invoked 3 times (1 initial + 2 retries)
-        self.assertEqual(worker.call_count, 3)
-
     def test_verifier_crash_treated_as_failure(self):
         worker = MagicMock(return_value=0)
-        # _run_verifier returning None = verifier couldn't produce a verdict
         with self._stub_verifier([None]):
             with self.assertRaises(SystemExit):
                 fd._run_phase_with_verifier(
                     "FOO-1", "pm-start", worker, self.wt)
         worker.assert_called_once()
 
-    def test_worker_nonzero_rc_aborts_before_verifier(self):
-        """If the worker itself bailed, we don't bother running the verifier."""
+    def test_worker_rc_nonzero_does_not_abort_before_verifier(self):
+        """New behavior: rc!=0 does not short-circuit. Verifier runs from
+        state; a crashed worker that still committed real work can pass."""
         worker = MagicMock(return_value=1)
-        verifier = MagicMock()
-        with patch.object(fd, "_run_verifier", verifier):
-            with self.assertRaises(SystemExit):
-                fd._run_phase_with_verifier(
-                    "FOO-1", "work-2", worker, self.wt)
+        verdict = {
+            "state": "complete",
+            "summary": "worker crashed but commits landed",
+            "deliverable": {"ready": True, "url": ""},
+        }
+        with self._stub_verifier([verdict]):
+            result = fd._run_phase_with_verifier(
+                "FOO-1", "work-2", worker, self.wt)
         worker.assert_called_once()
-        verifier.assert_not_called()
+        # Verifier got called despite rc=1
+        self.assertEqual(result["ready"], True)
+
+
+class TestVerdictSchemaValidation(unittest.TestCase):
+    """_validate_verdict_schema rejects malformed verifier output."""
+
+    def test_valid_minimal_verdict(self):
+        v = {"state": "complete", "summary": "ok", "deliverable": {}}
+        ok, err = fd._validate_verdict_schema(v)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+
+    def test_missing_state(self):
+        v = {"summary": "x", "deliverable": {}}
+        ok, err = fd._validate_verdict_schema(v)
+        self.assertFalse(ok)
+        self.assertIn("state", err)
+
+    def test_invalid_state_value(self):
+        v = {"state": "done", "summary": "x", "deliverable": {}}
+        ok, err = fd._validate_verdict_schema(v)
+        self.assertFalse(ok)
+        self.assertIn("invalid state", err)
+
+    def test_deliverable_must_be_object(self):
+        v = {"state": "complete", "summary": "x", "deliverable": "not-a-dict"}
+        ok, err = fd._validate_verdict_schema(v)
+        self.assertFalse(ok)
+        self.assertIn("deliverable", err)
+
+    def test_feedback_must_be_list_when_present(self):
+        v = {"state": "incomplete", "summary": "x", "deliverable": {},
+             "feedback": "should be a list"}
+        ok, err = fd._validate_verdict_schema(v)
+        self.assertFalse(ok)
+        self.assertIn("feedback", err)
+
+    def test_non_dict_rejected(self):
+        ok, err = fd._validate_verdict_schema("hello")
+        self.assertFalse(ok)
 
 
 class TestVerifierPromptShape(SessionBase):
     """verifier_prompt contains the phase description, success criteria,
-    and evidence-source guidance. Retry context is only included on retries."""
+    and evidence-source guidance."""
 
-    def test_first_attempt_no_prior_feedback_block(self):
-        p = fd.verifier_prompt("FOO-1", "pm-start",
-                               Path("/tmp/wt"), attempt=0, prior_feedback=None)
+    def test_prompt_includes_phase_description(self):
+        p = fd.verifier_prompt("FOO-1", "pm-start", Path("/tmp/wt"))
         self.assertIn("pm-start initializes", p)
         self.assertIn("feature branch", p.lower())
         self.assertIn("verdict", p.lower())
         self.assertIn("gh pr", p)
-        # No retry block
-        self.assertNotIn("Prior feedback", p)
-
-    def test_retry_includes_prior_feedback_verbatim(self):
-        feedback = ["comment on Gallery.tsx:42 unaddressed",
-                    "comment on manifest.ts:7 unaddressed"]
-        p = fd.verifier_prompt("FOO-1", "work-2",
-                               Path("/tmp/wt"), attempt=1,
-                               prior_feedback=feedback)
-        self.assertIn("Prior feedback", p)
-        self.assertIn("Gallery.tsx:42", p)
-        self.assertIn("manifest.ts:7", p)
-        # Don't invent new criteria note is included
-        self.assertIn("Do NOT invent new criteria", p)
 
     def test_prompt_includes_deliverable_schema(self):
-        p = fd.verifier_prompt("FOO-1", "pm-start",
-                               Path("/tmp/wt"), attempt=0, prior_feedback=None)
-        self.assertIn("completed_at", p)  # a pm-start schema field
+        p = fd.verifier_prompt("FOO-1", "pm-start", Path("/tmp/wt"))
+        self.assertIn("completed_at", p)
         self.assertIn("pr_url", p)
 
     def test_prompt_no_production_language(self):
-        """Verifier prompt must explicitly say 'no code, no commits'."""
-        p = fd.verifier_prompt("FOO-1", "work-2",
-                               Path("/tmp/wt"), attempt=0, prior_feedback=None)
+        p = fd.verifier_prompt("FOO-1", "work-2", Path("/tmp/wt"))
         self.assertIn("You do NOT produce", p)
 
-    def test_review_phase_prompt_includes_sentinel_guidance(self):
-        """Review verifier must know about the agent sentinel so it
-        distinguishes agent-authored reviews from human reviews on the
-        same PR."""
-        p = fd.verifier_prompt("FOO-1", "review",
-                               Path("/tmp/wt"), attempt=0, prior_feedback=None)
-        self.assertIn(fd.REVIEW_SENTINEL, p)
-        self.assertIn("humans", p)  # acknowledges multi-source reviews
-        # Verdict inference rules present
-        self.assertIn("APPROVED", p)
-        self.assertIn("CHANGES_REQUESTED", p)
-        self.assertIn("COMMENTED", p)
-        self.assertIn("PENDING", p)
+    def test_no_retry_language_in_prompt(self):
+        """Retries removed — prompt should NOT mention attempts or prior
+        feedback anymore."""
+        p = fd.verifier_prompt("FOO-1", "pm-start", Path("/tmp/wt"))
+        self.assertNotIn("Prior feedback", p)
+        self.assertNotIn("attempt", p.lower())
 
-    def test_non_review_phase_has_no_sentinel_block(self):
-        """Only the review-phase prompt gets the sentinel / review-state
-        inference block — other phases don't need it."""
-        for phase in ("pm-start", "work-2", "work-3"):
-            p = fd.verifier_prompt("FOO-1", phase,
-                                   Path("/tmp/wt"),
-                                   attempt=0, prior_feedback=None)
-            self.assertNotIn("Identifying agent-authored reviews", p,
-                             f"phase={phase} should not have the "
-                             f"review sentinel block")
-
-
-class TestReviewPromptSentinel(unittest.TestCase):
-    """The worker's review prompt must instruct the agent to include the
-    sentinel in the review body (so the verifier can identify it later)."""
-
-    def test_review_prompt_includes_sentinel(self):
-        p = fd.review_prompt("FOO-1", 42)
-        self.assertIn(fd.REVIEW_SENTINEL, p)
-        # Must explicitly say "do NOT write .pm/review-result.json"
-        self.assertIn("Do NOT write", p)
-        self.assertIn("review-result.json", p)
-        # Must tell the agent to SUBMIT the review (not just post comments)
-        self.assertIn("Submit the review", p)
-
-    def test_review_prompt_retry_feedback_included(self):
-        p = fd.review_prompt("FOO-1", 42,
-                             prior_feedback=["no sentinel in review body"])
-        self.assertIn("Retry", p)
-        self.assertIn("no sentinel in review body", p)
+    def test_review_phase_has_no_verifier_spec(self):
+        """Review verifier was removed — its absence from PHASE_SPECS is
+        the signal that review is not verifier-gated."""
+        self.assertNotIn("review", fd.PHASE_SPECS)
 
 
 class TestDeliverableSynthesis(SessionBase):

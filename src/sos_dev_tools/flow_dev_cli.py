@@ -312,21 +312,7 @@ of forking from the wrong branch: hours of rework downstream.
 """
 
 
-REVIEW_SENTINEL = "<!-- sos-flow-review -->"
-
-
-def review_prompt(ticket, pr_num, prior_feedback=None):
-    retry_block = ""
-    if prior_feedback:
-        items = "\n".join(f"  - {f}" for f in prior_feedback)
-        retry_block = f"""
-## Retry — address these specific gaps from the previous verifier
-
-{items}
-
-Focus this attempt on closing these gaps. Do NOT re-do work you
-previously did correctly.
-"""
+def review_prompt(ticket, pr_num):
     return f"""You are a senior code reviewer. Review PR #{pr_num} in this repo.
 
 Ticket context: read `.pm/active-ticket.json` for summary + acceptance criteria.
@@ -344,45 +330,21 @@ Ticket context: read `.pm/active-ticket.json` for summary + acceptance criteria.
    - Dead code, leftover debug prints, stray TODOs
 4. For each concrete issue, post an inline review comment:
       gh pr review {pr_num} --comment -F <feedback-file>
-5. **Submit the review** with `gh pr review {pr_num} --request-changes -b "<body>"`
-   (or `--approve` if no issues found). The review body MUST contain this
-   exact sentinel on its own line so the verifier can distinguish agent
-   reviews from human reviews on the same PR:
+5. When done, write `.pm/review-result.json` in the worktree root:
+      {{"comments": N, "verdict": "changes-requested" | "approve"}}
+   Do NOT print the JSON to stdout — the orchestrator reads the file.
 
-       {REVIEW_SENTINEL}
+Review phase has no separate verifier — the natural signal is the next
+phase. If you found zero issues (verdict=approve), flow routes straight
+to QA. If you found issues (verdict=changes-requested), work-2 reads
+your comments and addresses them, then review runs AGAIN to confirm
+the fixes. That second review is your quality check.
 
-   A typical body:
-
-       ## Review summary
-
-       Found 6 issues: 1 logic bug, 2 perf risks, 3 nits.
-
-       {REVIEW_SENTINEL}
-
-**Do NOT write `.pm/review-result.json`.** A separate verifier agent reads
-the PR's review state and comment count and writes the canonical
-deliverable. Your job is to identify issues + post comments + submit the
-review; the verifier's job is to judge whether the review happened.
-{retry_block}
 {_blocker_for(ticket)}
 """
 
 
-def work2_prompt(ticket, pr_num, comments_n, prior_feedback=None):
-    feedback_block = ""
-    if prior_feedback:
-        items = "\n".join(f"  - {f}" for f in prior_feedback)
-        feedback_block = f"""
-## Retry — address these specific gaps from the previous verifier
-
-A previous attempt at this phase was marked INCOMPLETE for these reasons:
-
-{items}
-
-Focus this attempt on closing these specific gaps. Do NOT re-do work that
-the previous attempt already completed.
-"""
-
+def work2_prompt(ticket, pr_num, comments_n):
     return f"""You are the implementation agent. PR #{pr_num} has {comments_n} review comments to address.
 
 ## Your task
@@ -396,33 +358,26 @@ the previous attempt already completed.
 4. Resolve review threads where your fix addresses them.
 5. If a preview dev server is configured (see `.pm/config.json` preview), use
    it to verify in-flight.
-{feedback_block}
+
 **Do NOT write `.pm/work-2-result.json`.** A separate verifier agent reads
 git state + PR state + your tmux log and writes the canonical deliverable.
 Your job is to do the work; the verifier's job is to judge completion.
+
+After you finish, the orchestrator will run the reviewer AGAIN against
+your changes. Any comments the reviewer finds become the next iteration's
+work. Make sure your commits directly address each review comment so
+the re-review has nothing to flag.
 
 {_blocker_for(ticket)}
 """
 
 
-def work3_prompt(ticket, pr_num, reason, prior_feedback=None):
+def work3_prompt(ticket, pr_num, reason):
     feedback = reason.strip() if reason else (
         "(no reason string supplied; read the reply thread on the most recent "
         "'Ready for QA' card — use `sos-inbox list --ticket " + ticket + "` "
         "to find its id and `sos-inbox replies <id>`)"
     )
-    retry_block = ""
-    if prior_feedback:
-        items = "\n".join(f"  - {f}" for f in prior_feedback)
-        retry_block = f"""
-## Retry — address these specific gaps from the previous verifier
-
-A previous attempt at this phase was marked INCOMPLETE:
-
-{items}
-
-Focus this attempt on closing these specific gaps.
-"""
     return f"""QA rejected PR #{pr_num} for {ticket}. Feedback from the reviewer:
 
     {feedback}
@@ -432,10 +387,14 @@ Focus this attempt on closing these specific gaps.
 1. Understand the feedback. If vague, consult the reply thread via sos-inbox.
 2. Address the feedback in the worktree. Commit and push.
 3. Keep the preview server running.
-{retry_block}
+
 **Do NOT write `.pm/work-3-result.json`.** A separate verifier agent reads
 git state + PR state + your tmux log and writes the canonical deliverable.
 Your job is to do the work; the verifier's job is to judge completion.
+
+After you finish, the orchestrator will run the reviewer against your
+changes. If the reviewer finds new issues, flow halts and surfaces them
+to the operator.
 
 {_blocker_for(ticket)}
 """
@@ -461,9 +420,6 @@ Your job is to do the work; the verifier's job is to judge completion.
 #     "failed" phase so the operator sees it.
 #   - Max 2 retries (3 total worker attempts). After exhaustion, fail the phase
 #     and surface the accumulated feedback to the operator.
-
-VERIFIER_MAX_RETRIES = 2
-
 
 PHASE_SPECS = {
     "pm-start": {
@@ -533,36 +489,15 @@ PHASE_SPECS = {
             "url": "string — preview URL or empty",
         },
     },
-    "review": {
-        "description": (
-            "review reads the PR diff, identifies issues (logic bugs, "
-            "security, test gaps, AC deviations), posts line-level "
-            "comments, and submits a review with a verdict."
-        ),
-        "success_criteria": [
-            "At least one review has been submitted by the agent on the "
-            "PR (state in APPROVED, CHANGES_REQUESTED, or COMMENTED — "
-            "NOT PENDING or DISMISSED)",
-            f"The agent's review body contains the sentinel string "
-            f"`{REVIEW_SENTINEL}` so it's distinguishable from human "
-            f"reviews on the same PR",
-            "If the review state is COMMENTED or CHANGES_REQUESTED, at "
-            "least one inline comment must exist (a review that requests "
-            "changes but posts zero specifics is useless)",
-        ],
-        "deliverable_path": "{worktree}/.pm/review-result.json",
-        "deliverable_schema": {
-            "comments": "int — count of inline review comments authored "
-                        "in the sentinel-tagged review",
-            "verdict": "string — 'approve' if GitHub review state is "
-                       "APPROVED, else 'changes-requested' (CHANGES_REQUESTED "
-                       "or COMMENTED both map to changes-requested)",
-        },
-    },
+    # Note: review phase does NOT have a verifier entry. Review's output
+    # IS the next phase's input — if no comments are posted, work-N has
+    # nothing to address and flow naturally routes to QA. A dedicated
+    # review verifier adds complexity without catching a meaningful
+    # failure mode; dropping it keeps the architecture simpler.
 }
 
 
-def verifier_prompt(ticket, phase, worktree, attempt, prior_feedback):
+def verifier_prompt(ticket, phase, worktree):
     """Build the verifier prompt. Verifier is a read-only agent whose
     output is a single JSON verdict file."""
     spec = PHASE_SPECS[phase]
@@ -571,41 +506,6 @@ def verifier_prompt(ticket, phase, worktree, attempt, prior_feedback):
     verdict_path = f"/tmp/verify-{ticket}-{phase}.json"
     worker_log = f"/tmp/sos-claude-flow-{ticket}-{phase}.log"
     sess_path = str(STATE_DIR / "sessions" / f"{ticket}.json")
-
-    feedback_block = ""
-    if prior_feedback:
-        feedback_items = "\n".join(f"  - {f}" for f in prior_feedback)
-        feedback_block = (
-            f"\n## Prior feedback to this worker (attempt {attempt + 1} of "
-            f"{VERIFIER_MAX_RETRIES + 1})\n\n"
-            f"You previously said this phase was INCOMPLETE with these "
-            f"specific gaps:\n{feedback_items}\n\n"
-            f"Re-verify now that the worker has had another attempt. "
-            f"Focus on whether the specific gaps above are closed. "
-            f"Do NOT invent new criteria — only judge against the success "
-            f"criteria below.\n"
-        )
-
-    review_sentinel_note = ""
-    if phase == "review":
-        review_sentinel_note = (
-            f"\n## Identifying agent-authored reviews\n\n"
-            f"The PR may have reviews from multiple sources (this agent, "
-            f"humans, other bots). ONLY count reviews whose body contains "
-            f"the literal sentinel `{REVIEW_SENTINEL}`. All other reviews "
-            f"are someone else's work and must not satisfy the success "
-            f"criteria.\n\n"
-            f"Verdict inference from GitHub review state (for the sentinel-"
-            f"tagged review):\n"
-            f"  - state = `APPROVED` → deliverable.verdict = 'approve'\n"
-            f"  - state = `CHANGES_REQUESTED` → 'changes-requested'\n"
-            f"  - state = `COMMENTED` (with inline comments) → 'changes-requested'\n"
-            f"  - state = `COMMENTED` (zero comments) → verdict is 'approve' "
-            f"BUT this is suspicious — a review with no comments and no "
-            f"explicit approval usually means the agent skipped the actual "
-            f"review. Mark incomplete.\n"
-            f"  - state = `PENDING` → review was never submitted; incomplete.\n"
-        )
 
     schema_lines = "\n".join(
         f"  \"{k}\": {v!r}" for k, v in spec["deliverable_schema"].items()
@@ -643,7 +543,7 @@ or any other production work.
   contains the worker's self-summary — read it but do not trust it
   without cross-referencing git/PR state)
 - Existing deliverable file (if worker did write one): {deliverable_path}
-{review_sentinel_note}{feedback_block}
+
 ## Your verdict
 
 Write JSON to `{verdict_path}` with this exact schema:
@@ -665,9 +565,10 @@ Write JSON to `{verdict_path}` with this exact schema:
   deliverable whose values come from actual state (git branch --show-current,
   gh pr list, etc.), not from the worker's self-report.
 - **incomplete** — worker did some work but specific criteria are unmet.
-  List the gaps concretely in `feedback`. Include the criterion number
-  or the specific missing artifact. The worker will re-run with your
-  feedback verbatim.
+  List the gaps concretely in `feedback` so the operator can fix and
+  re-run manually. Include the criterion number or the specific missing
+  artifact. There is no automatic retry — be specific enough that the
+  operator knows exactly what to tell the worker.
 - **failed** — worker produced work that breaks acceptance (committed
   to wrong branch, broke tests, regressed a previously-passing spec).
   Surface to operator via `deliverable.error` field.
@@ -685,28 +586,55 @@ Then exit 0.
 """
 
 
-def _run_verifier(ticket, phase, worktree, attempt, prior_feedback):
-    """Spawn the verifier subagent, wait for it, parse the verdict JSON.
+_VERDICT_REQUIRED = ("state", "summary", "deliverable")
 
-    Returns a dict {state, summary, deliverable, feedback} or None if the
-    verifier itself crashed (treat that as "failed" upstream).
+
+def _validate_verdict_schema(data):
+    """Validate the verifier's output has the fields flow-dev expects.
+    Returns (ok, error_msg). Schema: top-level required keys + state enum
+    + `deliverable` is an object + `feedback` is a list when present."""
+    if not isinstance(data, dict):
+        return False, "verdict is not a JSON object"
+    for k in _VERDICT_REQUIRED:
+        if k not in data:
+            return False, f"missing required field: {k!r}"
+    if data["state"] not in ("complete", "incomplete", "failed"):
+        return False, f"invalid state: {data['state']!r}"
+    if not isinstance(data["deliverable"], dict):
+        return False, "deliverable must be an object"
+    if "feedback" in data and not isinstance(data["feedback"], list):
+        return False, "feedback must be a list"
+    return True, None
+
+
+def _run_verifier(ticket, phase, worktree):
+    """Spawn the verifier subagent, wait for it, parse + schema-validate
+    the verdict JSON.
+
+    Returns a dict {state, summary, deliverable, feedback?} or None if
+    the verifier itself crashed or produced malformed output.
     """
-    prompt = verifier_prompt(ticket, phase, worktree, attempt, prior_feedback)
+    prompt = verifier_prompt(ticket, phase, worktree)
     session = f"verify-{ticket}-{phase}"
-    if attempt > 0:
-        session = f"{session}-retry{attempt}"
     verdict_path = Path(f"/tmp/verify-{ticket}-{phase}.json")
     if verdict_path.exists():
-        # Clear prior verdict so a crashed verifier can't accidentally
-        # satisfy the next read.
         try:
             verdict_path.unlink()
         except OSError:
             pass
-    step(f"Phase {phase} — verify (attempt {attempt + 1})")
-    rc = run_subagent(session, prompt)
-    if rc != 0:
-        print(f"  ✗ verifier subagent exited {rc}", file=sys.stderr)
+    step(f"Phase {phase} — verify")
+
+    # Watcher around the verifier so operator can see "it's running" in the
+    # sidebar even though verifiers typically don't touch the worktree.
+    watcher = spawn_watcher(ticket, f"verify-{phase}")
+    verifier_rc = 1
+    try:
+        verifier_rc = run_subagent(session, prompt)
+    finally:
+        stop_watcher(watcher, error=(verifier_rc != 0))
+
+    if verifier_rc != 0:
+        print(f"  ✗ verifier subagent exited {verifier_rc}", file=sys.stderr)
         return None
     if not verdict_path.exists():
         print(f"  ✗ verifier did not write {verdict_path}", file=sys.stderr)
@@ -716,62 +644,93 @@ def _run_verifier(ticket, phase, worktree, attempt, prior_feedback):
     except json.JSONDecodeError as e:
         print(f"  ✗ verifier verdict invalid JSON: {e}", file=sys.stderr)
         return None
-    state = data.get("state")
-    if state not in ("complete", "incomplete", "failed"):
-        print(f"  ✗ verifier verdict has invalid state: {state!r}",
-              file=sys.stderr)
+    ok, err = _validate_verdict_schema(data)
+    if not ok:
+        print(f"  ✗ verifier verdict schema invalid: {err}", file=sys.stderr)
         return None
     return data
 
 
-def _run_phase_with_verifier(ticket, phase, worker_fn, worktree,
-                             max_retries=VERIFIER_MAX_RETRIES):
-    """Run worker → verify loop. Worker may be invoked up to max_retries+1
-    times; each retry gets the prior verifier's feedback prepended to the
-    worker's prompt via worker_fn(feedback=...).
+def _run_phase_with_verifier(ticket, phase, worker_fn, worktree):
+    """Run worker, then verifier. Single-shot — no retries. Operator
+    re-invokes manually if they want a retry.
 
-    Returns the verifier's final `deliverable` dict on success.
-    Raises via fail() on failure (verifier said failed, or retries exhausted).
+    Philosophy: a phase either produces complete work or it doesn't.
+    Auto-retry with feedback tends to: duplicate work when the worker
+    misreads its own prior attempt, burn token budget in ambiguous
+    loops, and mask real problems behind "one more try." Halting on
+    the first incomplete/failed surfaces the issue immediately and
+    lets the operator decide whether to fix, re-run, or escalate.
+
+    Returns the verifier's `deliverable` dict on success; raises via
+    fail() on any non-complete verdict. Worker rc!=0 does NOT abort
+    before the verifier — the verifier judges from state, and a
+    crashed worker that still committed real work can still pass.
     """
-    feedback = None
-    last_summary = None
     spec = PHASE_SPECS[phase]
-    for attempt in range(max_retries + 1):
-        rc = worker_fn(feedback=feedback, attempt=attempt)
-        if rc != 0:
-            fail(f"{phase} worker subagent exited {rc} (attempt {attempt + 1})")
-        verdict = _run_verifier(ticket, phase, worktree, attempt, feedback)
-        if verdict is None:
-            fail(f"{phase} verifier could not produce a verdict (attempt {attempt + 1})")
-        state = verdict["state"]
-        summary = verdict.get("summary", "")
-        last_summary = summary
-        check(f"verify {phase} {ticket} → {state}"
-              + (f" — {summary}" if summary else ""))
-        # Write canonical deliverable file (verifier-authored, not worker-authored)
-        deliverable = verdict.get("deliverable") or {}
-        deliverable_path = Path(spec["deliverable_path"].format(
-            ticket=ticket, worktree=str(worktree)))
-        try:
-            deliverable_path.parent.mkdir(parents=True, exist_ok=True)
-            deliverable_path.write_text(json.dumps(deliverable, indent=2))
-        except OSError as e:
-            print(f"  ⚠ could not write {deliverable_path}: {e}",
-                  file=sys.stderr)
-        if state == "complete":
-            return deliverable
-        if state == "failed":
-            err = deliverable.get("error") or summary or "verifier marked phase as failed"
-            fail(f"{phase} failed (verifier): {err}")
-        # state == "incomplete" — set up retry
-        feedback = verdict.get("feedback") or ["(verifier provided no specific feedback)"]
-        if attempt < max_retries:
-            print(f"  ↻ {phase} incomplete — retrying worker "
-                  f"(attempt {attempt + 2} of {max_retries + 1}) "
-                  f"with {len(feedback)} feedback item(s)", flush=True)
-    # Retries exhausted
-    fail(f"{phase} did not reach `complete` after {max_retries + 1} worker "
-         f"attempts. Last summary: {last_summary}. Last feedback: {feedback}")
+
+    # Run the worker. rc is captured but not gating — verifier decides.
+    worker_rc = worker_fn()
+
+    verdict = _run_verifier(ticket, phase, worktree)
+    if verdict is None:
+        fail(f"{phase} verifier could not produce a verdict "
+             f"(worker rc={worker_rc})")
+    state = verdict["state"]
+    summary = verdict.get("summary", "")
+    feedback = verdict.get("feedback") or []
+
+    # Write canonical deliverable file (verifier-authored, not worker).
+    deliverable = verdict.get("deliverable") or {}
+    deliverable_path = Path(spec["deliverable_path"].format(
+        ticket=ticket, worktree=str(worktree)))
+    try:
+        deliverable_path.parent.mkdir(parents=True, exist_ok=True)
+        deliverable_path.write_text(json.dumps(deliverable, indent=2))
+    except OSError as e:
+        print(f"  ⚠ could not write {deliverable_path}: {e}",
+              file=sys.stderr)
+
+    check(f"verify {phase} {ticket} → {state}"
+          + (f" — {summary}" if summary else ""))
+
+    if state == "complete":
+        return deliverable
+
+    # Log verifier feedback to stderr AND to the inbox so the operator
+    # sees WHY without grepping. The activity-watcher card already flipped
+    # to red via stop_watcher(error=True) — append a concrete error card
+    # with the feedback items for at-a-glance visibility.
+    if feedback:
+        print(f"  ↳ verifier feedback:", file=sys.stderr)
+        for item in feedback:
+            print(f"    - {item}", file=sys.stderr)
+    _post_phase_failure_card(ticket, phase, state, summary, feedback,
+                             deliverable)
+    if state == "failed":
+        err = deliverable.get("error") or summary or "verifier marked phase as failed"
+        fail(f"{phase} failed (verifier): {err}")
+    # state == "incomplete"
+    fb_list = " | ".join(feedback) if feedback else "(no specific feedback)"
+    fail(f"{phase} incomplete — {summary}. Feedback: {fb_list}. "
+         f"Fix the gaps and re-run the phase manually if desired.")
+
+
+def _post_phase_failure_card(ticket, phase, state, summary, feedback,
+                             deliverable):
+    """Surface verifier verdict to the inbox so operator doesn't have to
+    read stderr. Graceful if inbox is unreachable."""
+    icon = "✗" if state == "failed" else "⊘"
+    title = f"{icon} {phase} {state}"
+    ctx_parts = []
+    if summary:
+        ctx_parts.append(summary)
+    if state == "failed" and deliverable.get("error"):
+        ctx_parts.append(deliverable["error"])
+    if feedback:
+        ctx_parts.append(" · Gaps: " + " / ".join(feedback[:5]))
+    post_card("info", title, ticket=ticket,
+              ctx=" ".join(ctx_parts)[:480] if ctx_parts else None)
 
 
 # ─── Phase runners (the mechanical parts) ──────────────────────────────────
@@ -851,21 +810,16 @@ the basis of "another agent is already working on this ticket". Do not
 call `sos-flow-dev cleanup`. Do not try to attach to `flow-{ticket}-work1`
 (you are already in it).
 
-⛔ **CRITICAL EXIT CONDITION.** The ONLY acceptable way to exit this
-skill is AFTER writing `/tmp/pm-complete-{ticket}.json` per step 10.
-flow-dev blocks on that file; if you exit without it, the whole ticket
-fails with the message:
+**You do NOT need to write `/tmp/pm-complete-{ticket}.json`.** A separate
+verifier agent reads observable state (git branch, PR via `gh pr list`,
+commits, your tmux log) and writes the canonical completion marker. Your
+job is to do the real work — create the branch, launch the dev agent,
+open the PR, optionally start a preview — and exit. The verifier handles
+the paperwork.
 
-    ✗ missing /tmp/pm-complete-{ticket}.json — did pm-start run?
-
-— even though you may have done all the upstream work. The skill has 10
-steps. Step 5 launches the dev agent and blocks until it exits (possibly
-for 10-30 minutes). AFTER step 5 returns, you still need to run steps 6
-through 10. Do NOT interpret "the dev agent tmux session ended" as
-"pm-start is done" — it means "the dev agent finished and it is now
-YOUR turn to run steps 6-10". The last instruction in the skill is
-literally `ls -la /tmp/pm-complete-{ticket}.json`; only exit after that
-succeeds.
+The skill has 10 steps. Do steps 1-9 to the best of your ability. Step
+10 (writing the completion marker) is now the verifier's responsibility,
+not yours; you can ignore or skip it.
 
 If step 5's Bash tool times out (sos-claude-print --tmux can run longer
 than Bash's default 2-min timeout), re-invoke with `timeout=600000` (10
@@ -885,21 +839,9 @@ def phase_pm_start(ticket, iteration="first-pass"):
     wt = Path(session_get(ticket, "worktree") or "")
 
     prefix = _FLOW_DEV_PREFIX_TEMPLATE.format(ticket=ticket)
-    skill_body = PM_START_SKILL.read_text()
+    body = prefix + PM_START_SKILL.read_text() + f"\n\n{ticket} {iteration}\n"
 
-    def worker(feedback=None, attempt=0):
-        retry_note = ""
-        if feedback:
-            items = "\n".join(f"  - {f}" for f in feedback)
-            retry_note = (
-                f"\n## Retry — address these specific gaps from the verifier\n\n"
-                f"A previous attempt at pm-start was marked INCOMPLETE:\n\n"
-                f"{items}\n\n"
-                f"Focus this attempt on closing these gaps.\n\n"
-                f"**You do NOT need to write /tmp/pm-complete-{ticket}.json — "
-                f"the verifier writes it.** Just do the work.\n"
-            )
-        body = prefix + skill_body + retry_note + f"\n\n{ticket} {iteration}\n"
+    def worker():
         watcher = spawn_watcher(ticket, "work-1")
         rc = 1
         try:
@@ -908,8 +850,7 @@ def phase_pm_start(ticket, iteration="first-pass"):
             stop_watcher(watcher, error=(rc != 0))
         return rc
 
-    deliverable = _run_phase_with_verifier(ticket, "pm-start", worker, wt)
-    return deliverable
+    return _run_phase_with_verifier(ticket, "pm-start", worker, wt)
 
 
 def _capture_head(worktree):
@@ -983,35 +924,35 @@ def _run_subagent_with_watcher(ticket, phase_label, session, prompt,
 
 
 def phase_review(ticket, pr_num):
+    """Review phase — no verifier. Review's output (comment count +
+    verdict written to .pm/review-result.json) is the next phase's input;
+    if the verdict is changes-requested, work-2 runs and review is
+    called AGAIN on the result (that second-pass is the real quality
+    check). If verdict is approve, flow routes to QA."""
     step(f"Phase 2/5 — review PR #{pr_num}")
-    wt = worktree_root()
-
-    def worker(feedback=None, attempt=0):
-        watcher = spawn_watcher(ticket, "review")
-        rc = 1
-        try:
-            rc = run_subagent(
-                f"flow-{ticket}-review",
-                review_prompt(ticket, pr_num, prior_feedback=feedback),
-            )
-        finally:
-            stop_watcher(watcher, error=(rc != 0))
-        return rc
-
-    return _run_phase_with_verifier(ticket, "review", worker, wt)
+    rf = worktree_root() / ".pm" / "review-result.json"
+    rc, missing = _run_subagent_with_watcher(
+        ticket, "review", f"flow-{ticket}-review",
+        review_prompt(ticket, pr_num), rf,
+    )
+    if rc != 0:
+        fail(f"review subagent exited {rc}")
+    if missing:
+        fail(f"review subagent did not write {rf} — check `tmux attach -t flow-{ticket}-review` for last state")
+    return json.loads(rf.read_text())
 
 
 def phase_work2(ticket, pr_num, comments_n):
     step(f"Phase 3/5 — address {comments_n} review comments")
     wt = worktree_root()
 
-    def worker(feedback=None, attempt=0):
+    def worker():
         watcher = spawn_watcher(ticket, "work-2")
         rc = 1
         try:
             rc = run_subagent(
                 f"flow-{ticket}-work2",
-                work2_prompt(ticket, pr_num, comments_n, prior_feedback=feedback),
+                work2_prompt(ticket, pr_num, comments_n),
             )
         finally:
             stop_watcher(watcher, error=(rc != 0))
@@ -1024,13 +965,13 @@ def phase_work3(ticket, pr_num, reason):
     step(f"Phase 3/5 (re-QA) — address reviewer feedback")
     wt = worktree_root()
 
-    def worker(feedback=None, attempt=0):
+    def worker():
         watcher = spawn_watcher(ticket, "work-3")
         rc = 1
         try:
             rc = run_subagent(
                 f"flow-{ticket}-work3",
-                work3_prompt(ticket, pr_num, reason, prior_feedback=feedback),
+                work3_prompt(ticket, pr_num, reason),
             )
         finally:
             stop_watcher(watcher, error=(rc != 0))
@@ -1221,9 +1162,31 @@ def _run_start_blocking(ticket, args):
                       ticket=ticket, ctx=w.get("failed", ""))
             fail(f"work-2 failed: {w.get('failed')}")
         preview_url = w.get("url") or preview_url
-        session_set(ticket, preview_url=preview_url, phase="awaiting-qa")
+        session_set(ticket, preview_url=preview_url, phase="review-2")
+
+        # Re-review after work-2 closes the quality loop: the original
+        # review found N issues, work-2 addressed them, and now we run
+        # the reviewer AGAIN to confirm the fixes are real. If this
+        # second review still finds issues, halt and surface them to
+        # the operator — no automatic third pass.
+        step(f"Phase 3.5/5 — re-review after work-2")
+        r2 = phase_review(ticket, pr_num)
+        verdict2 = r2.get("verdict")
+        comments2 = r2.get("comments", 0)
+        session_set(ticket, review_verdict=verdict2,
+                    review_comments=comments2,
+                    phase="awaiting-qa")
+        post_card(
+            "info", f"Re-review posted — {comments2} comments",
+            ticket=ticket, url=pr_url or None,
+            ctx=f"Verdict: {verdict2} (after work-2)",
+        )
+        if verdict2 == "changes-requested":
+            fail(f"re-review still found {comments2} issues after work-2 — "
+                 f"flow halts. Operator: inspect PR #{pr_num} and re-run "
+                 f"with `sos-flow-dev work2 {ticket}` or qa-reject as appropriate.")
         if args.pause_after == "work2":
-            gate(ticket, "Work 2 done — continue to QA card?")
+            gate(ticket, "Work 2 + re-review done — continue to QA card?")
 
     # Phase 4 — QA card
     step("Phase 4/5 — post QA gate")
@@ -1376,11 +1339,32 @@ def cmd_qa_reject(args):
     if "failed" in w:
         fail(f"work-3 failed: {w.get('failed')}")
     preview_url = w.get("url") or sess.get("preview_url", "")
-    session_set(ticket, preview_url=preview_url, phase="awaiting-qa-2")
+    session_set(ticket, preview_url=preview_url, phase="review-3")
+
+    # Re-review after work-3 for the same reason work-2 gets one:
+    # work-3 introduced code changes and the operator rejection may not
+    # have caught everything. Run the reviewer against the new commits
+    # and halt if it still finds issues.
+    step(f"Phase 3.5 (re-QA) — review after work-3")
+    r3 = phase_review(ticket, pr_num)
+    verdict3 = r3.get("verdict")
+    comments3 = r3.get("comments", 0)
+    session_set(ticket, review_verdict=verdict3,
+                review_comments=comments3,
+                phase="awaiting-qa-2")
+    post_card(
+        "info", f"Re-review posted — {comments3} comments",
+        ticket=ticket, url=sess.get("pr_url") or None,
+        ctx=f"Verdict: {verdict3} (after work-3)",
+    )
+    if verdict3 == "changes-requested":
+        fail(f"re-review still found {comments3} issues after work-3 — "
+             f"flow halts. Operator: inspect PR #{pr_num}.")
+
     post_card(
         "action", f"Re-QA on {ticket}",
         ticket=ticket, url=preview_url or sess.get("pr_url") or None,
-        ctx=f"PR #{pr_num} · re-review after feedback",
+        ctx=f"PR #{pr_num} · re-review after feedback (verdict: {verdict3})",
         actions=qa_card_actions(ticket, sess.get("pr_url", ""), preview_url),
     )
     check("re-QA card posted")
