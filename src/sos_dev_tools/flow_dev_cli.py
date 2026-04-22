@@ -2219,6 +2219,29 @@ def _kill_process_on_port(port, timeout=5):
     return True
 
 
+def _kill_wellknown_dev_ports(command):
+    """Kill processes on ports that dev-server CLIs commonly hardcode,
+    when the service command suggests that CLI is in play.
+
+    Many npm scripts look like `storybook dev -p 6006` where the port
+    is baked in and $PORT env is ignored. If an orphan of a prior launch
+    is bound to that default port, the new launch asks interactively
+    "Port X is not available, use Y instead?" — which hangs in a
+    detached tmux (no stdin). Sweep the default ports of known offenders.
+    """
+    cmd_lower = (command or "").lower()
+    # Well-known default ports by CLI keyword
+    kill_ports = set()
+    if "storybook" in cmd_lower:
+        kill_ports.add(6006)
+    if "next " in cmd_lower or "next-dev" in cmd_lower or "next dev" in cmd_lower:
+        kill_ports.add(3000)
+    if "vite" in cmd_lower:
+        kill_ports.add(5173)
+    for p in kill_ports:
+        _kill_process_on_port(p)
+
+
 def _start_preview_for(ticket, services, wait=True, force=False):
     """Start one or more preview services for a ticket.
 
@@ -2276,6 +2299,13 @@ def _start_preview_for(ticket, services, wait=True, force=False):
                         _kill_process_on_port(stale_port)
                     except (ValueError, IndexError):
                         pass
+                # Service-specific well-known-port cleanup. Many dev-server
+                # npm scripts hardcode a default port (storybook dev -p 6006,
+                # next dev -p 3000, etc.) that ignores the PORT env var we
+                # set. On --force, sweep those too so an orphan from a prior
+                # launch doesn't block the new one with an interactive
+                # "port in use" prompt that hangs the detached tmux.
+                _kill_wellknown_dev_ports(command)
                 preview_urls.pop(name, None)
                 preview_sessions.pop(name, None)
             else:
