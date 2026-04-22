@@ -1610,5 +1610,106 @@ class TestInboxPost(unittest.TestCase):
         self.assertIsNone(resp)
 
 
+class TestDeliverableSynthesis(SessionBase):
+    """When a subagent commits real work but exits without writing its
+    deliverable file, _run_subagent_with_watcher should synthesize the
+    deliverable from git state rather than flag the phase as failed."""
+
+    def setUp(self):
+        super().setUp()
+        self.wt = Path(self._tmp) / "wt"
+        (self.wt / ".pm").mkdir(parents=True)
+        self.deliverable = self.wt / ".pm" / "work-3-result.json"
+
+    def _patch_subagent(self, rc=0):
+        """Stub out everything except the synthesis logic."""
+        return patch.multiple(
+            fd,
+            run_subagent=MagicMock(return_value=rc),
+            spawn_watcher=MagicMock(return_value=MagicMock()),
+            stop_watcher=MagicMock(),
+        )
+
+    def _stub_head(self, before, after):
+        """HEAD returns `before` on first call, `after` on second."""
+        def fake(cmd, **kw):
+            if "rev-parse" in cmd:
+                return MagicMock(stdout=(before if fake.calls == 0 else after) + "\n",
+                                 returncode=0)
+            return MagicMock(stdout="", returncode=0)
+        fake.calls = 0
+        def wrapped(cmd, **kw):
+            v = fake(cmd, **kw)
+            fake.calls += 1
+            return v
+        return wrapped
+
+    def test_explicit_deliverable_trusted_no_synthesis(self):
+        """If the agent wrote the file, use it verbatim — never call synth."""
+        self.deliverable.write_text('{"ready": true, "url": "http://x"}')
+        synth = MagicMock(return_value={"ready": True, "url": "synth"})
+        with self._patch_subagent(rc=0):
+            rc, missing = fd._run_subagent_with_watcher(
+                "FOO-1", "work-3", "sess", "prompt",
+                self.deliverable, synthesize_fn=synth)
+        self.assertEqual(rc, 0)
+        self.assertFalse(missing)
+        synth.assert_not_called()
+        self.assertNotIn("_synthesized", json.loads(self.deliverable.read_text()))
+
+    def test_synthesis_kicks_in_when_commits_landed(self):
+        """Missing file + HEAD moved → synthesize + write, treat as success."""
+        synth = lambda: {"ready": True, "url": "http://preview:6008"}
+        with self._patch_subagent(rc=0), \
+             patch.object(fd.subprocess, "run",
+                          side_effect=self._stub_head("a" * 40, "b" * 40)):
+            rc, missing = fd._run_subagent_with_watcher(
+                "FOO-1", "work-3", "sess", "prompt",
+                self.deliverable, synthesize_fn=synth)
+        self.assertEqual(rc, 0)
+        self.assertFalse(missing)
+        # Written synthesized result carries provenance fields
+        data = json.loads(self.deliverable.read_text())
+        self.assertTrue(data.get("_synthesized"))
+        self.assertEqual(data["_commits_since"], "a" * 7)
+        self.assertEqual(data["url"], "http://preview:6008")
+
+    def test_no_synthesis_when_head_unchanged(self):
+        """Missing file + HEAD didn't move → real failure."""
+        synth = MagicMock(return_value={"ready": True})
+        same = "c" * 40
+        with self._patch_subagent(rc=0), \
+             patch.object(fd.subprocess, "run",
+                          side_effect=self._stub_head(same, same)):
+            rc, missing = fd._run_subagent_with_watcher(
+                "FOO-1", "work-3", "sess", "prompt",
+                self.deliverable, synthesize_fn=synth)
+        self.assertTrue(missing)
+        self.assertFalse(self.deliverable.exists())
+        synth.assert_not_called()
+
+    def test_rc_nonzero_skips_synthesis(self):
+        """Subagent exited non-zero → real failure, even if HEAD moved."""
+        synth = MagicMock()
+        with self._patch_subagent(rc=1), \
+             patch.object(fd.subprocess, "run",
+                          side_effect=self._stub_head("a" * 40, "b" * 40)):
+            rc, missing = fd._run_subagent_with_watcher(
+                "FOO-1", "work-3", "sess", "prompt",
+                self.deliverable, synthesize_fn=synth)
+        self.assertEqual(rc, 1)
+        synth.assert_not_called()
+
+    def test_synthesize_fn_none_requires_explicit_deliverable(self):
+        """Phases without a synthesizer (e.g. review) still require the file."""
+        with self._patch_subagent(rc=0), \
+             patch.object(fd.subprocess, "run",
+                          side_effect=self._stub_head("a" * 40, "b" * 40)):
+            rc, missing = fd._run_subagent_with_watcher(
+                "FOO-1", "review", "sess", "prompt",
+                self.deliverable, synthesize_fn=None)
+        self.assertTrue(missing)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -491,23 +491,85 @@ Repeat the poll call until the session is gone, THEN proceed to step 6.
 """
 
 
+def _synthesize_pm_complete(ticket, worktree, head_before):
+    """Build /tmp/pm-complete-TICKET.json from observable state when the
+    pm-start subagent committed work but forgot to write it.
+
+    Reads:
+      - branch from the worktree
+      - PR url from `gh pr list --head <branch>` (if a PR was opened)
+      - preview_url from session state (if pm-start's preview step ran)
+    """
+    try:
+        branch = run_capture(
+            ["git", "-C", str(worktree), "branch", "--show-current"],
+        ).strip()
+    except subprocess.CalledProcessError:
+        branch = ""
+    pr_url = ""
+    if branch and shutil.which("gh"):
+        try:
+            out = run_capture(
+                ["gh", "pr", "list", "--head", branch,
+                 "--json", "url", "--jq", ".[0].url // \"\""],
+            ).strip()
+            pr_url = out or ""
+        except subprocess.CalledProcessError:
+            pass
+    sess = session_get(ticket) or {}
+    return {
+        "ticket": ticket,
+        "worktree": worktree.name,
+        "branch": branch,
+        "pr_url": pr_url or None,
+        "preview_url": sess.get("preview_url") or None,
+        "smoke_test": "see PR description",
+        "open_questions": [],
+        "completed_at": now_iso(),
+        "_synthesized": True,
+        "_commits_since": (head_before or "")[:7],
+    }
+
+
 def phase_pm_start(ticket, iteration="first-pass"):
     step(f"Phase 1/5 — pm-start {ticket} {iteration}")
     if not PM_START_SKILL.exists():
         fail(f"pm-start skill not found at {PM_START_SKILL}")
     prefix = _FLOW_DEV_PREFIX_TEMPLATE.format(ticket=ticket)
     body = prefix + PM_START_SKILL.read_text() + f"\n\n{ticket} {iteration}\n"
+    wt = Path(session_get(ticket, "worktree") or "")
+    head_before = _capture_head(wt) if wt.is_dir() else None
     watcher = spawn_watcher(ticket, "work-1")
     error = False
     completion_missing = False
     rc = None
+    marker = Path(f"/tmp/pm-complete-{ticket}.json")
     try:
         rc = run_subagent(f"flow-{ticket}-work1", body)
         if rc != 0:
             error = True
-        # Check completion marker while watcher still alive so status flips
-        # to "error" on the card rather than lingering as "working → done".
-        elif not Path(f"/tmp/pm-complete-{ticket}.json").exists():
+        elif marker.exists():
+            pass  # explicit marker — trust it
+        elif wt.is_dir() and head_before:
+            head_after = _capture_head(wt)
+            if head_after and head_after != head_before:
+                synth = _synthesize_pm_complete(ticket, wt, head_before)
+                try:
+                    marker.write_text(json.dumps(synth, indent=2))
+                    print(f"  ↳ synthesized /tmp/pm-complete-{ticket}.json "
+                          f"from git state ({head_after[:7]} vs "
+                          f"{head_before[:7]}) — pm-start committed but "
+                          f"skipped the completion file",
+                          flush=True)
+                except OSError as e:
+                    print(f"  ↳ synthesis write failed: {e}",
+                          file=sys.stderr, flush=True)
+                    error = True
+                    completion_missing = True
+            else:
+                error = True
+                completion_missing = True
+        else:
             error = True
             completion_missing = True
     finally:
@@ -516,16 +578,41 @@ def phase_pm_start(ticket, iteration="first-pass"):
         fail(f"pm-start subagent exited {rc}")
     if completion_missing:
         fail(f"missing /tmp/pm-complete-{ticket}.json — pm-start exited "
-             f"without writing the completion marker (check tmux pm-{ticket} "
-             f"to see if the dev agent is still running)")
+             f"without writing the completion marker and no commits landed "
+             f"(check tmux pm-{ticket} to see if the dev agent is still running)")
     return read_pm_complete(ticket)
 
 
+def _capture_head(worktree):
+    """Return `git rev-parse HEAD` or None if not resolvable."""
+    try:
+        return run_capture(
+            ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        ).strip() or None
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
 def _run_subagent_with_watcher(ticket, phase_label, session, prompt,
-                               deliverable_path):
+                               deliverable_path, synthesize_fn=None):
     """Run a subagent with an activity watcher, flipping the card to 'error'
-    if either the subagent exits non-zero OR the expected deliverable file
-    is missing when the subagent returns."""
+    only when there's no evidence the work happened.
+
+    Evidence of success, in priority order:
+      1. deliverable file exists → trust it
+      2. synthesize_fn is provided AND HEAD moved on the branch during the
+         phase → call synthesize_fn(), write its result to deliverable_path,
+         treat as success. Agents frequently commit real work and forget
+         the deliverable-file ritual; git state is the authoritative signal.
+      3. otherwise → error (no deliverable, no commits, nothing happened)
+
+    Synthesized results carry `_synthesized: true` and `_commits_since:
+    <sha>` so downstream and post-mortem can tell real deliverables from
+    inferred ones.
+    """
+    wt_root = Path(deliverable_path).parent.parent if deliverable_path else None
+    head_before = _capture_head(wt_root) if wt_root else None
+
     watcher = spawn_watcher(ticket, phase_label)
     error = False
     rc = None
@@ -534,7 +621,31 @@ def _run_subagent_with_watcher(ticket, phase_label, session, prompt,
         rc = run_subagent(session, prompt)
         if rc != 0:
             error = True
-        elif deliverable_path is not None and not Path(deliverable_path).exists():
+        elif deliverable_path is None or Path(deliverable_path).exists():
+            pass  # explicit deliverable — trust it
+        elif synthesize_fn is not None and head_before and wt_root:
+            head_after = _capture_head(wt_root)
+            if head_after and head_after != head_before:
+                synth = synthesize_fn() or {}
+                synth["_synthesized"] = True
+                synth["_commits_since"] = head_before[:7]
+                try:
+                    Path(deliverable_path).write_text(
+                        json.dumps(synth, indent=2))
+                    print(f"  ↳ synthesized {Path(deliverable_path).name} "
+                          f"from git state ({head_after[:7]} vs "
+                          f"{head_before[:7]}) — agent committed but "
+                          f"skipped the deliverable file",
+                          flush=True)
+                except OSError as e:
+                    print(f"  ↳ synthesis write failed: {e}",
+                          file=sys.stderr, flush=True)
+                    error = True
+                    missing = True
+            else:
+                error = True
+                missing = True
+        else:
             error = True
             missing = True
     finally:
@@ -556,17 +667,27 @@ def phase_review(ticket, pr_num):
     return json.loads(rf.read_text())
 
 
+def _synthesize_work_result(ticket):
+    """Synthesize work-2 / work-3 result from session state when the agent
+    committed but forgot to write the deliverable file."""
+    return {
+        "ready": True,
+        "url": session_get(ticket, "preview_url") or "",
+    }
+
+
 def phase_work2(ticket, pr_num, comments_n):
     step(f"Phase 3/5 — address {comments_n} review comments")
     rf = worktree_root() / ".pm" / "work-2-result.json"
     rc, missing = _run_subagent_with_watcher(
         ticket, "work-2", f"flow-{ticket}-work2",
         work2_prompt(ticket, pr_num, comments_n), rf,
+        synthesize_fn=lambda: _synthesize_work_result(ticket),
     )
     if rc != 0:
         fail(f"work-2 subagent exited {rc}")
     if missing:
-        fail(f"work-2 subagent did not write {rf}")
+        fail(f"work-2 subagent did not write {rf} and no commits landed")
     return json.loads(rf.read_text())
 
 
@@ -576,11 +697,12 @@ def phase_work3(ticket, pr_num, reason):
     rc, missing = _run_subagent_with_watcher(
         ticket, "work-3", f"flow-{ticket}-work3",
         work3_prompt(ticket, pr_num, reason), rf,
+        synthesize_fn=lambda: _synthesize_work_result(ticket),
     )
     if rc != 0:
         fail(f"work-3 subagent exited {rc}")
     if missing:
-        fail(f"work-3 subagent did not write {rf}")
+        fail(f"work-3 subagent did not write {rf} and no commits landed")
     return json.loads(rf.read_text())
 
 
