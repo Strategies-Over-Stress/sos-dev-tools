@@ -3193,6 +3193,159 @@ def _remove_worktree(wt):
         print(f"  git worktree remove warning: {r.stderr.strip()}", file=sys.stderr)
 
 
+def _list_ticket_tmux_sessions(ticket, include_preview=False):
+    """Enumerate every tmux session name that belongs to this ticket.
+
+    Matches the naming conventions established across flow-dev:
+      flow-runner-<T>                   orchestrator (detached runner)
+      flow-<T>-{alloc,work1,work2,work3,review,review-2}
+                                        phase subagents
+      pm-<T>                            dev-agent spawned by pm-start
+      verify-<T>-<phase>                verifier subagents
+      preview-<T>-<service>             preview dev-servers (opt-in)
+
+    Returns a list of session names currently live for this ticket.
+    """
+    if shutil.which("tmux") is None:
+        return []
+    try:
+        out = subprocess.run(
+            ["tmux", "ls", "-F", "#{session_name}"],
+            capture_output=True, text=True, check=False,
+        ).stdout
+    except subprocess.SubprocessError:
+        return []
+    names = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    match = []
+    suffix = ticket
+    for n in names:
+        if n == f"flow-runner-{suffix}":
+            match.append(n)
+        elif n == f"pm-{suffix}":
+            match.append(n)
+        elif n.startswith(f"flow-{suffix}-"):
+            match.append(n)
+        elif n.startswith(f"verify-{suffix}-"):
+            match.append(n)
+        elif include_preview and n.startswith(f"preview-{suffix}-"):
+            match.append(n)
+    return match
+
+
+def _stop_ticket(ticket, include_preview=False, include_worktree=False):
+    """Stop every running process belonging to this ticket.
+
+    Order matters:
+      1. Kill the orchestrator + phase tmux sessions first (they spawn
+         the others, so killing them prevents new children).
+      2. pkill the activity watcher subprocess (lives OUTSIDE tmux, spawned
+         by spawn_watcher as a detached Popen).
+      3. Optionally kill preview tmux sessions.
+      4. Optionally remove the worktree via cmd_cleanup.
+
+    Returns a dict {sessions_killed, watcher_killed, preview_killed,
+    worktree_removed, errors} for operator visibility.
+    """
+    result = {"sessions_killed": [], "watcher_killed": False,
+              "preview_killed": [], "worktree_removed": False, "errors": []}
+    # Phase tmux + orchestrator
+    sessions = _list_ticket_tmux_sessions(ticket, include_preview=False)
+    for name in sessions:
+        r = subprocess.run(["tmux", "kill-session", "-t", name],
+                           capture_output=True, text=True, check=False)
+        if r.returncode == 0:
+            result["sessions_killed"].append(name)
+        else:
+            result["errors"].append(f"tmux kill {name}: {r.stderr.strip()}")
+
+    # Activity watcher (Popen subprocess, not in tmux)
+    r = subprocess.run(["pkill", "-f", f"sos-flow-dev activity {ticket}"],
+                       capture_output=True, text=True, check=False)
+    # pkill rc 0 = one or more processes matched and killed; rc 1 = no match
+    if r.returncode == 0:
+        result["watcher_killed"] = True
+    elif r.returncode not in (0, 1):
+        result["errors"].append(f"pkill watcher: rc={r.returncode}")
+
+    if include_preview:
+        preview_sessions = [n for n in _list_ticket_tmux_sessions(
+            ticket, include_preview=True) if n.startswith(f"preview-{ticket}-")]
+        for name in preview_sessions:
+            r = subprocess.run(["tmux", "kill-session", "-t", name],
+                               capture_output=True, text=True, check=False)
+            if r.returncode == 0:
+                result["preview_killed"].append(name)
+
+    if include_worktree:
+        try:
+            cmd_cleanup(argparse.Namespace(ticket=ticket, remove=True))
+            result["worktree_removed"] = True
+        except SystemExit:
+            result["errors"].append("worktree removal failed")
+        except Exception as e:
+            result["errors"].append(f"worktree removal: {e}")
+
+    # Record the stop in session state so the UI can see it
+    sess = session_get(ticket)
+    if sess:
+        session_set(ticket, phase="stopped", stopped_at=now_iso())
+
+    return result
+
+
+def cmd_stop(args):
+    if args.all:
+        d = STATE_DIR / "sessions"
+        tickets = []
+        if d.is_dir():
+            for p in sorted(d.glob("*.json")):
+                try:
+                    data = json.loads(p.read_text())
+                except (json.JSONDecodeError, OSError):
+                    continue
+                phase = data.get("phase") or ""
+                if phase not in ("merged", "stopped", ""):
+                    tickets.append(data.get("ticket") or p.stem)
+        if not tickets:
+            print("(no running tickets to stop)")
+            return
+        print(f"stopping {len(tickets)} ticket(s): {', '.join(tickets)}")
+    else:
+        if not args.tickets:
+            fail("pass one or more TICKET ids, or --all to stop every active ticket")
+        tickets = list(args.tickets)
+
+    any_errors = False
+    for t in tickets:
+        step(f"stopping {t}")
+        r = _stop_ticket(t, include_preview=args.include_preview,
+                         include_worktree=args.include_worktree)
+        if r["sessions_killed"]:
+            check(f"{t}: killed {len(r['sessions_killed'])} tmux session(s) "
+                  f"({', '.join(r['sessions_killed'])})")
+        else:
+            print(f"  {t}: no tmux sessions matched", flush=True)
+        if r["watcher_killed"]:
+            check(f"{t}: killed activity watcher")
+        if r["preview_killed"]:
+            check(f"{t}: killed {len(r['preview_killed'])} preview session(s)")
+        if r["worktree_removed"]:
+            check(f"{t}: worktree removed")
+        for e in r["errors"]:
+            print(f"  ✗ {t}: {e}", file=sys.stderr, flush=True)
+            any_errors = True
+        # Inbox card so the operator sees it in the sidebar
+        post_card("info", f"⏹ {t} stopped", ticket=t,
+                  ctx=(f"Killed {len(r['sessions_killed'])} tmux session(s)"
+                       + (", watcher" if r["watcher_killed"] else "")
+                       + (f", {len(r['preview_killed'])} preview(s)"
+                          if r["preview_killed"] else "")
+                       + (", worktree removed"
+                          if r["worktree_removed"] else "")))
+    if any_errors:
+        sys.exit(1)
+
+
 def cmd_cleanup(args):
     ticket = args.ticket
     sess = session_get(ticket) or {}
@@ -3384,6 +3537,27 @@ def main():
                    help="Pretty-print JSON output (default: compact)")
 
     p = sub.add_parser(
+        "stop",
+        help="Kill every running process for a ticket (flow-runner + phase "
+             "subagents + activity watcher). Optionally kill previews + "
+             "remove the worktree.",
+    )
+    p.add_argument("tickets", nargs="*",
+                   help="Ticket(s) to stop. If empty, requires --all.")
+    p.add_argument("--all", action="store_true",
+                   help="Stop every ticket whose session state shows a "
+                        "non-terminal phase. Equivalent to passing every "
+                        "active ticket individually.")
+    p.add_argument("--include-preview", action="store_true",
+                   help="Also kill this ticket's preview-<T>-<svc> tmux "
+                        "sessions. Off by default — preview is often "
+                        "still useful after stopping a flow.")
+    p.add_argument("--include-worktree", action="store_true",
+                   help="Also remove the ticket's worktree (git worktree "
+                        "remove --force). Off by default — uncommitted "
+                        "work in the tree would be lost.")
+
+    p = sub.add_parser(
         "cleanup",
         help="Reset the ticket's worktree for reuse (default) or remove it outright",
     )
@@ -3424,6 +3598,7 @@ def main():
         "resync": cmd_resync,
         "config": cmd_config,
         "cleanup": cmd_cleanup,
+        "stop": cmd_stop,
     }[args.subcommand](args)
 
 
