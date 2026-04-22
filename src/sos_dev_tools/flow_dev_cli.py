@@ -312,7 +312,21 @@ of forking from the wrong branch: hours of rework downstream.
 """
 
 
-def review_prompt(ticket, pr_num):
+REVIEW_SENTINEL = "<!-- sos-flow-review -->"
+
+
+def review_prompt(ticket, pr_num, prior_feedback=None):
+    retry_block = ""
+    if prior_feedback:
+        items = "\n".join(f"  - {f}" for f in prior_feedback)
+        retry_block = f"""
+## Retry — address these specific gaps from the previous verifier
+
+{items}
+
+Focus this attempt on closing these gaps. Do NOT re-do work you
+previously did correctly.
+"""
     return f"""You are a senior code reviewer. Review PR #{pr_num} in this repo.
 
 Ticket context: read `.pm/active-ticket.json` for summary + acceptance criteria.
@@ -330,10 +344,26 @@ Ticket context: read `.pm/active-ticket.json` for summary + acceptance criteria.
    - Dead code, leftover debug prints, stray TODOs
 4. For each concrete issue, post an inline review comment:
       gh pr review {pr_num} --comment -F <feedback-file>
-5. When done, write `.pm/review-result.json` in the worktree root:
-      {{"comments": N, "verdict": "changes-requested" | "approve"}}
-   Do NOT print the JSON to stdout — the orchestrator reads the file.
+5. **Submit the review** with `gh pr review {pr_num} --request-changes -b "<body>"`
+   (or `--approve` if no issues found). The review body MUST contain this
+   exact sentinel on its own line so the verifier can distinguish agent
+   reviews from human reviews on the same PR:
 
+       {REVIEW_SENTINEL}
+
+   A typical body:
+
+       ## Review summary
+
+       Found 6 issues: 1 logic bug, 2 perf risks, 3 nits.
+
+       {REVIEW_SENTINEL}
+
+**Do NOT write `.pm/review-result.json`.** A separate verifier agent reads
+the PR's review state and comment count and writes the canonical
+deliverable. Your job is to identify issues + post comments + submit the
+review; the verifier's job is to judge whether the review happened.
+{retry_block}
 {_blocker_for(ticket)}
 """
 
@@ -503,6 +533,32 @@ PHASE_SPECS = {
             "url": "string — preview URL or empty",
         },
     },
+    "review": {
+        "description": (
+            "review reads the PR diff, identifies issues (logic bugs, "
+            "security, test gaps, AC deviations), posts line-level "
+            "comments, and submits a review with a verdict."
+        ),
+        "success_criteria": [
+            "At least one review has been submitted by the agent on the "
+            "PR (state in APPROVED, CHANGES_REQUESTED, or COMMENTED — "
+            "NOT PENDING or DISMISSED)",
+            f"The agent's review body contains the sentinel string "
+            f"`{REVIEW_SENTINEL}` so it's distinguishable from human "
+            f"reviews on the same PR",
+            "If the review state is COMMENTED or CHANGES_REQUESTED, at "
+            "least one inline comment must exist (a review that requests "
+            "changes but posts zero specifics is useless)",
+        ],
+        "deliverable_path": "{worktree}/.pm/review-result.json",
+        "deliverable_schema": {
+            "comments": "int — count of inline review comments authored "
+                        "in the sentinel-tagged review",
+            "verdict": "string — 'approve' if GitHub review state is "
+                       "APPROVED, else 'changes-requested' (CHANGES_REQUESTED "
+                       "or COMMENTED both map to changes-requested)",
+        },
+    },
 }
 
 
@@ -528,6 +584,27 @@ def verifier_prompt(ticket, phase, worktree, attempt, prior_feedback):
             f"Focus on whether the specific gaps above are closed. "
             f"Do NOT invent new criteria — only judge against the success "
             f"criteria below.\n"
+        )
+
+    review_sentinel_note = ""
+    if phase == "review":
+        review_sentinel_note = (
+            f"\n## Identifying agent-authored reviews\n\n"
+            f"The PR may have reviews from multiple sources (this agent, "
+            f"humans, other bots). ONLY count reviews whose body contains "
+            f"the literal sentinel `{REVIEW_SENTINEL}`. All other reviews "
+            f"are someone else's work and must not satisfy the success "
+            f"criteria.\n\n"
+            f"Verdict inference from GitHub review state (for the sentinel-"
+            f"tagged review):\n"
+            f"  - state = `APPROVED` → deliverable.verdict = 'approve'\n"
+            f"  - state = `CHANGES_REQUESTED` → 'changes-requested'\n"
+            f"  - state = `COMMENTED` (with inline comments) → 'changes-requested'\n"
+            f"  - state = `COMMENTED` (zero comments) → verdict is 'approve' "
+            f"BUT this is suspicious — a review with no comments and no "
+            f"explicit approval usually means the agent skipped the actual "
+            f"review. Mark incomplete.\n"
+            f"  - state = `PENDING` → review was never submitted; incomplete.\n"
         )
 
     schema_lines = "\n".join(
@@ -566,7 +643,7 @@ or any other production work.
   contains the worker's self-summary — read it but do not trust it
   without cross-referencing git/PR state)
 - Existing deliverable file (if worker did write one): {deliverable_path}
-{feedback_block}
+{review_sentinel_note}{feedback_block}
 ## Your verdict
 
 Write JSON to `{verdict_path}` with this exact schema:
@@ -907,16 +984,21 @@ def _run_subagent_with_watcher(ticket, phase_label, session, prompt,
 
 def phase_review(ticket, pr_num):
     step(f"Phase 2/5 — review PR #{pr_num}")
-    rf = worktree_root() / ".pm" / "review-result.json"
-    rc, missing = _run_subagent_with_watcher(
-        ticket, "review", f"flow-{ticket}-review",
-        review_prompt(ticket, pr_num), rf,
-    )
-    if rc != 0:
-        fail(f"review subagent exited {rc}")
-    if missing:
-        fail(f"review subagent did not write {rf} — check `tmux attach -t flow-{ticket}-review` for last state")
-    return json.loads(rf.read_text())
+    wt = worktree_root()
+
+    def worker(feedback=None, attempt=0):
+        watcher = spawn_watcher(ticket, "review")
+        rc = 1
+        try:
+            rc = run_subagent(
+                f"flow-{ticket}-review",
+                review_prompt(ticket, pr_num, prior_feedback=feedback),
+            )
+        finally:
+            stop_watcher(watcher, error=(rc != 0))
+        return rc
+
+    return _run_phase_with_verifier(ticket, "review", worker, wt)
 
 
 def phase_work2(ticket, pr_num, comments_n):

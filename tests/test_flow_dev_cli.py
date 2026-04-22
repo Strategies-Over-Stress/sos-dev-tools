@@ -1759,6 +1759,51 @@ class TestVerifierPromptShape(SessionBase):
                                Path("/tmp/wt"), attempt=0, prior_feedback=None)
         self.assertIn("You do NOT produce", p)
 
+    def test_review_phase_prompt_includes_sentinel_guidance(self):
+        """Review verifier must know about the agent sentinel so it
+        distinguishes agent-authored reviews from human reviews on the
+        same PR."""
+        p = fd.verifier_prompt("FOO-1", "review",
+                               Path("/tmp/wt"), attempt=0, prior_feedback=None)
+        self.assertIn(fd.REVIEW_SENTINEL, p)
+        self.assertIn("humans", p)  # acknowledges multi-source reviews
+        # Verdict inference rules present
+        self.assertIn("APPROVED", p)
+        self.assertIn("CHANGES_REQUESTED", p)
+        self.assertIn("COMMENTED", p)
+        self.assertIn("PENDING", p)
+
+    def test_non_review_phase_has_no_sentinel_block(self):
+        """Only the review-phase prompt gets the sentinel / review-state
+        inference block — other phases don't need it."""
+        for phase in ("pm-start", "work-2", "work-3"):
+            p = fd.verifier_prompt("FOO-1", phase,
+                                   Path("/tmp/wt"),
+                                   attempt=0, prior_feedback=None)
+            self.assertNotIn("Identifying agent-authored reviews", p,
+                             f"phase={phase} should not have the "
+                             f"review sentinel block")
+
+
+class TestReviewPromptSentinel(unittest.TestCase):
+    """The worker's review prompt must instruct the agent to include the
+    sentinel in the review body (so the verifier can identify it later)."""
+
+    def test_review_prompt_includes_sentinel(self):
+        p = fd.review_prompt("FOO-1", 42)
+        self.assertIn(fd.REVIEW_SENTINEL, p)
+        # Must explicitly say "do NOT write .pm/review-result.json"
+        self.assertIn("Do NOT write", p)
+        self.assertIn("review-result.json", p)
+        # Must tell the agent to SUBMIT the review (not just post comments)
+        self.assertIn("Submit the review", p)
+
+    def test_review_prompt_retry_feedback_included(self):
+        p = fd.review_prompt("FOO-1", 42,
+                             prior_feedback=["no sentinel in review body"])
+        self.assertIn("Retry", p)
+        self.assertIn("no sentinel in review body", p)
+
 
 class TestDeliverableSynthesis(SessionBase):
     """When a subagent commits real work but exits without writing its
