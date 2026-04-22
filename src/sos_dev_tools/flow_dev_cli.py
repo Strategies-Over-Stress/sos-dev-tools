@@ -338,7 +338,21 @@ Ticket context: read `.pm/active-ticket.json` for summary + acceptance criteria.
 """
 
 
-def work2_prompt(ticket, pr_num, comments_n):
+def work2_prompt(ticket, pr_num, comments_n, prior_feedback=None):
+    feedback_block = ""
+    if prior_feedback:
+        items = "\n".join(f"  - {f}" for f in prior_feedback)
+        feedback_block = f"""
+## Retry — address these specific gaps from the previous verifier
+
+A previous attempt at this phase was marked INCOMPLETE for these reasons:
+
+{items}
+
+Focus this attempt on closing these specific gaps. Do NOT re-do work that
+the previous attempt already completed.
+"""
+
     return f"""You are the implementation agent. PR #{pr_num} has {comments_n} review comments to address.
 
 ## Your task
@@ -350,25 +364,35 @@ def work2_prompt(ticket, pr_num, comments_n):
    the ticket (e.g. `{ticket}: address review feedback on <topic>`).
 3. Push after each logical group of commits.
 4. Resolve review threads where your fix addresses them.
-5. If a preview dev server is configured (see `.pm/config.json` preview.port), use
-   it to verify in-flight. If none is configured but one is useful, start one —
-   e.g. `cd packages/ui && PORT=<port> npm run storybook &` — and record the URL
-   in the result file below.
-6. When done, write `.pm/work-2-result.json` in the worktree root:
-      {{"ready": true, "url": "<preview_url or empty string>"}}
-   or on failure:
-      {{"failed": "<reason>"}}
+5. If a preview dev server is configured (see `.pm/config.json` preview), use
+   it to verify in-flight.
+{feedback_block}
+**Do NOT write `.pm/work-2-result.json`.** A separate verifier agent reads
+git state + PR state + your tmux log and writes the canonical deliverable.
+Your job is to do the work; the verifier's job is to judge completion.
 
 {_blocker_for(ticket)}
 """
 
 
-def work3_prompt(ticket, pr_num, reason):
+def work3_prompt(ticket, pr_num, reason, prior_feedback=None):
     feedback = reason.strip() if reason else (
         "(no reason string supplied; read the reply thread on the most recent "
         "'Ready for QA' card — use `sos-inbox list --ticket " + ticket + "` "
         "to find its id and `sos-inbox replies <id>`)"
     )
+    retry_block = ""
+    if prior_feedback:
+        items = "\n".join(f"  - {f}" for f in prior_feedback)
+        retry_block = f"""
+## Retry — address these specific gaps from the previous verifier
+
+A previous attempt at this phase was marked INCOMPLETE:
+
+{items}
+
+Focus this attempt on closing these specific gaps.
+"""
     return f"""QA rejected PR #{pr_num} for {ticket}. Feedback from the reviewer:
 
     {feedback}
@@ -378,13 +402,299 @@ def work3_prompt(ticket, pr_num, reason):
 1. Understand the feedback. If vague, consult the reply thread via sos-inbox.
 2. Address the feedback in the worktree. Commit and push.
 3. Keep the preview server running.
-4. When done, write `.pm/work-3-result.json`:
-      {{"ready": true, "url": "<preview_url>"}}
-   or on failure:
-      {{"failed": "<reason>"}}
+{retry_block}
+**Do NOT write `.pm/work-3-result.json`.** A separate verifier agent reads
+git state + PR state + your tmux log and writes the canonical deliverable.
+Your job is to do the work; the verifier's job is to judge completion.
 
 {_blocker_for(ticket)}
 """
+
+
+# ─── Verifier (phase-completion judge) ─────────────────────────────────────
+#
+# Workers are unreliable at self-reporting completion — they skip writing
+# deliverable files, claim partial work is complete, or just exit early.
+# That's not a bug in any specific worker; it's a structural problem with
+# letting the same agent that did the work judge whether the work is done.
+#
+# Every phase (pm-start, work-2, work-3) runs the worker, then a separate
+# verifier subagent. The verifier's single job: read the phase spec, read
+# observable state (git, PR, tmux log), and write a verdict JSON. If the
+# verifier says "incomplete", flow-dev re-invokes the worker with the
+# verifier's specific feedback, up to max_retries times.
+#
+# Design invariants:
+#   - Verifier writes NO code, NO commits, NO PR comments. It only reads + judges.
+#   - Deliverable files are authored by the verifier, never by the worker.
+#   - Verifier verdict JSON has a strict schema — parsing failures = treat as
+#     "failed" phase so the operator sees it.
+#   - Max 2 retries (3 total worker attempts). After exhaustion, fail the phase
+#     and surface the accumulated feedback to the operator.
+
+VERIFIER_MAX_RETRIES = 2
+
+
+PHASE_SPECS = {
+    "pm-start": {
+        "description": (
+            "pm-start initializes a Jira ticket's implementation: fetches "
+            "the ticket, creates a feature branch, launches a dev agent "
+            "that implements the work and commits, opens a PR, optionally "
+            "starts a preview server."
+        ),
+        "success_criteria": [
+            "A feature branch exists matching `feature/<TICKET>-<iteration>` "
+            "(or the repo's configured branch_prefix)",
+            "The feature branch has at least one commit authored by the "
+            "dev agent beyond the parent branch",
+            "An open PR exists targeting the parent branch (verify via "
+            "`gh pr list --head <branch>`)",
+            "The PR body includes the ticket ID and a reference to the "
+            "acceptance criteria",
+        ],
+        "deliverable_path": "/tmp/pm-complete-{ticket}.json",
+        "deliverable_schema": {
+            "ticket": "string — the ticket ID",
+            "worktree": "string — basename of the worktree dir",
+            "branch": "string — the feature branch name",
+            "pr_url": "string or null — full GitHub PR URL",
+            "preview_url": "string or null — from session state if preview ran",
+            "smoke_test": "string — one-line smoke-test instruction from PR or .pm/summary.md",
+            "open_questions": "list — from .pm/work-summary.md if present",
+            "completed_at": "ISO 8601 timestamp (now)",
+        },
+    },
+    "work-2": {
+        "description": (
+            "work-2 addresses review comments on the open PR. The dev "
+            "agent reads every comment, fixes the underlying issues, "
+            "commits each fix, pushes."
+        ),
+        "success_criteria": [
+            "Every review comment on the PR has been addressed by code "
+            "change OR explicitly replied to in a thread with rationale",
+            "At least one new commit exists on the branch beyond the "
+            "pre-work-2 HEAD",
+            "The branch has been pushed (remote HEAD matches local HEAD "
+            "for the feature branch)",
+        ],
+        "deliverable_path": "{worktree}/.pm/work-2-result.json",
+        "deliverable_schema": {
+            "ready": "bool — true if all comments addressed",
+            "url": "string — preview URL or empty",
+        },
+    },
+    "work-3": {
+        "description": (
+            "work-3 addresses operator rejection feedback (from a "
+            "qa-reject action on an already-reviewed PR)."
+        ),
+        "success_criteria": [
+            "The operator's rejection feedback (free-form text or inbox "
+            "reply) has been addressed in the code",
+            "At least one new commit exists on the branch beyond the "
+            "pre-work-3 HEAD",
+            "The branch has been pushed",
+        ],
+        "deliverable_path": "{worktree}/.pm/work-3-result.json",
+        "deliverable_schema": {
+            "ready": "bool",
+            "url": "string — preview URL or empty",
+        },
+    },
+}
+
+
+def verifier_prompt(ticket, phase, worktree, attempt, prior_feedback):
+    """Build the verifier prompt. Verifier is a read-only agent whose
+    output is a single JSON verdict file."""
+    spec = PHASE_SPECS[phase]
+    deliverable_path = spec["deliverable_path"].format(
+        ticket=ticket, worktree=str(worktree))
+    verdict_path = f"/tmp/verify-{ticket}-{phase}.json"
+    worker_log = f"/tmp/sos-claude-flow-{ticket}-{phase}.log"
+    sess_path = str(STATE_DIR / "sessions" / f"{ticket}.json")
+
+    feedback_block = ""
+    if prior_feedback:
+        feedback_items = "\n".join(f"  - {f}" for f in prior_feedback)
+        feedback_block = (
+            f"\n## Prior feedback to this worker (attempt {attempt + 1} of "
+            f"{VERIFIER_MAX_RETRIES + 1})\n\n"
+            f"You previously said this phase was INCOMPLETE with these "
+            f"specific gaps:\n{feedback_items}\n\n"
+            f"Re-verify now that the worker has had another attempt. "
+            f"Focus on whether the specific gaps above are closed. "
+            f"Do NOT invent new criteria — only judge against the success "
+            f"criteria below.\n"
+        )
+
+    schema_lines = "\n".join(
+        f"  \"{k}\": {v!r}" for k, v in spec["deliverable_schema"].items()
+    )
+    criteria = "\n".join(f"{i+1}. {c}" for i, c in enumerate(spec["success_criteria"]))
+
+    return f"""You are the phase verifier for {phase} on ticket {ticket}.
+
+Your ONLY job: read observable state, decide if the phase is complete,
+write a verdict file. You do NOT produce code, commits, PR comments,
+or any other production work.
+
+## What the worker was supposed to do
+
+{spec["description"]}
+
+## Success criteria (ALL must be met for `complete`)
+
+{criteria}
+
+## Evidence sources
+
+- Git state:
+    git -C {worktree} log --oneline -10
+    git -C {worktree} diff --stat @~5..HEAD
+    git -C {worktree} branch --show-current
+    git -C {worktree} status --porcelain
+- Remote state:
+    gh pr list --repo <owner>/<repo> --head <branch> --json number,url,state
+    gh pr view <N> --json reviews,comments
+    gh api repos/:owner/:repo/pulls/<N>/comments
+- Session state: {sess_path}
+- Worker's final tmux output: {worker_log}
+  (claude --print buffers stdout until exit; the last chunk typically
+  contains the worker's self-summary — read it but do not trust it
+  without cross-referencing git/PR state)
+- Existing deliverable file (if worker did write one): {deliverable_path}
+{feedback_block}
+## Your verdict
+
+Write JSON to `{verdict_path}` with this exact schema:
+
+```json
+{{
+  "state": "complete" | "incomplete" | "failed",
+  "summary": "1-2 sentences: what the worker ACTUALLY did (not claimed)",
+  "deliverable": {{
+{schema_lines}
+  }},
+  "feedback": ["specific missing item", "another"] // required if state=incomplete
+}}
+```
+
+## Verdict rules
+
+- **complete** — every success criterion above is met. Write a full
+  deliverable whose values come from actual state (git branch --show-current,
+  gh pr list, etc.), not from the worker's self-report.
+- **incomplete** — worker did some work but specific criteria are unmet.
+  List the gaps concretely in `feedback`. Include the criterion number
+  or the specific missing artifact. The worker will re-run with your
+  feedback verbatim.
+- **failed** — worker produced work that breaks acceptance (committed
+  to wrong branch, broke tests, regressed a previously-passing spec).
+  Surface to operator via `deliverable.error` field.
+
+Do NOT be lenient. Self-reports are unreliable — that is WHY you exist.
+If 4 of 6 review comments are addressed, verdict is incomplete with
+the 2 unaddressed comment IDs in feedback. If nothing is committed,
+verdict is failed.
+
+After writing the verdict file, print one line to stdout:
+
+    verify {phase} {ticket} → <state>
+
+Then exit 0.
+"""
+
+
+def _run_verifier(ticket, phase, worktree, attempt, prior_feedback):
+    """Spawn the verifier subagent, wait for it, parse the verdict JSON.
+
+    Returns a dict {state, summary, deliverable, feedback} or None if the
+    verifier itself crashed (treat that as "failed" upstream).
+    """
+    prompt = verifier_prompt(ticket, phase, worktree, attempt, prior_feedback)
+    session = f"verify-{ticket}-{phase}"
+    if attempt > 0:
+        session = f"{session}-retry{attempt}"
+    verdict_path = Path(f"/tmp/verify-{ticket}-{phase}.json")
+    if verdict_path.exists():
+        # Clear prior verdict so a crashed verifier can't accidentally
+        # satisfy the next read.
+        try:
+            verdict_path.unlink()
+        except OSError:
+            pass
+    step(f"Phase {phase} — verify (attempt {attempt + 1})")
+    rc = run_subagent(session, prompt)
+    if rc != 0:
+        print(f"  ✗ verifier subagent exited {rc}", file=sys.stderr)
+        return None
+    if not verdict_path.exists():
+        print(f"  ✗ verifier did not write {verdict_path}", file=sys.stderr)
+        return None
+    try:
+        data = json.loads(verdict_path.read_text())
+    except json.JSONDecodeError as e:
+        print(f"  ✗ verifier verdict invalid JSON: {e}", file=sys.stderr)
+        return None
+    state = data.get("state")
+    if state not in ("complete", "incomplete", "failed"):
+        print(f"  ✗ verifier verdict has invalid state: {state!r}",
+              file=sys.stderr)
+        return None
+    return data
+
+
+def _run_phase_with_verifier(ticket, phase, worker_fn, worktree,
+                             max_retries=VERIFIER_MAX_RETRIES):
+    """Run worker → verify loop. Worker may be invoked up to max_retries+1
+    times; each retry gets the prior verifier's feedback prepended to the
+    worker's prompt via worker_fn(feedback=...).
+
+    Returns the verifier's final `deliverable` dict on success.
+    Raises via fail() on failure (verifier said failed, or retries exhausted).
+    """
+    feedback = None
+    last_summary = None
+    spec = PHASE_SPECS[phase]
+    for attempt in range(max_retries + 1):
+        rc = worker_fn(feedback=feedback, attempt=attempt)
+        if rc != 0:
+            fail(f"{phase} worker subagent exited {rc} (attempt {attempt + 1})")
+        verdict = _run_verifier(ticket, phase, worktree, attempt, feedback)
+        if verdict is None:
+            fail(f"{phase} verifier could not produce a verdict (attempt {attempt + 1})")
+        state = verdict["state"]
+        summary = verdict.get("summary", "")
+        last_summary = summary
+        check(f"verify {phase} {ticket} → {state}"
+              + (f" — {summary}" if summary else ""))
+        # Write canonical deliverable file (verifier-authored, not worker-authored)
+        deliverable = verdict.get("deliverable") or {}
+        deliverable_path = Path(spec["deliverable_path"].format(
+            ticket=ticket, worktree=str(worktree)))
+        try:
+            deliverable_path.parent.mkdir(parents=True, exist_ok=True)
+            deliverable_path.write_text(json.dumps(deliverable, indent=2))
+        except OSError as e:
+            print(f"  ⚠ could not write {deliverable_path}: {e}",
+                  file=sys.stderr)
+        if state == "complete":
+            return deliverable
+        if state == "failed":
+            err = deliverable.get("error") or summary or "verifier marked phase as failed"
+            fail(f"{phase} failed (verifier): {err}")
+        # state == "incomplete" — set up retry
+        feedback = verdict.get("feedback") or ["(verifier provided no specific feedback)"]
+        if attempt < max_retries:
+            print(f"  ↻ {phase} incomplete — retrying worker "
+                  f"(attempt {attempt + 2} of {max_retries + 1}) "
+                  f"with {len(feedback)} feedback item(s)", flush=True)
+    # Retries exhausted
+    fail(f"{phase} did not reach `complete` after {max_retries + 1} worker "
+         f"attempts. Last summary: {last_summary}. Last feedback: {feedback}")
 
 
 # ─── Phase runners (the mechanical parts) ──────────────────────────────────
@@ -491,96 +801,38 @@ Repeat the poll call until the session is gone, THEN proceed to step 6.
 """
 
 
-def _synthesize_pm_complete(ticket, worktree, head_before):
-    """Build /tmp/pm-complete-TICKET.json from observable state when the
-    pm-start subagent committed work but forgot to write it.
-
-    Reads:
-      - branch from the worktree
-      - PR url from `gh pr list --head <branch>` (if a PR was opened)
-      - preview_url from session state (if pm-start's preview step ran)
-    """
-    try:
-        branch = run_capture(
-            ["git", "-C", str(worktree), "branch", "--show-current"],
-        ).strip()
-    except subprocess.CalledProcessError:
-        branch = ""
-    pr_url = ""
-    if branch and shutil.which("gh"):
-        try:
-            out = run_capture(
-                ["gh", "pr", "list", "--head", branch,
-                 "--json", "url", "--jq", ".[0].url // \"\""],
-            ).strip()
-            pr_url = out or ""
-        except subprocess.CalledProcessError:
-            pass
-    sess = session_get(ticket) or {}
-    return {
-        "ticket": ticket,
-        "worktree": worktree.name,
-        "branch": branch,
-        "pr_url": pr_url or None,
-        "preview_url": sess.get("preview_url") or None,
-        "smoke_test": "see PR description",
-        "open_questions": [],
-        "completed_at": now_iso(),
-        "_synthesized": True,
-        "_commits_since": (head_before or "")[:7],
-    }
-
-
 def phase_pm_start(ticket, iteration="first-pass"):
     step(f"Phase 1/5 — pm-start {ticket} {iteration}")
     if not PM_START_SKILL.exists():
         fail(f"pm-start skill not found at {PM_START_SKILL}")
-    prefix = _FLOW_DEV_PREFIX_TEMPLATE.format(ticket=ticket)
-    body = prefix + PM_START_SKILL.read_text() + f"\n\n{ticket} {iteration}\n"
     wt = Path(session_get(ticket, "worktree") or "")
-    head_before = _capture_head(wt) if wt.is_dir() else None
-    watcher = spawn_watcher(ticket, "work-1")
-    error = False
-    completion_missing = False
-    rc = None
-    marker = Path(f"/tmp/pm-complete-{ticket}.json")
-    try:
-        rc = run_subagent(f"flow-{ticket}-work1", body)
-        if rc != 0:
-            error = True
-        elif marker.exists():
-            pass  # explicit marker — trust it
-        elif wt.is_dir() and head_before:
-            head_after = _capture_head(wt)
-            if head_after and head_after != head_before:
-                synth = _synthesize_pm_complete(ticket, wt, head_before)
-                try:
-                    marker.write_text(json.dumps(synth, indent=2))
-                    print(f"  ↳ synthesized /tmp/pm-complete-{ticket}.json "
-                          f"from git state ({head_after[:7]} vs "
-                          f"{head_before[:7]}) — pm-start committed but "
-                          f"skipped the completion file",
-                          flush=True)
-                except OSError as e:
-                    print(f"  ↳ synthesis write failed: {e}",
-                          file=sys.stderr, flush=True)
-                    error = True
-                    completion_missing = True
-            else:
-                error = True
-                completion_missing = True
-        else:
-            error = True
-            completion_missing = True
-    finally:
-        stop_watcher(watcher, error=error)
-    if rc != 0:
-        fail(f"pm-start subagent exited {rc}")
-    if completion_missing:
-        fail(f"missing /tmp/pm-complete-{ticket}.json — pm-start exited "
-             f"without writing the completion marker and no commits landed "
-             f"(check tmux pm-{ticket} to see if the dev agent is still running)")
-    return read_pm_complete(ticket)
+
+    prefix = _FLOW_DEV_PREFIX_TEMPLATE.format(ticket=ticket)
+    skill_body = PM_START_SKILL.read_text()
+
+    def worker(feedback=None, attempt=0):
+        retry_note = ""
+        if feedback:
+            items = "\n".join(f"  - {f}" for f in feedback)
+            retry_note = (
+                f"\n## Retry — address these specific gaps from the verifier\n\n"
+                f"A previous attempt at pm-start was marked INCOMPLETE:\n\n"
+                f"{items}\n\n"
+                f"Focus this attempt on closing these gaps.\n\n"
+                f"**You do NOT need to write /tmp/pm-complete-{ticket}.json — "
+                f"the verifier writes it.** Just do the work.\n"
+            )
+        body = prefix + skill_body + retry_note + f"\n\n{ticket} {iteration}\n"
+        watcher = spawn_watcher(ticket, "work-1")
+        rc = 1
+        try:
+            rc = run_subagent(f"flow-{ticket}-work1", body)
+        finally:
+            stop_watcher(watcher, error=(rc != 0))
+        return rc
+
+    deliverable = _run_phase_with_verifier(ticket, "pm-start", worker, wt)
+    return deliverable
 
 
 def _capture_head(worktree):
@@ -667,43 +919,42 @@ def phase_review(ticket, pr_num):
     return json.loads(rf.read_text())
 
 
-def _synthesize_work_result(ticket):
-    """Synthesize work-2 / work-3 result from session state when the agent
-    committed but forgot to write the deliverable file."""
-    return {
-        "ready": True,
-        "url": session_get(ticket, "preview_url") or "",
-    }
-
-
 def phase_work2(ticket, pr_num, comments_n):
     step(f"Phase 3/5 — address {comments_n} review comments")
-    rf = worktree_root() / ".pm" / "work-2-result.json"
-    rc, missing = _run_subagent_with_watcher(
-        ticket, "work-2", f"flow-{ticket}-work2",
-        work2_prompt(ticket, pr_num, comments_n), rf,
-        synthesize_fn=lambda: _synthesize_work_result(ticket),
-    )
-    if rc != 0:
-        fail(f"work-2 subagent exited {rc}")
-    if missing:
-        fail(f"work-2 subagent did not write {rf} and no commits landed")
-    return json.loads(rf.read_text())
+    wt = worktree_root()
+
+    def worker(feedback=None, attempt=0):
+        watcher = spawn_watcher(ticket, "work-2")
+        rc = 1
+        try:
+            rc = run_subagent(
+                f"flow-{ticket}-work2",
+                work2_prompt(ticket, pr_num, comments_n, prior_feedback=feedback),
+            )
+        finally:
+            stop_watcher(watcher, error=(rc != 0))
+        return rc
+
+    return _run_phase_with_verifier(ticket, "work-2", worker, wt)
 
 
 def phase_work3(ticket, pr_num, reason):
     step(f"Phase 3/5 (re-QA) — address reviewer feedback")
-    rf = worktree_root() / ".pm" / "work-3-result.json"
-    rc, missing = _run_subagent_with_watcher(
-        ticket, "work-3", f"flow-{ticket}-work3",
-        work3_prompt(ticket, pr_num, reason), rf,
-        synthesize_fn=lambda: _synthesize_work_result(ticket),
-    )
-    if rc != 0:
-        fail(f"work-3 subagent exited {rc}")
-    if missing:
-        fail(f"work-3 subagent did not write {rf} and no commits landed")
-    return json.loads(rf.read_text())
+    wt = worktree_root()
+
+    def worker(feedback=None, attempt=0):
+        watcher = spawn_watcher(ticket, "work-3")
+        rc = 1
+        try:
+            rc = run_subagent(
+                f"flow-{ticket}-work3",
+                work3_prompt(ticket, pr_num, reason, prior_feedback=feedback),
+            )
+        finally:
+            stop_watcher(watcher, error=(rc != 0))
+        return rc
+
+    return _run_phase_with_verifier(ticket, "work-3", worker, wt)
 
 
 def qa_card_actions(ticket, pr_url, preview_url):

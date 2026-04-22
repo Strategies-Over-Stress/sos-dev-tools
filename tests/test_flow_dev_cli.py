@@ -1610,6 +1610,156 @@ class TestInboxPost(unittest.TestCase):
         self.assertIsNone(resp)
 
 
+class TestVerifierLoop(SessionBase):
+    """Worker/verifier split: worker produces work, verifier judges, retry
+    loop pushes back on incomplete verdicts."""
+
+    def setUp(self):
+        super().setUp()
+        self.wt = Path(self._tmp) / "wt"
+        self.wt.mkdir(parents=True)
+        (self.wt / ".pm").mkdir(parents=True)
+
+    def _verdict_file(self, phase="pm-start"):
+        return Path(f"/tmp/verify-FOO-1-{phase}.json")
+
+    def _stub_verifier(self, verdicts):
+        """Patch _run_verifier to return the given verdicts in order."""
+        return patch.object(fd, "_run_verifier",
+                            side_effect=list(verdicts))
+
+    def test_complete_on_first_try(self):
+        worker = MagicMock(return_value=0)
+        verdict = {
+            "state": "complete",
+            "summary": "worker did the thing",
+            "deliverable": {"branch": "feature/FOO-1-first-pass",
+                            "pr_url": "https://x/pull/1"},
+            "feedback": [],
+        }
+        with self._stub_verifier([verdict]):
+            result = fd._run_phase_with_verifier(
+                "FOO-1", "pm-start", worker, self.wt)
+        worker.assert_called_once()
+        # Worker invoked with feedback=None on first attempt
+        self.assertIsNone(worker.call_args.kwargs.get("feedback"))
+        self.assertEqual(worker.call_args.kwargs.get("attempt"), 0)
+        self.assertEqual(result["pr_url"], "https://x/pull/1")
+        # Deliverable file written at canonical path
+        marker = Path(f"/tmp/pm-complete-FOO-1.json")
+        self.assertTrue(marker.exists())
+        try: marker.unlink()
+        except OSError: pass
+
+    def test_incomplete_then_complete_retries_with_feedback(self):
+        worker = MagicMock(return_value=0)
+        incomplete = {
+            "state": "incomplete",
+            "summary": "only 2 of 6 comments addressed",
+            "deliverable": {},
+            "feedback": ["comment on Gallery.tsx:42 unaddressed",
+                         "comment on manifest.ts:7 unaddressed"],
+        }
+        complete = {
+            "state": "complete", "summary": "all 6 addressed",
+            "deliverable": {"ready": True, "url": ""}, "feedback": [],
+        }
+        with self._stub_verifier([incomplete, complete]):
+            result = fd._run_phase_with_verifier(
+                "FOO-1", "work-2", worker, self.wt)
+        self.assertEqual(worker.call_count, 2)
+        # Second call received the incomplete verdict's feedback
+        second_call_feedback = worker.call_args_list[1].kwargs["feedback"]
+        self.assertIn("comment on Gallery.tsx:42 unaddressed",
+                      second_call_feedback)
+        self.assertEqual(result["ready"], True)
+
+    def test_failed_verdict_aborts(self):
+        worker = MagicMock(return_value=0)
+        failed = {
+            "state": "failed",
+            "summary": "committed to wrong branch",
+            "deliverable": {"error": "on parent branch, should be feature/FOO-1"},
+            "feedback": [],
+        }
+        with self._stub_verifier([failed]):
+            with self.assertRaises(SystemExit):
+                fd._run_phase_with_verifier("FOO-1", "work-2", worker, self.wt)
+        worker.assert_called_once()
+
+    def test_max_retries_exhausted(self):
+        worker = MagicMock(return_value=0)
+        incomplete = {
+            "state": "incomplete", "summary": "still missing X",
+            "deliverable": {}, "feedback": ["still X"],
+        }
+        with self._stub_verifier([incomplete, incomplete, incomplete]):
+            with self.assertRaises(SystemExit):
+                fd._run_phase_with_verifier(
+                    "FOO-1", "work-2", worker, self.wt, max_retries=2)
+        # Worker invoked 3 times (1 initial + 2 retries)
+        self.assertEqual(worker.call_count, 3)
+
+    def test_verifier_crash_treated_as_failure(self):
+        worker = MagicMock(return_value=0)
+        # _run_verifier returning None = verifier couldn't produce a verdict
+        with self._stub_verifier([None]):
+            with self.assertRaises(SystemExit):
+                fd._run_phase_with_verifier(
+                    "FOO-1", "pm-start", worker, self.wt)
+        worker.assert_called_once()
+
+    def test_worker_nonzero_rc_aborts_before_verifier(self):
+        """If the worker itself bailed, we don't bother running the verifier."""
+        worker = MagicMock(return_value=1)
+        verifier = MagicMock()
+        with patch.object(fd, "_run_verifier", verifier):
+            with self.assertRaises(SystemExit):
+                fd._run_phase_with_verifier(
+                    "FOO-1", "work-2", worker, self.wt)
+        worker.assert_called_once()
+        verifier.assert_not_called()
+
+
+class TestVerifierPromptShape(SessionBase):
+    """verifier_prompt contains the phase description, success criteria,
+    and evidence-source guidance. Retry context is only included on retries."""
+
+    def test_first_attempt_no_prior_feedback_block(self):
+        p = fd.verifier_prompt("FOO-1", "pm-start",
+                               Path("/tmp/wt"), attempt=0, prior_feedback=None)
+        self.assertIn("pm-start initializes", p)
+        self.assertIn("feature branch", p.lower())
+        self.assertIn("verdict", p.lower())
+        self.assertIn("gh pr", p)
+        # No retry block
+        self.assertNotIn("Prior feedback", p)
+
+    def test_retry_includes_prior_feedback_verbatim(self):
+        feedback = ["comment on Gallery.tsx:42 unaddressed",
+                    "comment on manifest.ts:7 unaddressed"]
+        p = fd.verifier_prompt("FOO-1", "work-2",
+                               Path("/tmp/wt"), attempt=1,
+                               prior_feedback=feedback)
+        self.assertIn("Prior feedback", p)
+        self.assertIn("Gallery.tsx:42", p)
+        self.assertIn("manifest.ts:7", p)
+        # Don't invent new criteria note is included
+        self.assertIn("Do NOT invent new criteria", p)
+
+    def test_prompt_includes_deliverable_schema(self):
+        p = fd.verifier_prompt("FOO-1", "pm-start",
+                               Path("/tmp/wt"), attempt=0, prior_feedback=None)
+        self.assertIn("completed_at", p)  # a pm-start schema field
+        self.assertIn("pr_url", p)
+
+    def test_prompt_no_production_language(self):
+        """Verifier prompt must explicitly say 'no code, no commits'."""
+        p = fd.verifier_prompt("FOO-1", "work-2",
+                               Path("/tmp/wt"), attempt=0, prior_feedback=None)
+        self.assertIn("You do NOT produce", p)
+
+
 class TestDeliverableSynthesis(SessionBase):
     """When a subagent commits real work but exits without writing its
     deliverable file, _run_subagent_with_watcher should synthesize the
