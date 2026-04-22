@@ -742,6 +742,56 @@ class TestPreviewCommand(SessionBase):
         with patch.object(fd, "_source_repo_for_worktree", return_value=None):
             self.assertIsNone(fd._preview_config_for_ticket("FOO-1"))
 
+    def test_agent_suggested_preview_fallback(self):
+        """When no .pm/config.json preview block exists in worktree OR source,
+        fall back to .pm/preview-suggested.json written by the dev agent."""
+        wt = Path(self._tmp) / "wt-1"
+        (wt / ".pm").mkdir(parents=True)
+        # Empty worktree config (no preview), no source config.
+        (wt / ".pm" / "config.json").write_text(json.dumps({}))
+        (wt / ".pm" / "preview-suggested.json").write_text(json.dumps({
+            "command": "npm run dev -w apps/web",
+            "cwd": "."
+        }))
+        fd.session_set("FOO-1", worktree=str(wt))
+        with patch.object(fd, "_source_repo_for_worktree", return_value=None):
+            cfg = fd._preview_config_for_ticket("FOO-1")
+        self.assertEqual(cfg["command"], "npm run dev -w apps/web")
+
+    def test_operator_config_beats_agent_suggestion(self):
+        """Regression: if the worktree has an operator-defined preview block,
+        agent-suggested is ignored. Config explicit > agent inference."""
+        wt = Path(self._tmp) / "wt-1"
+        (wt / ".pm").mkdir(parents=True)
+        (wt / ".pm" / "config.json").write_text(json.dumps({
+            "preview": {"command": "operator-wrote-this", "cwd": "."}
+        }))
+        (wt / ".pm" / "preview-suggested.json").write_text(json.dumps({
+            "command": "agent-guessed-this", "cwd": "."
+        }))
+        fd.session_set("FOO-1", worktree=str(wt))
+        with patch.object(fd, "_source_repo_for_worktree", return_value=None):
+            cfg = fd._preview_config_for_ticket("FOO-1")
+        self.assertEqual(cfg["command"], "operator-wrote-this")
+
+    def test_source_repo_config_beats_agent_suggestion(self):
+        """Source-repo defaults also override agent suggestion."""
+        src = Path(self._tmp) / "src"
+        (src / ".pm").mkdir(parents=True)
+        (src / ".pm" / "config.json").write_text(json.dumps({
+            "preview": {"command": "source-default", "cwd": "."}
+        }))
+        wt = Path(self._tmp) / "wt-1"
+        (wt / ".pm").mkdir(parents=True)
+        (wt / ".pm" / "config.json").write_text(json.dumps({}))
+        (wt / ".pm" / "preview-suggested.json").write_text(json.dumps({
+            "command": "agent-guessed", "cwd": "."
+        }))
+        fd.session_set("FOO-1", worktree=str(wt))
+        with patch.object(fd, "_source_repo_for_worktree", return_value=src):
+            cfg = fd._preview_config_for_ticket("FOO-1")
+        self.assertEqual(cfg["command"], "source-default")
+
     def test_normalize_legacy_config(self):
         # Port in config is IGNORED — runner assigns at runtime.
         cfg = {"command": "npm run storybook", "cwd": "packages/ui", "port": 6006}

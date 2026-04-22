@@ -1100,25 +1100,58 @@ def _read_preview_block(config_path):
     return preview
 
 
+def _read_preview_suggested(path):
+    """Read a `.pm/preview-suggested.json` written by the dev agent.
+
+    Shape is the same as the `preview` block inside `.pm/config.json` —
+    either {command, cwd} or {services: [...]}. Returns the parsed dict
+    or None if missing/unreadable/empty.
+    """
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not data.get("command") and not data.get("services"):
+        return None
+    return data
+
+
 def _preview_config_for_ticket(ticket):
-    """Load the preview block. Prefers the worktree's .pm/config.json, falls
-    back to the source repo's when the worktree has no preview configured —
-    so adding the block once at the source is enough for every worktree.
+    """Load the preview block. Lookup order:
+
+      1. Worktree `.pm/config.json` preview block (operator-defined,
+         ticket-local override).
+      2. Source-repo `.pm/config.json` preview block (project default).
+      3. Worktree `.pm/preview-suggested.json` — written by the dev agent
+         when it knows what to serve but neither config has a preview.
+         Agent-suggested is a fallback, not an override — so an operator
+         who deliberately disables preview at the source level stays in
+         control.
+
+    Step 3 is deliberately last: config-defined beats agent-suggested so
+    operators' explicit decisions always win.
     """
     sess = session_get(ticket) or {}
     wt = sess.get("worktree")
     if not wt:
         return None
     worktree = Path(wt)
-    # Try the worktree first.
+    # Try the worktree config first.
     cfg = _read_preview_block(worktree / ".pm" / "config.json")
     if cfg:
         return cfg
     # Fall back to the source repo.
     source = _source_repo_for_worktree(worktree)
     if source:
-        return _read_preview_block(source / ".pm" / "config.json")
-    return None
+        cfg = _read_preview_block(source / ".pm" / "config.json")
+        if cfg:
+            return cfg
+    # Last resort: dev-agent suggestion.
+    return _read_preview_suggested(worktree / ".pm" / "preview-suggested.json")
 
 
 def _normalize_preview_config(cfg):
