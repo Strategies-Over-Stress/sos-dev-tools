@@ -312,14 +312,21 @@ of forking from the wrong branch: hours of rework downstream.
 """
 
 
-def review_prompt(ticket, pr_num, is_rereview=False):
+def review_prompt(ticket, pr_num, is_rereview=False, work_start_head=None):
     if is_rereview:
+        diff_range = (f"{work_start_head}..HEAD" if work_start_head
+                      else "HEAD~5..HEAD")
         return f"""You are a senior code reviewer on a RE-REVIEW of PR #{pr_num}.
 
-## Scope
+## Scope — read ONLY the delta since work-N began
 
-A prior review cycle posted comments; a work-N agent has since pushed
-commits to address them. Your job has three parts:
+The first review already inspected the entire PR. Your job is focused on
+what work-N changed: `git diff {diff_range}` gives you the commits
+that need scrutiny. Do NOT re-read files that work-N didn't touch —
+the first review already covered those, and re-reading them wastes
+tokens without catching new issues.
+
+Three-part brief:
 
 1. **Verify prior comments are resolved.** For each comment from the
    prior round, read the file in its current state and the commit(s)
@@ -330,10 +337,10 @@ commits to address them. Your job has three parts:
 2. **Catch regressions.** If work-N's fixes broke anything that was
    working before, post those too.
 
-3. **Catch BLOCKERS the first review missed.** Real bugs the initial
-   reviewer overlooked are legitimate findings — do not suppress them
-   just because they weren't raised last round. Apply the SAME
-   blocker-vs-preference standard as a first-pass review (below).
+3. **Catch BLOCKERS the first review missed in the delta.** Apply the
+   same blocker-vs-preference standard as first-pass, but ONLY on the
+   commits/files work-N touched. If a bug exists outside the delta,
+   trust the first review's judgment on it.
 
 ## What counts as a BLOCKER (post it)
 
@@ -368,13 +375,13 @@ backlog is for refactors; the PR is for blockers.
        gh api repos/:owner/:repo/pulls/{pr_num}/comments
 2. For each prior comment, inspect current state. Post a new comment
    ONLY if unresolved.
-3. Read work-N's commits for regressions.
-4. Scan the full diff for blocker-level issues the first reviewer
-   may have missed. Ignore nits.
-5. Submit the review:
+3. Read work-N's delta: `git diff {diff_range}` — look for regressions
+   and blocker-level issues the first reviewer may have missed IN THE
+   COMMITS WORK-N JUST PUSHED. Ignore nits.
+4. Submit the review:
        gh pr review {pr_num} --approve -b "..."          # all clear
        gh pr review {pr_num} --request-changes -b "..."  # blockers found
-6. Write `.pm/review-result.json`:
+5. Write `.pm/review-result.json`:
        {{"comments": N, "verdict": "approve" | "changes-requested"}}
    Where N = count of comments YOU posted in THIS review.
 
@@ -656,26 +663,32 @@ PHASE_SPECS = {
 }
 
 
-def verifier_prompt(ticket, phase, worktree):
+def verifier_prompt(ticket, phase, worktree, phase_start_head=None):
     """Build the verifier prompt. Verifier is a read-only agent whose
-    output is a single JSON verdict file."""
+    output is a single JSON verdict file.
+
+    Lean-evidence design: the verifier compares COMMIT MESSAGES + PR STATE
+    against the worker's INSTRUCTIONS — NOT the worker's full tmux log
+    or the full PR diff. The worker's deliverable is the updated PR;
+    commit messages are a high-signal, cheap proxy for 'did they do
+    what was asked.' A worker that forgets paperwork but makes real
+    commits passes; a worker that lies in commit messages could slip
+    past (rare, and the auto-retry + re-review catch post-hoc).
+    """
     spec = PHASE_SPECS[phase]
     deliverable_path = spec["deliverable_path"].format(
         ticket=ticket, worktree=str(worktree))
     verdict_path = f"/tmp/verify-{ticket}-{phase}.json"
-    worker_log = f"/tmp/sos-claude-flow-{ticket}-{phase}.log"
-    sess_path = str(STATE_DIR / "sessions" / f"{ticket}.json")
 
     schema_lines = "\n".join(
         f"  \"{k}\": {v!r}" for k, v in spec["deliverable_schema"].items()
     )
     criteria = "\n".join(f"{i+1}. {c}" for i, c in enumerate(spec["success_criteria"]))
+    log_range = f"{phase_start_head}..HEAD" if phase_start_head else "@~10..HEAD"
 
     return f"""You are the phase verifier for {phase} on ticket {ticket}.
-
-Your ONLY job: read observable state, decide if the phase is complete,
-write a verdict file. You do NOT produce code, commits, PR comments,
-or any other production work.
+Read observable state, decide if the phase is complete, write a verdict
+to `{verdict_path}`. You do NOT produce code, commits, or PR comments.
 
 ## What the worker was supposed to do
 
@@ -685,63 +698,51 @@ or any other production work.
 
 {criteria}
 
-## Evidence sources
+## Evidence — run these, judge from the output
 
-- Git state:
-    git -C {worktree} log --oneline -10
-    git -C {worktree} diff --stat @~5..HEAD
-    git -C {worktree} branch --show-current
-    git -C {worktree} status --porcelain
-- Remote state:
-    gh pr list --repo <owner>/<repo> --head <branch> --json number,url,state
-    gh pr view <N> --json reviews,comments
-    gh api repos/:owner/:repo/pulls/<N>/comments
-- Session state: {sess_path}
-- Worker's final tmux output: {worker_log}
-  (claude --print buffers stdout until exit; the last chunk typically
-  contains the worker's self-summary — read it but do not trust it
-  without cross-referencing git/PR state)
-- Existing deliverable file (if worker did write one): {deliverable_path}
+    # Worker's committed output (commit messages are the signal):
+    git -C {worktree} log {log_range} --format=fuller
+    git -C {worktree} diff --stat {log_range}
 
-## Your verdict
+    # PR headline state (do NOT read the full diff — too expensive):
+    gh pr view <PR_NUMBER> --json title,body,state,url,headRefName
 
-Write JSON to `{verdict_path}` with this exact schema:
+    # Original instructions to compare against:
+    cat {worktree}/.pm/active-ticket.json
+
+    # Deliverable file (optional — worker may or may not have written it):
+    test -f {deliverable_path} && cat {deliverable_path}
+
+## Verdict schema → {verdict_path}
 
 ```json
 {{
   "state": "complete" | "incomplete" | "failed",
-  "summary": "1-2 sentences: what the worker ACTUALLY did (not claimed)",
+  "summary": "1-2 sentences: what the commits + PR actually show",
   "deliverable": {{
 {schema_lines}
   }},
-  "feedback": ["specific missing item", "another"] // required if state=incomplete
+  "feedback": ["specific gap"]  // required if state=incomplete
 }}
 ```
 
-## Verdict rules
+## Rules
 
-- **complete** — every success criterion above is met. Write a full
-  deliverable whose values come from actual state (git branch --show-current,
-  gh pr list, etc.), not from the worker's self-report.
-- **incomplete** — worker did some work but specific criteria are unmet.
-  List the gaps concretely in `feedback` so the operator can fix and
-  re-run manually. Include the criterion number or the specific missing
-  artifact. There is no automatic retry — be specific enough that the
-  operator knows exactly what to tell the worker.
-- **failed** — worker produced work that breaks acceptance (committed
-  to wrong branch, broke tests, regressed a previously-passing spec).
-  Surface to operator via `deliverable.error` field.
+- **complete**: commit messages reference the ticket + describe work
+  that satisfies the criteria above. Synthesize `deliverable` from git
+  state (branch name via `branch --show-current`, PR URL via `gh pr
+  view`, etc.) — NOT from the worker's self-report.
+- **incomplete**: commits exist but don't cover all criteria (e.g.,
+  only addresses 4 of 6 review comments). List the gaps concretely.
+- **failed**: wrong branch, missing commits, commits that contradict
+  the ticket. Put reason in `deliverable.error`.
 
-Do NOT be lenient. Self-reports are unreliable — that is WHY you exist.
-If 4 of 6 review comments are addressed, verdict is incomplete with
-the 2 unaddressed comment IDs in feedback. If nothing is committed,
-verdict is failed.
+You DO NOT need to read the PR diff content or the full tmux log.
+Commit messages + PR state headline + ticket instructions are enough
+for phase-completion judgment. Trust the commit messages for WHAT
+was done; trust the git state for THAT it was done.
 
-After writing the verdict file, print one line to stdout:
-
-    verify {phase} {ticket} → <state>
-
-Then exit 0.
+Exit 0 after writing the verdict.
 """
 
 
@@ -766,14 +767,105 @@ def _validate_verdict_schema(data):
     return True, None
 
 
-def _run_verifier(ticket, phase, worktree):
+def _fast_complete_check(ticket, phase, worktree, phase_start_head):
+    """Python-only pre-check: if the worker cleanly met the phase's
+    criteria (HEAD moved + commits reference the ticket + PR exists for
+    pm-start), synthesize the deliverable and return it to skip the
+    verifier LLM call. If any gate fails, return None and let the
+    verifier make the call.
+
+    Saves ~1 LLM call per phase in the majority of clean runs where
+    the worker did exactly what was asked.
+    """
+    if phase_start_head is None:
+        return None
+    head_after = _capture_head(worktree)
+    if not head_after or head_after == phase_start_head:
+        return None  # worker didn't commit anything — let verifier decide
+
+    # Commit messages must reference the ticket ID. A worker that made
+    # commits without the ticket ref is off-script; let the LLM verifier
+    # look at it.
+    try:
+        log = run_capture([
+            "git", "-C", str(worktree), "log",
+            f"{phase_start_head}..HEAD", "--format=%B",
+        ])
+    except subprocess.CalledProcessError:
+        return None
+    if ticket not in log:
+        return None
+
+    # Phase-specific gates
+    sess = session_get(ticket) or {}
+    try:
+        branch = run_capture(
+            ["git", "-C", str(worktree), "branch", "--show-current"]
+        ).strip()
+    except subprocess.CalledProcessError:
+        return None
+
+    if phase == "pm-start":
+        # Must have an open PR. `gh pr list --head <branch> --json url`.
+        if shutil.which("gh") is None:
+            return None
+        try:
+            out = run_capture([
+                "gh", "pr", "list", "--head", branch,
+                "--json", "url,state", "--jq", ".[0]",
+            ]).strip()
+        except subprocess.CalledProcessError:
+            return None
+        if not out:
+            return None
+        try:
+            pr_data = json.loads(out)
+        except json.JSONDecodeError:
+            return None
+        if pr_data.get("state") != "OPEN":
+            return None
+        pr_url = pr_data.get("url") or ""
+        deliverable = {
+            "ticket": ticket,
+            "worktree": Path(worktree).name if worktree else "",
+            "branch": branch,
+            "pr_url": pr_url,
+            "preview_url": sess.get("preview_url") or None,
+            "smoke_test": "see PR description",
+            "open_questions": [],
+            "completed_at": now_iso(),
+            "_fast_path": True,
+        }
+        return {
+            "state": "complete",
+            "summary": f"fast-path: branch {branch} + PR {pr_url} exist, "
+                       f"commits reference {ticket}",
+            "deliverable": deliverable,
+        }
+
+    # work-2 / work-3: just need new commits referencing the ticket
+    if phase in ("work-2", "work-3"):
+        return {
+            "state": "complete",
+            "summary": f"fast-path: new commits on {branch} reference {ticket}",
+            "deliverable": {
+                "ready": True,
+                "url": sess.get("preview_url") or "",
+                "_fast_path": True,
+            },
+        }
+
+    return None  # unknown phase — defer to verifier
+
+
+def _run_verifier(ticket, phase, worktree, phase_start_head=None):
     """Spawn the verifier subagent, wait for it, parse + schema-validate
     the verdict JSON.
 
     Returns a dict {state, summary, deliverable, feedback?} or None if
     the verifier itself crashed or produced malformed output.
     """
-    prompt = verifier_prompt(ticket, phase, worktree)
+    prompt = verifier_prompt(ticket, phase, worktree, phase_start_head)
     session = f"verify-{ticket}-{phase}"
     verdict_path = Path(f"/tmp/verify-{ticket}-{phase}.json")
     if verdict_path.exists():
@@ -808,27 +900,38 @@ def _run_verifier(ticket, phase, worktree):
 
 
 def _run_phase_with_verifier(ticket, phase, worker_fn, worktree):
-    """Run worker, then verifier. Single-shot — no retries. Operator
-    re-invokes manually if they want a retry.
+    """Run worker, then verifier (OR fast-path synthesis if the worker's
+    output clearly satisfies the phase criteria).
 
-    Philosophy: a phase either produces complete work or it doesn't.
-    Auto-retry with feedback tends to: duplicate work when the worker
-    misreads its own prior attempt, burn token budget in ambiguous
-    loops, and mask real problems behind "one more try." Halting on
-    the first incomplete/failed surfaces the issue immediately and
-    lets the operator decide whether to fix, re-run, or escalate.
+    Flow:
+      1. Capture HEAD before the worker runs (phase_start_head)
+      2. Run the worker
+      3. Try fast-path: if the worker made commits, they reference the
+         ticket, and phase-specific gates pass (PR exists for pm-start),
+         synthesize the deliverable from git/PR state and SKIP the
+         verifier LLM call entirely. Saves ~1 LLM call per phase in
+         the majority of clean runs.
+      4. Otherwise, run the full verifier (which now reads commit
+         messages + PR headline, not full diff/tmux log).
 
-    Returns the verifier's `deliverable` dict on success; raises via
-    fail() on any non-complete verdict. Worker rc!=0 does NOT abort
-    before the verifier — the verifier judges from state, and a
-    crashed worker that still committed real work can still pass.
+    Worker rc!=0 does NOT abort before the verifier — the verifier judges
+    from state, and a crashed worker that still committed real work can
+    still pass.
     """
     spec = PHASE_SPECS[phase]
+
+    phase_start_head = _capture_head(worktree)
 
     # Run the worker. rc is captured but not gating — verifier decides.
     worker_rc = worker_fn()
 
-    verdict = _run_verifier(ticket, phase, worktree)
+    # Fast-path: try to skip the verifier LLM call.
+    verdict = _fast_complete_check(ticket, phase, worktree, phase_start_head)
+    if verdict is not None:
+        check(f"verify {phase} {ticket} → complete (fast-path, no LLM)")
+    else:
+        verdict = _run_verifier(ticket, phase, worktree,
+                                phase_start_head=phase_start_head)
     if verdict is None:
         fail(f"{phase} verifier could not produce a verdict "
              f"(worker rc={worker_rc})")
@@ -847,8 +950,11 @@ def _run_phase_with_verifier(ticket, phase, worker_fn, worktree):
         print(f"  ⚠ could not write {deliverable_path}: {e}",
               file=sys.stderr)
 
-    check(f"verify {phase} {ticket} → {state}"
-          + (f" — {summary}" if summary else ""))
+    # Skip this "check" line when the fast-path already printed one —
+    # fast-path sets `_fast_path: True` in the deliverable as a tag.
+    if not (isinstance(deliverable, dict) and deliverable.get("_fast_path")):
+        check(f"verify {phase} {ticket} → {state}"
+              + (f" — {summary}" if summary else ""))
 
     if state == "complete":
         return deliverable
@@ -1079,21 +1185,19 @@ def _run_subagent_with_watcher(ticket, phase_label, session, prompt,
     return rc, missing
 
 
-def phase_review(ticket, pr_num, is_rereview=False):
-    """Review phase — no verifier. Review's output (comment count +
-    verdict written to .pm/review-result.json) is the next phase's input.
+def phase_review(ticket, pr_num, is_rereview=False, work_start_head=None):
+    """Review phase — no verifier.
 
     First-pass review: full quality sweep against the whole diff.
-    Re-review (is_rereview=True): narrow-scope, verifies the prior
-    round's comments are addressed + catches regressions, does NOT
-    expand scope to new findings. Without this narrowing, every
-    re-review tends to invent new nits and flow never converges.
+    Re-review (is_rereview=True): scoped to the delta since work-N began.
+    work_start_head: captured git HEAD before work-N ran; if provided,
+    the re-review prompt tells the reviewer to read ONLY `<head>..HEAD`
+    rather than the entire PR. Big token savings on re-reviews (PR diff
+    can be 50+ files; delta is usually 1-5).
     """
     label = "re-review" if is_rereview else "review"
     step(f"Phase 2/5 — {label} PR #{pr_num}")
     rf = worktree_root() / ".pm" / "review-result.json"
-    # Clear any prior review-result.json so a stale file can't accidentally
-    # satisfy the next read (especially important on re-review).
     if rf.exists():
         try:
             rf.unlink()
@@ -1102,7 +1206,9 @@ def phase_review(ticket, pr_num, is_rereview=False):
     session = f"flow-{ticket}-review-2" if is_rereview else f"flow-{ticket}-review"
     rc, missing = _run_subagent_with_watcher(
         ticket, label.replace("-", "_"), session,
-        review_prompt(ticket, pr_num, is_rereview=is_rereview), rf,
+        review_prompt(ticket, pr_num, is_rereview=is_rereview,
+                      work_start_head=work_start_head),
+        rf,
     )
     if rc != 0:
         fail(f"{label} subagent exited {rc}")
@@ -1183,8 +1289,17 @@ def _work_rereview_loop(ticket, pr_num, worker_fn, max_retries=3,
     """
     last_review = None
     for attempt in range(max_retries + 1):
+        # Capture HEAD before this work cycle so the re-review can scope
+        # its diff read to just what work-N changed — not the entire PR.
+        # Falls back to base_ref..HEAD if worktree/HEAD can't be read.
+        try:
+            wt = worktree_root()
+            work_start_head = _capture_head(wt)
+        except Exception:
+            work_start_head = None
         worker_fn(attempt)
-        last_review = phase_review(ticket, pr_num, is_rereview=True)
+        last_review = phase_review(ticket, pr_num, is_rereview=True,
+                                   work_start_head=work_start_head)
         verdict = last_review.get("verdict")
         comments = last_review.get("comments", 0)
         if verdict != "changes-requested":

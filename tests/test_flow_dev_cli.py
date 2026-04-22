@@ -2100,6 +2100,101 @@ class TestVerifierPromptShape(SessionBase):
         the signal that review is not verifier-gated."""
         self.assertNotIn("review", fd.PHASE_SPECS)
 
+    def test_verifier_prompt_scopes_log_to_phase_start(self):
+        """Token optimization: verifier prompt reads commits from
+        phase_start_head..HEAD, not the last 10 commits generically."""
+        p = fd.verifier_prompt("FOO-1", "pm-start", Path("/tmp/wt"),
+                               phase_start_head="abc123def")
+        self.assertIn("abc123def..HEAD", p)
+
+    def test_verifier_prompt_does_not_read_tmux_log(self):
+        """Token optimization: verifier should NOT be instructed to read
+        the worker's full tmux log (can be 100KB+ for long dev-agent runs).
+        Commit messages + PR state are sufficient."""
+        p = fd.verifier_prompt("FOO-1", "pm-start", Path("/tmp/wt"))
+        self.assertNotIn("tmux output", p.lower())
+        self.assertNotIn("/tmp/sos-claude-flow", p)
+
+    def test_verifier_prompt_does_not_read_full_pr_diff(self):
+        """Token optimization: verifier should read PR HEADLINE (json
+        title,body,state) only — NOT the full diff."""
+        p = fd.verifier_prompt("FOO-1", "pm-start", Path("/tmp/wt"))
+        # Headline read is present
+        self.assertIn("gh pr view", p)
+        self.assertIn("json title,body,state", p)
+        # Full-diff read is absent
+        self.assertNotIn("gh pr diff", p)
+
+    def test_review_prompt_rereview_scoped_to_work_delta(self):
+        """Token optimization: re-review reads `git diff <work_start>..HEAD`
+        — the delta since work-N began, NOT the full PR diff."""
+        p = fd.review_prompt("FOO-1", "42", is_rereview=True,
+                             work_start_head="feedb00")
+        self.assertIn("feedb00..HEAD", p)
+        self.assertIn("delta", p.lower())
+
+
+class TestFastPathCompleteCheck(SessionBase):
+    """The fast-path pre-check synthesizes a complete-verdict and skips
+    the verifier LLM call when the worker's observable output cleanly
+    satisfies the phase criteria. Saves ~1 LLM call per phase in happy
+    runs."""
+
+    def test_fast_path_none_if_head_did_not_move(self):
+        with patch.object(fd, "_capture_head", return_value="abc123"):
+            r = fd._fast_complete_check("FOO-1", "pm-start",
+                                        Path("/tmp/wt"), "abc123")
+        self.assertIsNone(r)
+
+    def test_fast_path_none_if_phase_start_head_is_none(self):
+        r = fd._fast_complete_check("FOO-1", "pm-start",
+                                    Path("/tmp/wt"), None)
+        self.assertIsNone(r)
+
+    def test_fast_path_none_if_commit_msg_missing_ticket(self):
+        with patch.object(fd, "_capture_head", return_value="def456"), \
+             patch.object(fd, "run_capture",
+                          return_value="some commit without ticket id"):
+            r = fd._fast_complete_check("FOO-1", "work-2",
+                                        Path("/tmp/wt"), "abc123")
+        self.assertIsNone(r)
+
+    def test_fast_path_work2_succeeds_when_commits_reference_ticket(self):
+        # Mock: HEAD moved, commit message contains ticket, branch readable
+        def capture(cmd, **kw):
+            if "rev-parse" in cmd:
+                return "def456"
+            if "log" in cmd:
+                return "FOO-1: fix thing\n"
+            if "branch" in cmd:
+                return "feature/FOO-1-first-pass"
+            return ""
+        with patch.object(fd, "_capture_head", return_value="def456"), \
+             patch.object(fd, "run_capture", side_effect=capture):
+            r = fd._fast_complete_check("FOO-1", "work-2",
+                                        Path("/tmp/wt"), "abc123")
+        self.assertIsNotNone(r)
+        self.assertEqual(r["state"], "complete")
+        self.assertTrue(r["deliverable"]["_fast_path"])
+
+    def test_fast_path_pm_start_requires_open_pr(self):
+        """pm-start's fast path gates on an open PR existing; if gh
+        reports no PR or a closed PR, fall back to full verifier."""
+        def capture(cmd, **kw):
+            if "log" in cmd:
+                return "FOO-1: scaffold\n"
+            if "branch" in cmd:
+                return "feature/FOO-1-first-pass"
+            if "pr" in cmd and "list" in cmd:
+                return ""  # no PR yet
+            return ""
+        with patch.object(fd, "_capture_head", return_value="def456"), \
+             patch.object(fd, "run_capture", side_effect=capture), \
+             patch.object(fd.shutil, "which", return_value="/usr/bin/gh"):
+            r = fd._fast_complete_check("FOO-1", "pm-start",
+                                        Path("/tmp/wt"), "abc123")
+        self.assertIsNone(r)
+
 
 class TestDeliverableSynthesis(SessionBase):
     """When a subagent commits real work but exits without writing its
