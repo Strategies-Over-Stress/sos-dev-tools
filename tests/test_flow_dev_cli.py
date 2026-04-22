@@ -1653,6 +1653,43 @@ class TestActivitySnapshot(unittest.TestCase):
         status_call = next(c for c in captured if "status" in c)
         self.assertIn("--untracked-files=all", status_call)
 
+    def test_pm_dir_recent_activity_detects_fresh_file(self):
+        """Silence side-channel: if .pm/*.json or .pm/*.md has been modified
+        since last_activity, we're NOT silent (pm-start is running its prep
+        phase which writes gitignored .pm/ files invisible to porcelain)."""
+        import tempfile, time as _time
+        with tempfile.TemporaryDirectory() as td:
+            pm = Path(td) / ".pm"
+            pm.mkdir()
+            # No activity yet
+            self.assertFalse(fd._pm_dir_has_recent_activity(Path(td),
+                                                            _time.time()))
+            # Touch a .pm/ file
+            (pm / "active-ticket.json").write_text("{}")
+            # Now there IS activity since epoch
+            self.assertTrue(fd._pm_dir_has_recent_activity(Path(td), 0))
+
+    def test_pm_dir_recent_activity_skips_old_files(self):
+        """Files modified BEFORE since_ts don't count — we want NEW activity."""
+        import tempfile, time as _time, os
+        with tempfile.TemporaryDirectory() as td:
+            pm = Path(td) / ".pm"
+            pm.mkdir()
+            f = pm / "active-ticket.json"
+            f.write_text("{}")
+            # Set mtime to 1 hour ago
+            old = _time.time() - 3600
+            os.utime(f, (old, old))
+            # since_ts is now — file's 1 hour older → no recent activity
+            self.assertFalse(fd._pm_dir_has_recent_activity(Path(td),
+                                                             _time.time()))
+
+    def test_pm_dir_recent_activity_no_pm_dir(self):
+        """Missing .pm dir → False, don't crash."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            self.assertFalse(fd._pm_dir_has_recent_activity(Path(td), 0))
+
     def test_snapshot_cumulative_includes_committed_files(self):
         """Regression: when an agent commits a file it drops from
         porcelain. Without cumulative tracking, the watcher would see the

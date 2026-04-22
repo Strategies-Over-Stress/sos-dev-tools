@@ -2512,6 +2512,34 @@ def _inbox_post(path, body):
         return None
 
 
+def _pm_dir_has_recent_activity(worktree, since_ts):
+    """True if any file under the worktree's `.pm/` dir has been modified
+    since `since_ts`. Used as a silence-detection side-channel: pm-start's
+    steps 1-5 write gitignored files (active-ticket.json,
+    dev-agent-instructions.md, failed.json) that are invisible to
+    `git status --porcelain`. Without this check, the watcher reports
+    false-silence during pm-start's legitimate prep phase.
+
+    Only scans .pm/ itself (not subdirs), checks file mtimes.
+    Failures (dir missing, perm error) are silently False.
+    """
+    pm_dir = Path(worktree) / ".pm"
+    if not pm_dir.is_dir():
+        return False
+    try:
+        for entry in pm_dir.iterdir():
+            if not entry.is_file():
+                continue
+            try:
+                if entry.stat().st_mtime > since_ts:
+                    return True
+            except OSError:
+                continue
+        return False
+    except OSError:
+        return False
+
+
 def _git_snapshot(worktree, base_ref, phase_start_head=None):
     """Cumulative snapshot: (files-touched-this-phase, commits-this-phase).
 
@@ -2849,13 +2877,24 @@ def cmd_activity(args):
                     })
                 prev_signal = cur_signal
             elif not silence_warned and (now - last_activity) > silence_s:
-                silence_warned = True
-                text = f"⚠ {int((now - last_activity) / 60)}m of silence"
-                _write_file_log([text])
-                if card_id:
-                    _inbox_post(f"/inbox/{card_id}/progress", {
-                        "log_append": [{"ts": int(now * 1000), "text": text}],
-                    })
+                # Side-channel: pm-start writes gitignored .pm/* files
+                # (active-ticket.json, dev-agent-instructions.md,
+                # failed.json, etc.) during steps 1-5 that never show in
+                # `git status --porcelain`. Without this check, pm-start's
+                # 3-5 minutes of prep look like silence even though the
+                # skill is actively running. Reset last_activity if any
+                # .pm/ file has been touched since the last activity point.
+                if _pm_dir_has_recent_activity(worktree, last_activity):
+                    last_activity = now
+                else:
+                    silence_warned = True
+                    text = f"⚠ {int((now - last_activity) / 60)}m of silence"
+                    _write_file_log([text])
+                    if card_id:
+                        _inbox_post(f"/inbox/{card_id}/progress", {
+                            "log_append": [{"ts": int(now * 1000),
+                                            "text": text}],
+                        })
     finally:
         end = int(time.time() * 1000)
         status = stopping.get("status", "done")
