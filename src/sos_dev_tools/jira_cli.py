@@ -21,7 +21,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .env import load_env
-from .jira_api import api, md_to_adf, get_project_key, set_project_key, get_base_url, get_issue_type_id, transition_ticket, create_project
+from .jira_api import api, md_to_adf, get_project_key, set_project_key, get_base_url, get_issue_type_id, transition_ticket, create_project, move_issues_to_project
 
 
 def cmd_create(args):
@@ -61,6 +61,25 @@ def cmd_move(args):
     status = args.status.upper()
     if transition_ticket(ticket, status):
         print(f"{ticket} → {status}")
+
+
+def cmd_move_project(args):
+    """Re-home one or more issues into another project (re-keys them, preserving
+    history/comments) via Jira Cloud's bulk-move. Async under the hood."""
+    tickets = [t.upper() for t in args.tickets]
+    type_map = {t: args.type for t in tickets} if args.type else None
+    task, remap = move_issues_to_project(
+        tickets, args.to_project, type_map=type_map, notify=args.notify
+    )
+    status = task.get("status")
+    if status != "COMPLETE":
+        msg = task.get("message") or task.get("result") or ""
+        print(f"Error: bulk move did not complete (status: {status}). {msg}", file=sys.stderr)
+        sys.exit(1)
+    dest = args.to_project.upper()
+    for old in tickets:
+        print(f"  {old} → {remap.get(old, '?')}")
+    print(f"\n{len(tickets)} issue(s) moved to {dest}")
 
 
 def cmd_view(args):
@@ -346,6 +365,21 @@ malformed JSON, or a non-array root is a hard failure before any API calls.
     )
     p.add_argument("file", help="Path to JSON file containing an array of operation objects (see below)")
 
+    p = sub.add_parser(
+        "move-project",
+        help="Re-home issue(s) into another project (re-keys them, keeps history)",
+        description=(
+            "Move one or more issues into a different project via Jira Cloud's "
+            "bulk-move. This RE-KEYS the issues (e.g. INFRA-108 → WEGUUD-71) while "
+            "preserving their history, comments, and links — unlike a create+delete. "
+            "Each issue keeps its own type unless --type forces one."
+        ),
+    )
+    p.add_argument("tickets", nargs="+", help="Issue key(s) to move")
+    p.add_argument("--to-project", "-T", required=True, help="Destination project key (e.g. WEGUUD)")
+    p.add_argument("--type", "-t", default=None, help="Force a target issue type for all tickets (default: keep each issue's own type)")
+    p.add_argument("--notify", action="store_true", help="Send bulk-move notifications (default: off)")
+
     p = sub.add_parser("create-project")
     p.add_argument("--key", "-k", required=True, help="Project key (e.g. PILOT) — uppercase, 2-10 chars")
     p.add_argument("--name", "-n", required=True, help="Project name (e.g. Pilot Development)")
@@ -360,6 +394,7 @@ malformed JSON, or a non-array root is a hard failure before any API calls.
 
     {
         "create": cmd_create, "edit": cmd_edit, "move": cmd_move,
+        "move-project": cmd_move_project,
         "view": cmd_view, "list": cmd_list, "comment": cmd_comment,
         "delete": cmd_delete, "sync": cmd_sync, "create-project": cmd_create_project,
     }[args.command](args)
