@@ -50,16 +50,40 @@ STRIP_ENV = [
     "ANTHROPIC_API_KEY",
 ]
 
+# Env vars forced on for spawned agents unless the caller set them explicitly.
+#
+# Both target the same failure: long headless tool-use runs dying with
+#   "API Error: 400 ... `thinking` blocks in the latest assistant message
+#   cannot be modified". Claude Code's mid-run context management edits an
+#   assistant message that contains thinking blocks, violating the API's
+#   thinking-block immutability rule.
+#
+# MAX_THINKING_TOKENS=0 disables extended thinking outright — with no thinking
+#   blocks emitted at all, the immutability rule can never be violated,
+#   regardless of compaction or run length. This is the load-bearing fix.
+# DISABLE_INTERLEAVED_THINKING=1 additionally drops the interleaved-thinking
+#   beta (thinking carried across tool turns). Kept as defense-in-depth.
+# (DISABLE_INTERLEAVED_THINKING alone proved insufficient: the model still
+#  emitted a thinking block on the first turn, which compaction invalidated.)
+DEFAULT_ENV = {
+    "MAX_THINKING_TOKENS": "0",
+    "DISABLE_INTERLEAVED_THINKING": "1",
+}
+
 DEFAULT_ARGS = ["--dangerously-skip-permissions", "--print"]
 
 TMUX_POLL_INTERVAL_S = 1.0
 
 
 def stripped_env(source=None):
-    """Return a copy of the env with the parent-harness + API-key vars removed."""
+    """Return a copy of the env with the parent-harness + API-key vars removed
+    and the sub-agent defaults applied (caller-set values win)."""
     if source is None:
         source = os.environ
-    return {k: v for k, v in source.items() if k not in STRIP_ENV}
+    env = {k: v for k, v in source.items() if k not in STRIP_ENV}
+    for k, v in DEFAULT_ENV.items():
+        env.setdefault(k, v)
+    return env
 
 
 def run_in_tmux(session, cmd_argv):
@@ -101,12 +125,19 @@ def run_in_tmux(session, cmd_argv):
         cmd_argv = cmd_argv[:-1]
 
     unset_cmd = "unset " + " ".join(STRIP_ENV)
+    # Re-assert the sub-agent defaults inside the session shell (caller-set
+    # values are already resolved by stripped_env and win here), in case a
+    # pre-existing tmux server's env would otherwise shadow them.
+    resolved = stripped_env()
+    export_cmd = "export " + " ".join(
+        f"{k}={shlex.quote(resolved[k])}" for k in DEFAULT_ENV
+    )
     cmd_str = " ".join(shlex.quote(a) for a in cmd_argv)
     if prompt_file:
         stdin_redirect = f"< {shlex.quote(prompt_file)}"
     else:
         stdin_redirect = ""
-    wrapper = (f"{unset_cmd}; {cmd_str} {stdin_redirect}; "
+    wrapper = (f"{unset_cmd}; {export_cmd}; {cmd_str} {stdin_redirect}; "
                f"rc=$?; echo $rc > {shlex.quote(exit_file)}")
 
     # new-session -d: detached. -A: attach to existing session with this name

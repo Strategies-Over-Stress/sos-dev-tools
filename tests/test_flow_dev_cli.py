@@ -1177,11 +1177,100 @@ class TestCmdQaApprove(SessionBase):
         self.assertEqual(len(merge_calls), 1)
         self.assertIn("--squash", merge_calls[0])
         self.assertIn("--delete-branch", merge_calls[0])
-        # Verification call happened
+        # Two view calls: pre-check (is it already merged?) + post-merge verify
+        view_calls = [c for c in calls if isinstance(c, list)
+                      and c[0:3] == ["gh", "pr", "view"]]
+        self.assertEqual(len(view_calls), 2)
+        # Card posted
+        mock_post.assert_called_once()
+        self.assertEqual(fd.session_get("FOO-1", "phase"), "merged")
+
+    def test_already_merged_skips_merge_call(self):
+        """If the pre-check shows state=MERGED, skip the `gh pr merge` call
+        entirely — spam-clicking Approve & merge after a successful merge
+        must not emit an error. The button is idempotent."""
+        self._sess(merge_strategy="squash")
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if "view" in cmd and "pr" in cmd:
+                return MagicMock(
+                    returncode=0,
+                    stdout='{"mergedAt":"2026-04-21T20:00:00Z","state":"MERGED"}',
+                    stderr="")
+            # merge must never be called
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(fd.subprocess, "run", side_effect=fake_run), \
+             patch.object(fd, "post_card", return_value="card_x") as mock_post:
+            fd.cmd_qa_approve(args_ns(ticket="FOO-1"))
+
+        merge_calls = [c for c in calls if isinstance(c, list)
+                       and c[0:3] == ["gh", "pr", "merge"]]
+        self.assertEqual(merge_calls, [])  # merge call skipped
+        # Only the pre-check view call — no post-verify needed
         view_calls = [c for c in calls if isinstance(c, list)
                       and c[0:3] == ["gh", "pr", "view"]]
         self.assertEqual(len(view_calls), 1)
-        # Card posted
+        mock_post.assert_called_once()
+        self.assertEqual(fd.session_get("FOO-1", "phase"), "merged")
+
+    def test_race_already_merged_midflight_is_tolerated(self):
+        """A mid-click race: pre-check returns state=OPEN (not yet merged),
+        we call `gh pr merge`, but it returns non-zero with 'was already
+        merged' because another click landed the merge a moment earlier.
+        Treat as success."""
+        self._sess()
+        call_seq = {"view_i": 0}
+
+        def fake_run(cmd, **kw):
+            if "merge" in cmd and "pr" in cmd:
+                return MagicMock(returncode=1, stdout="",
+                                 stderr="PR was already merged")
+            if "view" in cmd and "pr" in cmd:
+                call_seq["view_i"] += 1
+                # First view: pre-check, shows OPEN. Second view: post-merge
+                # re-verify, now shows mergedAt (another click landed it).
+                if call_seq["view_i"] == 1:
+                    return MagicMock(returncode=0,
+                                     stdout='{"mergedAt":null,"state":"OPEN"}',
+                                     stderr="")
+                return MagicMock(returncode=0,
+                                 stdout='{"mergedAt":"2026-04-21T20:00:00Z"}',
+                                 stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(fd.subprocess, "run", side_effect=fake_run), \
+             patch.object(fd, "post_card", return_value="card_x") as mock_post:
+            fd.cmd_qa_approve(args_ns(ticket="FOO-1"))
+
+        mock_post.assert_called_once()
+        self.assertEqual(fd.session_get("FOO-1", "phase"), "merged")
+
+    def test_local_branch_cleanup_failure_is_warning(self):
+        """`gh pr merge --delete-branch` can fail at the LOCAL checkout step
+        (parent branch already checked out in another worktree) even when
+        the remote merge itself succeeded. Warn, don't fail."""
+        self._sess()
+
+        def fake_run(cmd, **kw):
+            if "merge" in cmd and "pr" in cmd:
+                return MagicMock(
+                    returncode=1, stdout="",
+                    stderr="failed to run git: already checked out at wt-3")
+            if "view" in cmd and "pr" in cmd:
+                # Pre-check: OPEN. Post-verify: merged (remote worked).
+                return MagicMock(returncode=0,
+                                 stdout='{"mergedAt":"2026-04-21T20:00:00Z",'
+                                        '"state":"OPEN"}',
+                                 stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(fd.subprocess, "run", side_effect=fake_run), \
+             patch.object(fd, "post_card", return_value="card_x") as mock_post:
+            fd.cmd_qa_approve(args_ns(ticket="FOO-1"))
+
         mock_post.assert_called_once()
         self.assertEqual(fd.session_get("FOO-1", "phase"), "merged")
 

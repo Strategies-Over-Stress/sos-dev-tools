@@ -21,7 +21,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .env import load_env
-from .jira_api import api, md_to_adf, get_project_key, set_project_key, get_base_url, get_issue_type_id, transition_ticket, create_project, move_issues_to_project
+from .jira_api import api, agile_api, md_to_adf, get_project_key, set_project_key, get_base_url, get_issue_type_id, transition_ticket, create_project, get_status_name, move_issues_to_project
 
 
 def cmd_create(args):
@@ -245,6 +245,88 @@ def cmd_create_project(args):
     print(f"Created project {key} (id: {project_id}) — {get_base_url()}/projects/{key}")
 
 
+def cmd_promote(args):
+    """Move tickets from backlog to the 'ready' status (e.g., Selected for Development)."""
+    target_status = get_status_name("ready")
+    tickets = [t.upper() for t in args.tickets]
+
+    for ticket in tickets:
+        transition_ticket(ticket, target_status.upper())
+        print(f"  {ticket} → {target_status}")
+
+    print(f"\n{len(tickets)} ticket(s) promoted to '{target_status}'")
+
+
+def _get_board_id():
+    """Find the board for the current project."""
+    project_key = get_project_key()
+    data = agile_api("GET", f"/board?projectKeyOrId={project_key}")
+    boards = data.get("values", [])
+    if not boards:
+        print(f"Error: no board found for project {project_key}", file=sys.stderr)
+        sys.exit(1)
+    return boards[0]["id"]
+
+
+def _get_active_sprint(board_id):
+    """Get the active sprint for a board."""
+    data = agile_api("GET", f"/board/{board_id}/sprint?state=active")
+    sprints = data.get("values", [])
+    if not sprints:
+        return None
+    return sprints[0]
+
+
+def cmd_sprint(args):
+    board_id = _get_board_id()
+
+    if args.sprint_action == "list":
+        data = agile_api("GET", f"/board/{board_id}/sprint?state=active,future")
+        sprints = data.get("values", [])
+        if not sprints:
+            print("No active or future sprints found.")
+            return
+        for s in sprints:
+            print(f"  {s['id']}  [{s['state'].upper()}]  {s['name']}")
+
+    elif args.sprint_action == "active":
+        sprint = _get_active_sprint(board_id)
+        if not sprint:
+            print("No active sprint.")
+            return
+        print(f"  {sprint['id']}  {sprint['name']}  ({sprint['state']})")
+        # List issues in this sprint
+        issues = agile_api("GET", f"/sprint/{sprint['id']}/issue")
+        for issue in issues.get("issues", []):
+            key = issue["key"]
+            summary = issue["fields"]["summary"]
+            status = issue["fields"]["status"]["name"]
+            print(f"    {key}  [{status}]  {summary}")
+
+    elif args.sprint_action == "move":
+        if not args.tickets:
+            print("Error: provide ticket IDs to move", file=sys.stderr)
+            sys.exit(1)
+
+        # Find target sprint
+        sprint = _get_active_sprint(board_id)
+        if not sprint:
+            # Try future sprints
+            data = agile_api("GET", f"/board/{board_id}/sprint?state=future")
+            future = data.get("values", [])
+            if future:
+                sprint = future[0]
+            else:
+                print("Error: no active or future sprint found.", file=sys.stderr)
+                sys.exit(1)
+
+        issue_keys = [t.upper() for t in args.tickets]
+        agile_api("POST", f"/sprint/{sprint['id']}/issue", {"issues": issue_keys})
+        print(f"Moved {len(issue_keys)} issue(s) to sprint '{sprint['name']}':")
+        for k in issue_keys:
+            print(f"  {k}")
+
+
 def main():
     load_env()
 
@@ -380,6 +462,13 @@ malformed JSON, or a non-array root is a hard failure before any API calls.
     p.add_argument("--type", "-t", default=None, help="Force a target issue type for all tickets (default: keep each issue's own type)")
     p.add_argument("--notify", action="store_true", help="Send bulk-move notifications (default: off)")
 
+    p = sub.add_parser("promote", parents=[proj])
+    p.add_argument("tickets", nargs="+", help="Ticket IDs to promote from backlog to ready")
+
+    p = sub.add_parser("sprint", parents=[proj])
+    p.add_argument("sprint_action", choices=["list", "active", "move"])
+    p.add_argument("tickets", nargs="*", help="Ticket IDs to move (for 'move' action)")
+
     p = sub.add_parser("create-project")
     p.add_argument("--key", "-k", required=True, help="Project key (e.g. PILOT) — uppercase, 2-10 chars")
     p.add_argument("--name", "-n", required=True, help="Project name (e.g. Pilot Development)")
@@ -396,7 +485,8 @@ malformed JSON, or a non-array root is a hard failure before any API calls.
         "create": cmd_create, "edit": cmd_edit, "move": cmd_move,
         "move-project": cmd_move_project,
         "view": cmd_view, "list": cmd_list, "comment": cmd_comment,
-        "delete": cmd_delete, "sync": cmd_sync, "create-project": cmd_create_project,
+        "delete": cmd_delete, "sync": cmd_sync, "promote": cmd_promote,
+        "sprint": cmd_sprint, "create-project": cmd_create_project,
     }[args.command](args)
 
 
