@@ -140,6 +140,24 @@ def worktree_root():
         fail("not inside a git worktree")
 
 
+def enter_ticket_worktree(ticket):
+    """chdir into the ticket's allocated worktree (recorded in session state).
+
+    `cmd_start` chdirs into the worktree right after allocation, so the full
+    pipeline runs there. The standalone phase subcommands (review, work2,
+    qa-reject/work3, resume) are invoked from wherever the operator's shell
+    happens to be — usually the main repo checkout, often on an unrelated
+    branch. Without re-entering, worktree_root() (`git rev-parse
+    --show-toplevel`) resolves to that wrong tree, so the verifier inspects
+    the wrong branch/HEAD and fails work that actually landed in the
+    worktree. Re-enter explicitly to match cmd_start's behavior.
+    """
+    wt = session_get(ticket, "worktree")
+    if wt and Path(wt).is_dir():
+        os.chdir(wt)
+    return wt
+
+
 def session_file(ticket):
     return STATE_DIR / "sessions" / f"{ticket}.json"
 
@@ -981,7 +999,16 @@ def _run_phase_with_verifier(ticket, phase, worker_fn, worktree):
 def _post_phase_failure_card(ticket, phase, state, summary, feedback,
                              deliverable):
     """Surface verifier verdict to the inbox so operator doesn't have to
-    read stderr. Graceful if inbox is unreachable."""
+    read stderr. Graceful if inbox is unreachable.
+
+    When the ticket has an open PR, attach retry/approve actions so the
+    operator can act without dropping to the CLI. The retry action is a
+    `prompt` kind — it collects free-text guidance from the operator,
+    shell-quotes it, and fires `sos-flow-dev qa-reject TICKET '<text>'`,
+    which feeds the text into the next work-3 prompt as reviewer
+    feedback. Reply-textarea on this card used to be a dead-letter box
+    (no process was waiting); the prompt action replaces that pattern.
+    """
     icon = "✗" if state == "failed" else "⊘"
     title = f"{icon} {phase} {state}"
     ctx_parts = []
@@ -991,8 +1018,29 @@ def _post_phase_failure_card(ticket, phase, state, summary, feedback,
         ctx_parts.append(deliverable["error"])
     if feedback:
         ctx_parts.append(" · Gaps: " + " / ".join(feedback[:5]))
-    post_card("info", title, ticket=ticket,
-              ctx=" ".join(ctx_parts)[:480] if ctx_parts else None)
+
+    sess = session_get(ticket) or {}
+    pr_num = sess.get("pr_num")
+    pr_url = sess.get("pr_url")
+
+    actions = None
+    card_kind = "info"
+    if pr_num:
+        card_kind = "action"
+        actions = [
+            {"label": "Open PR", "kind": "openUrl"},
+            {"label": "Retry with instructions…", "kind": "prompt",
+             "promptLabel": (f"Guidance for the next work cycle on "
+                             f"{ticket} (PR #{pr_num}):"),
+             "promptDefault": "Address the verifier feedback above.",
+             "cmd": f"sos-flow-dev qa-reject {ticket} {{input_sq}}"},
+            {"label": "Approve anyway", "kind": "exec",
+             "cmd": f"sos-flow-dev qa-approve {ticket}"},
+        ]
+
+    post_card(card_kind, title, ticket=ticket, url=pr_url or None,
+              ctx=" ".join(ctx_parts)[:480] if ctx_parts else None,
+              actions=actions)
 
 
 # ─── Phase runners (the mechanical parts) ──────────────────────────────────
@@ -1621,9 +1669,12 @@ def _run_start_blocking(ticket, args):
                      f"PR #{pr_num} — force-approve, retry, or fix manually."),
                 actions=[
                     {"label": "Open PR", "kind": "openUrl"},
-                    {"label": "Retry anyway", "kind": "exec",
-                     "cmd": (f"sos-flow-dev qa-reject {ticket} "
-                             f"\"address re-review feedback on PR #{pr_num}\"")},
+                    {"label": "Retry with instructions…", "kind": "prompt",
+                     "promptLabel": (f"Guidance for the next cycle on "
+                                     f"{ticket} (PR #{pr_num}):"),
+                     "promptDefault": (f"Address the re-review feedback on "
+                                       f"PR #{pr_num}."),
+                     "cmd": f"sos-flow-dev qa-reject {ticket} {{input_sq}}"},
                     {"label": "Approve anyway", "kind": "exec",
                      "cmd": f"sos-flow-dev qa-approve {ticket}"},
                 ],
@@ -1661,6 +1712,7 @@ def _run_start_blocking(ticket, args):
 
 def cmd_review(args):
     ticket = args.ticket
+    enter_ticket_worktree(ticket)
     sess = session_get(ticket) or {}
     pr_num = sess.get("pr_num") or extract_pr_num(sess.get("pr_url", ""))
     if not pr_num:
@@ -1677,6 +1729,7 @@ def cmd_review(args):
 
 def cmd_work2(args):
     ticket = args.ticket
+    enter_ticket_worktree(ticket)
     sess = session_get(ticket) or {}
     pr_num = sess.get("pr_num") or fail("no PR number on record")
     comments_n = (args.comments if args.comments is not None
@@ -1736,30 +1789,66 @@ def cmd_qa_approve(args):
         fail(f"unknown merge_strategy {strategy!r} — use squash|merge|rebase")
     delete_branch = git_cfg.get("delete_branch_on_merge", True)
 
-    merge_cmd = ["gh", "pr", "merge", str(pr_num), strategy_flag]
-    if delete_branch:
-        merge_cmd.append("--delete-branch")
-    step(f"merging PR #{pr_num} ({strategy})")
-    r = subprocess.run(merge_cmd, cwd=worktree or None,
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        fail(f"gh pr merge failed: {(r.stderr or r.stdout).strip()}")
-
-    # Verify GitHub actually marked it merged. Pre-refactor, a silent
-    # subagent no-op would falsely post a "Merged" card.
-    verify = subprocess.run(
-        ["gh", "pr", "view", str(pr_num), "--json", "mergedAt"],
+    # Pre-check: is the PR already merged? If so, skip the merge call
+    # (prevents 'was already merged' errors from spamming clicks) and
+    # go straight to the confirmation + state-update path. Makes the
+    # button idempotent — operator can click 5x without error.
+    precheck = subprocess.run(
+        ["gh", "pr", "view", str(pr_num), "--json", "mergedAt,state"],
         cwd=worktree or None, capture_output=True, text=True,
     )
+    already_merged = False
     merged_at = None
-    if verify.returncode == 0:
+    if precheck.returncode == 0:
         try:
-            merged_at = json.loads(verify.stdout).get("mergedAt")
+            pre = json.loads(precheck.stdout)
+            merged_at = pre.get("mergedAt")
+            if pre.get("state") == "MERGED" and merged_at:
+                already_merged = True
         except json.JSONDecodeError:
             pass
+
+    if already_merged:
+        step(f"PR #{pr_num} already merged — skipping merge call")
+    else:
+        merge_cmd = ["gh", "pr", "merge", str(pr_num), strategy_flag]
+        if delete_branch:
+            merge_cmd.append("--delete-branch")
+        step(f"merging PR #{pr_num} ({strategy})")
+        r = subprocess.run(merge_cmd, cwd=worktree or None,
+                           capture_output=True, text=True)
+        combined = (r.stderr or "") + (r.stdout or "")
+        # GitHub returns non-zero when a race-condition mid-click double-merge
+        # hits — also when --delete-branch's local checkout fails because the
+        # parent branch is already checked out in another worktree. Both are
+        # cosmetic; the remote merge is what matters. Detect and tolerate.
+        if r.returncode != 0:
+            msg = combined.strip()
+            if "was already merged" in combined.lower():
+                step(f"PR #{pr_num} was already merged by a prior click — "
+                     f"continuing")
+            elif ("already checked out" in combined.lower()
+                  and "failed to run git" in combined.lower()):
+                # The merge itself landed; only the local branch cleanup
+                # tripped on a worktree collision. Warn, don't fail.
+                print(f"  ⚠ local branch cleanup skipped: {msg}",
+                      file=sys.stderr)
+            else:
+                fail(f"gh pr merge failed: {msg}")
+
+        # Re-verify after attempting the merge
+        verify = subprocess.run(
+            ["gh", "pr", "view", str(pr_num), "--json", "mergedAt"],
+            cwd=worktree or None, capture_output=True, text=True,
+        )
+        if verify.returncode == 0:
+            try:
+                merged_at = json.loads(verify.stdout).get("mergedAt")
+            except json.JSONDecodeError:
+                pass
     if not merged_at:
-        fail(f"gh pr merge returned 0 but PR #{pr_num} is not marked merged "
-             f"(mergedAt is null) — refusing to post confirmation")
+        fail(f"PR #{pr_num} is not marked merged (mergedAt is null) — "
+             f"refusing to post confirmation")
 
     # Update Jira if the project has auto_transition + a known done status.
     jira_cfg = cfg.get("jira") or {}
@@ -1790,6 +1879,7 @@ def cmd_qa_approve(args):
 
 def cmd_qa_reject(args):
     ticket = args.ticket
+    enter_ticket_worktree(ticket)
     reason = args.reason or ""
     sess = session_get(ticket) or {}
     pr_num = sess.get("pr_num") or fail("no PR number on record")
@@ -1833,9 +1923,13 @@ def cmd_qa_reject(args):
                  f"fix manually."),
             actions=[
                 {"label": "Open PR", "kind": "openUrl"},
-                {"label": f"Retry (work-{next_work_n})", "kind": "exec",
-                 "cmd": (f"sos-flow-dev qa-reject {ticket} "
-                         f"\"address re-review feedback on PR #{pr_num}\"")},
+                {"label": f"Retry work-{next_work_n} with instructions…",
+                 "kind": "prompt",
+                 "promptLabel": (f"Guidance for work-{next_work_n} on "
+                                 f"{ticket} (PR #{pr_num}):"),
+                 "promptDefault": (f"Address the re-review feedback on "
+                                   f"PR #{pr_num}."),
+                 "cmd": f"sos-flow-dev qa-reject {ticket} {{input_sq}}"},
                 {"label": "Approve anyway", "kind": "exec",
                  "cmd": f"sos-flow-dev qa-approve {ticket}"},
             ],
@@ -3518,6 +3612,7 @@ def cmd_resume(args):
     sess = session_get(ticket)
     if not sess:
         fail(f"no session for {ticket}")
+    enter_ticket_worktree(ticket)
 
     # Clear the stopped flag up-front so any cards we post reflect "running"
     from_phase = sess.get("stopped_from_phase") or sess.get("phase", "")
@@ -3616,8 +3711,11 @@ def cmd_resume(args):
                       f"{last.get('comments', 0)} issues.",
                   actions=[
                       {"label": "Open PR", "kind": "openUrl"},
-                      {"label": "Retry", "kind": "exec",
-                       "cmd": f"sos-flow-dev qa-reject {ticket} \"resume retry\""},
+                      {"label": "Retry with instructions…", "kind": "prompt",
+                       "promptLabel": (f"Guidance for the next cycle on "
+                                       f"{ticket} (PR #{pr_num}):"),
+                       "promptDefault": "Address the re-review feedback.",
+                       "cmd": f"sos-flow-dev qa-reject {ticket} {{input_sq}}"},
                       {"label": "Approve anyway", "kind": "exec",
                        "cmd": f"sos-flow-dev qa-approve {ticket}"},
                   ])

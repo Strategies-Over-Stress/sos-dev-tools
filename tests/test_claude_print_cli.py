@@ -17,7 +17,8 @@ from sos_dev_tools import claude_print_cli
 
 
 class TestStripEnv(unittest.TestCase):
-    """stripped_env removes exactly the four load-bearing variables."""
+    """stripped_env removes the four load-bearing variables and applies the
+    sub-agent DEFAULT_ENV (caller-set values win)."""
 
     def test_strips_all_four(self):
         source = {
@@ -36,10 +37,21 @@ class TestStripEnv(unittest.TestCase):
         self.assertEqual(result["PATH"], "/usr/bin")
         self.assertEqual(result["HOME"], "/Users/x")
 
-    def test_no_vars_to_strip_is_identity(self):
+    def test_applies_defaults_when_nothing_stripped(self):
+        # Not an identity: passthrough vars are preserved AND the sub-agent
+        # DEFAULT_ENV (thinking-block mitigation) is injected.
         source = {"PATH": "/usr/bin", "HOME": "/Users/x"}
         result = claude_print_cli.stripped_env(source)
-        self.assertEqual(result, source)
+        self.assertEqual(result["PATH"], "/usr/bin")
+        self.assertEqual(result["HOME"], "/Users/x")
+        for k, v in claude_print_cli.DEFAULT_ENV.items():
+            self.assertEqual(result[k], v)
+
+    def test_caller_set_defaults_win(self):
+        # setdefault semantics — an explicit caller value is not overwritten.
+        source = {"PATH": "/usr/bin", "MAX_THINKING_TOKENS": "2048"}
+        result = claude_print_cli.stripped_env(source)
+        self.assertEqual(result["MAX_THINKING_TOKENS"], "2048")
 
     def test_strip_list_is_stable(self):
         # Guard against accidental edits to the strip list — each name is

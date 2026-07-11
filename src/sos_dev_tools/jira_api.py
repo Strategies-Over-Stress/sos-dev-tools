@@ -41,13 +41,63 @@ def api(method, path, data=None):
         sys.exit(1)
 
 
+def agile_api(method, path, data=None):
+    """Call the Jira Agile REST API (/rest/agile/1.0)."""
+    base_url = os.environ.get("JIRA_BASE_URL", "")
+    if not base_url:
+        print("Error: JIRA_BASE_URL not set", file=sys.stderr)
+        sys.exit(1)
+
+    url = f"{base_url}/rest/agile/1.0{path}"
+    body = json.dumps(data).encode() if data else None
+    req = Request(url, data=body, method=method)
+    req.add_header("Authorization", _auth_header())
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    try:
+        with urlopen(req) as resp:
+            if resp.status == 204:
+                return {}
+            return json.loads(resp.read())
+    except HTTPError as e:
+        error_body = e.read().decode()
+        print(f"Error {e.code}: {error_body}", file=sys.stderr)
+        sys.exit(1)
+
+
 def get_project_key():
+    config = load_jira_config()
+    if config and config.get("project_key"):
+        return config["project_key"]
     return os.environ.get("JIRA_PROJECT_KEY", "RICH")
 
 
 def set_project_key(key: str):
     """Override the project key for this session."""
     os.environ["JIRA_PROJECT_KEY"] = key.upper()
+
+
+def load_jira_config():
+    """Load .jira.json from the current directory or parents."""
+    cwd = Path.cwd()
+    for d in [cwd] + list(cwd.parents):
+        config_path = d / ".jira.json"
+        if config_path.exists():
+            try:
+                return json.loads(config_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                return None
+    return None
+
+
+def get_status_name(alias):
+    """Resolve a status alias (backlog, ready, in_progress, done) to the actual Jira status name."""
+    config = load_jira_config()
+    if config and "statuses" in config:
+        statuses = config["statuses"]
+        if alias in statuses:
+            return statuses[alias]
+    return alias
 
 
 def create_project(key, name, project_type="software", template="scrum"):
