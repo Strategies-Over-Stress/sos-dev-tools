@@ -285,6 +285,109 @@ def transition_ticket(ticket_key: str, status: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Cross-project move (re-home) — Jira Cloud bulk-move API
+# ---------------------------------------------------------------------------
+
+def get_project_id(project_key: str) -> str:
+    """Resolve a project key to its numeric id."""
+    return str(api("GET", f"/project/{project_key.upper()}")["id"])
+
+
+def get_issue_type_id_for_project(project_key: str, type_name: str) -> str:
+    """Resolve an issue type NAME → id within a SPECIFIC project (not the session
+    default) — needed when moving into a different project than the CLI's default.
+    """
+    meta = api("GET", f"/issue/createmeta?projectKeys={project_key.upper()}&expand=projects.issuetypes")
+    norm = type_name.lower().replace(" ", "")
+    for project in meta.get("projects", []):
+        for it in project.get("issuetypes", []):
+            if it["name"].lower().replace(" ", "") == norm:
+                return str(it["id"])
+    available = ", ".join(
+        it["name"] for p in meta.get("projects", []) for it in p.get("issuetypes", [])
+    )
+    print(f"Error: issue type '{type_name}' not found in project {project_key}. "
+          f"Available: {available}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _poll_task(task_id: str, timeout: int = 180, interval: int = 2) -> dict:
+    """Poll a Jira async task until it reaches a terminal state. Returns the task JSON
+    (status TIMEOUT if it never settles within `timeout` seconds)."""
+    waited = 0
+    while waited < timeout:
+        task = api("GET", f"/task/{task_id}")
+        if task.get("status") in ("COMPLETE", "FAILED", "CANCELLED", "DEAD"):
+            return task
+        time.sleep(interval)
+        waited += interval
+    return {"status": "TIMEOUT"}
+
+
+def move_issues_to_project(issue_keys, target_project_key, type_map=None, notify=False):
+    """Re-home issues into another project via Jira Cloud's bulk-move endpoint.
+
+    Unlike a create-and-delete, this RE-KEYS the existing issues (e.g. INFRA-108 →
+    WEGUUD-71) while preserving their history, comments, and links. The move is
+    async: it submits the bulk-move, polls the task to completion, then reports the
+    new key for each issue (the old key resolves to the new one after the move).
+
+    Args:
+        issue_keys: source issue keys.
+        target_project_key: destination project key.
+        type_map: optional {ISSUE_KEY: target_type_name}. When absent, each issue
+            keeps its own type name, mapped to the target project's type id.
+        notify: send bulk-move notifications (default False).
+
+    Returns:
+        (task_json, {old_key: new_key}).
+    """
+    target_project_key = target_project_key.upper()
+    project_id = get_project_id(target_project_key)
+    type_map = {k.upper(): v for k, v in (type_map or {}).items()}
+
+    # Group issues by their resolved target issue-type id — the bulk-move payload
+    # keys each source group by "<targetProjectId>,<targetIssueTypeId>".
+    groups: dict[str, list[str]] = {}
+    type_id_by_name: dict[str, str] = {}
+    for key in issue_keys:
+        key = key.upper()
+        type_name = type_map.get(key)
+        if not type_name:
+            type_name = api("GET", f"/issue/{key}?fields=issuetype")["fields"]["issuetype"]["name"]
+        if type_name not in type_id_by_name:
+            type_id_by_name[type_name] = get_issue_type_id_for_project(target_project_key, type_name)
+        groups.setdefault(type_id_by_name[type_name], []).append(key)
+
+    mapping = {
+        f"{project_id},{type_id}": {
+            "inferClassificationDefaults": True,
+            "inferFieldDefaults": True,
+            "inferStatusDefaults": True,
+            "inferSubtaskTypeDefault": True,
+            "issueIdsOrKeys": keys,
+        }
+        for type_id, keys in groups.items()
+    }
+
+    resp = api("POST", "/bulk/issues/move", {
+        "sendBulkNotification": bool(notify),
+        "targetToSourcesMapping": mapping,
+    })
+    task_id = resp.get("taskId")
+    if not task_id:
+        return resp, {}
+
+    task = _poll_task(task_id)
+    remap: dict[str, str] = {}
+    if task.get("status") == "COMPLETE":
+        for key in issue_keys:
+            info = api("GET", f"/issue/{key.upper()}?fields=key")
+            remap[key.upper()] = info.get("key", key.upper())
+    return task, remap
+
+
+# ---------------------------------------------------------------------------
 # Markdown → ADF converter
 # ---------------------------------------------------------------------------
 

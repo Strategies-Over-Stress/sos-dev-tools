@@ -325,5 +325,98 @@ class TestArgparseLowercase(unittest.TestCase):
         self.assertEqual(str.lower("SubTask"), "subtask")
 
 
+# Cross-project move (bulk-move / re-home)
+
+def make_move_api(captured, source_types, task_states):
+    """Build a stateful mock of jira_api.api for move tests.
+
+    Args:
+        captured: dict the mock writes the POST /bulk/issues/move payload into.
+        source_types: {ISSUE_KEY: type_name} for the source issues' current type.
+        task_states: list of task statuses returned on successive /task/ polls.
+    """
+    target_project_id = "10865"
+    target_types = {"task": "10005", "epic": "10000"}
+    new_keys = {"INFRA-108": "WEGUUD-71", "INFRA-107": "WEGUUD-70"}
+    polls = {"n": 0}
+
+    def _api(method, path, data=None):
+        if path == "/project/WEGUUD":
+            return {"id": target_project_id, "key": "WEGUUD"}
+        if path.startswith("/issue/createmeta"):
+            return {"projects": [{"issuetypes": [
+                {"id": "10005", "name": "Task"},
+                {"id": "10000", "name": "Epic"},
+            ]}]}
+        if "?fields=issuetype" in path:
+            key = path.split("/issue/")[1].split("?")[0]
+            return {"fields": {"issuetype": {"name": source_types[key]}}}
+        if method == "POST" and path == "/bulk/issues/move":
+            captured["payload"] = data
+            return {"taskId": "17226"}
+        if path.startswith("/task/"):
+            i = min(polls["n"], len(task_states) - 1)
+            polls["n"] += 1
+            return {"status": task_states[i]}
+        if "?fields=key" in path:
+            key = path.split("/issue/")[1].split("?")[0]
+            return {"key": new_keys.get(key, key)}
+        raise AssertionError(f"unexpected api call: {method} {path}")
+
+    return _api, target_project_id, target_types
+
+
+class TestMoveIssuesToProject(unittest.TestCase):
+    """move_issues_to_project builds the bulk-move payload, polls the task, and
+    reports re-keyed issues. All API + sleep calls mocked; no Jira needed."""
+
+    @patch("sos_dev_tools.jira_api.time.sleep", return_value=None)
+    def test_single_task_move_payload_and_remap(self, _sleep):
+        captured = {}
+        mock_api, pid, ttypes = make_move_api(
+            captured, {"INFRA-108": "Task"}, ["RUNNING", "COMPLETE"])
+        with patch.object(jira_api, "api", side_effect=mock_api):
+            task, remap = jira_api.move_issues_to_project(["INFRA-108"], "WEGUUD")
+        # payload shape: one mapping keyed "<projectId>,<taskTypeId>"
+        mapping = captured["payload"]["targetToSourcesMapping"]
+        self.assertIn(f"{pid},{ttypes['task']}", mapping)
+        self.assertEqual(mapping[f"{pid},{ttypes['task']}"]["issueIdsOrKeys"], ["INFRA-108"])
+        self.assertFalse(captured["payload"]["sendBulkNotification"])
+        # completed + re-keyed
+        self.assertEqual(task["status"], "COMPLETE")
+        self.assertEqual(remap["INFRA-108"], "WEGUUD-71")
+
+    @patch("sos_dev_tools.jira_api.time.sleep", return_value=None)
+    def test_mixed_types_group_into_separate_mappings(self, _sleep):
+        captured = {}
+        mock_api, pid, ttypes = make_move_api(
+            captured, {"INFRA-107": "Epic", "INFRA-108": "Task"}, ["COMPLETE"])
+        with patch.object(jira_api, "api", side_effect=mock_api):
+            jira_api.move_issues_to_project(["INFRA-107", "INFRA-108"], "WEGUUD")
+        mapping = captured["payload"]["targetToSourcesMapping"]
+        # epic and task land in distinct target-type buckets
+        self.assertEqual(mapping[f"{pid},{ttypes['epic']}"]["issueIdsOrKeys"], ["INFRA-107"])
+        self.assertEqual(mapping[f"{pid},{ttypes['task']}"]["issueIdsOrKeys"], ["INFRA-108"])
+
+    @patch("sos_dev_tools.jira_api.time.sleep", return_value=None)
+    def test_type_override_skips_source_type_lookup(self, _sleep):
+        captured = {}
+        # source_types intentionally empty: with an explicit type_map the code must
+        # NOT call /issue/{key}?fields=issuetype (would KeyError if it did).
+        mock_api, pid, ttypes = make_move_api(captured, {}, ["COMPLETE"])
+        with patch.object(jira_api, "api", side_effect=mock_api):
+            jira_api.move_issues_to_project(
+                ["INFRA-108"], "WEGUUD", type_map={"INFRA-108": "Task"})
+        mapping = captured["payload"]["targetToSourcesMapping"]
+        self.assertIn(f"{pid},{ttypes['task']}", mapping)
+
+    def test_poll_task_returns_on_terminal_state(self):
+        seq = iter(["RUNNING", "RUNNING", "FAILED"])
+        with patch.object(jira_api, "api", side_effect=lambda *a, **k: {"status": next(seq)}), \
+             patch("sos_dev_tools.jira_api.time.sleep", return_value=None):
+            task = jira_api._poll_task("17226", timeout=10, interval=0)
+        self.assertEqual(task["status"], "FAILED")
+
+
 if __name__ == "__main__":
     unittest.main()
