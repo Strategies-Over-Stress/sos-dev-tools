@@ -418,5 +418,77 @@ class TestMoveIssuesToProject(unittest.TestCase):
         self.assertEqual(task["status"], "FAILED")
 
 
+class DevWorkflowSchemeTests(unittest.TestCase):
+    """The canonical dev workflow scheme: default status aliases + the
+    create_project auto-assignment seam."""
+
+    def test_default_status_aliases(self):
+        with patch.object(jira_api, "load_jira_config", return_value=None):
+            self.assertEqual(jira_api.get_status_name("backlog"), "BACKLOG")
+            self.assertEqual(jira_api.get_status_name("ready"), "READY FOR DEV")
+            self.assertEqual(jira_api.get_status_name("in_progress"), "IN PROGRESS")
+            self.assertEqual(jira_api.get_status_name("in_review"), "IN REVIEW")
+            self.assertEqual(jira_api.get_status_name("in_qa"), "IN QA")
+            self.assertEqual(jira_api.get_status_name("done"), "DONE")
+
+    def test_unknown_alias_passes_through(self):
+        with patch.object(jira_api, "load_jira_config", return_value=None):
+            self.assertEqual(jira_api.get_status_name("whatever"), "whatever")
+
+    def test_repo_config_overrides_default_alias(self):
+        with patch.object(jira_api, "load_jira_config",
+                          return_value={"statuses": {"ready": "Selected for Development"}}):
+            self.assertEqual(jira_api.get_status_name("ready"), "Selected for Development")
+            # non-overridden aliases still fall back to the canonical defaults
+            self.assertEqual(jira_api.get_status_name("in_review"), "IN REVIEW")
+
+    def test_pipeline_shape(self):
+        names = [n for n, _ in jira_api.DEV_PIPELINE]
+        self.assertEqual(names, ["BACKLOG", "READY FOR DEV", "IN PROGRESS",
+                                 "IN REVIEW", "IN QA", "DONE"])
+
+    def test_assign_workflow_scheme_success(self):
+        with patch.object(jira_api, "_api_raw", return_value=(204, {})) as m:
+            self.assertTrue(jira_api.assign_workflow_scheme("10870", "10871"))
+        m.assert_called_once()
+        method, path, body = m.call_args[0]
+        self.assertEqual((method, path), ("PUT", "/workflowscheme/project"))
+        self.assertEqual(body, {"workflowSchemeId": "10871", "projectId": "10870"})
+
+    def test_assign_workflow_scheme_failure_is_nonfatal(self):
+        with patch.object(jira_api, "_api_raw", return_value=(400, {"error": "x"})):
+            self.assertFalse(jira_api.assign_workflow_scheme("10870", "10871"))
+
+    def test_create_project_assigns_scheme(self):
+        with patch.object(jira_api, "api", return_value={"key": "NEW", "id": "999"}), \
+             patch.object(jira_api, "ensure_dev_workflow_scheme", return_value="10871") as ens, \
+             patch.object(jira_api, "assign_workflow_scheme", return_value=True) as asg, \
+             patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("JIRA_SKIP_DEV_WORKFLOW", None)
+            result = jira_api.create_project("NEW", "New Project")
+        self.assertEqual(result["key"], "NEW")
+        ens.assert_called_once()
+        asg.assert_called_once_with("999", "10871")
+
+    def test_create_project_skips_when_opted_out(self):
+        with patch.object(jira_api, "api", return_value={"key": "NEW", "id": "999"}), \
+             patch.object(jira_api, "ensure_dev_workflow_scheme") as ens, \
+             patch.object(jira_api, "assign_workflow_scheme") as asg, \
+             patch.dict(os.environ, {"JIRA_SKIP_DEV_WORKFLOW": "1"}):
+            jira_api.create_project("NEW", "New Project")
+        ens.assert_not_called()
+        asg.assert_not_called()
+
+    def test_create_project_survives_scheme_error(self):
+        with patch.object(jira_api, "api", return_value={"key": "NEW", "id": "999"}), \
+             patch.object(jira_api, "ensure_dev_workflow_scheme",
+                          side_effect=RuntimeError("boom")), \
+             patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("JIRA_SKIP_DEV_WORKFLOW", None)
+            result = jira_api.create_project("NEW", "New Project")
+        # scheme failure must not break project creation
+        self.assertEqual(result["key"], "NEW")
+
+
 if __name__ == "__main__":
     unittest.main()

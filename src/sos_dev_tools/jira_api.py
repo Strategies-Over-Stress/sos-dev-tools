@@ -90,14 +90,27 @@ def load_jira_config():
     return None
 
 
+# Default alias → status name map for the canonical SOS dev pipeline. A repo's
+# .jira.json "statuses" block overrides any of these per-project.
+_DEFAULT_STATUS_ALIASES = {
+    "backlog": "BACKLOG",
+    "ready": "READY FOR DEV",
+    "in_progress": "IN PROGRESS",
+    "in_review": "IN REVIEW",
+    "in_qa": "IN QA",
+    "done": "DONE",
+}
+
+
 def get_status_name(alias):
-    """Resolve a status alias (backlog, ready, in_progress, done) to the actual Jira status name."""
+    """Resolve a status alias (backlog, ready, in_progress, in_review, in_qa, done)
+    to the actual Jira status name. A repo's .jira.json overrides the defaults."""
     config = load_jira_config()
     if config and "statuses" in config:
         statuses = config["statuses"]
         if alias in statuses:
             return statuses[alias]
-    return alias
+    return _DEFAULT_STATUS_ALIASES.get(alias, alias)
 
 
 def create_project(key, name, project_type="software", template="scrum"):
@@ -137,7 +150,177 @@ def create_project(key, name, project_type="software", template="scrum"):
     }
 
     result = api("POST", "/project", data)
+
+    # Guarantee the review + QA pipeline on every new project by assigning the
+    # shared canonical workflow scheme (idempotently provisioned). A brand-new
+    # project has no issues, so the association applies cleanly and synchronously.
+    # Opt out with JIRA_SKIP_DEV_WORKFLOW=1. Never fail creation over this.
+    if os.environ.get("JIRA_SKIP_DEV_WORKFLOW") != "1" and result.get("id"):
+        try:
+            scheme_id = ensure_dev_workflow_scheme()
+            if assign_workflow_scheme(result["id"], scheme_id):
+                print(f"  ✓ applied '{DEV_SCHEME_NAME}' "
+                      f"({' → '.join(n for n, _ in DEV_PIPELINE)})", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001 — scheme is best-effort
+            print(f"Warning: dev workflow scheme not applied to {data['key']}: {e}",
+                  file=sys.stderr)
+
     return result
+
+
+# ---------------------------------------------------------------------------
+# Canonical dev workflow scheme
+# ---------------------------------------------------------------------------
+# Every project created via create_project() is assigned one shared workflow
+# scheme so the review + QA stages are guaranteed and statuses never drift
+# project-to-project. Pipeline (open / any-to-any transitions):
+#   BACKLOG → READY FOR DEV → IN PROGRESS → IN REVIEW → IN QA → DONE
+
+DEV_WORKFLOW_NAME = "SOS Dev Workflow"
+DEV_SCHEME_NAME = "SOS Dev Workflow Scheme"
+# (status name, status category) in pipeline order
+DEV_PIPELINE = [
+    ("BACKLOG", "TODO"),
+    ("READY FOR DEV", "TODO"),
+    ("IN PROGRESS", "IN_PROGRESS"),
+    ("IN REVIEW", "IN_PROGRESS"),
+    ("IN QA", "IN_PROGRESS"),
+    ("DONE", "DONE"),
+]
+
+
+def _api_raw(method, path, data=None):
+    """Like api() but returns (status_code, parsed_body) and never sys.exit()s —
+    provisioning must inspect validation/error bodies rather than abort."""
+    base_url = os.environ.get("JIRA_BASE_URL", "")
+    if not base_url:
+        return 0, {"error": "JIRA_BASE_URL not set"}
+    url = f"{base_url}/rest/api/3{path}"
+    body = json.dumps(data).encode() if data is not None else None
+    req = Request(url, data=body, method=method)
+    req.add_header("Authorization", _auth_header())
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    try:
+        with urlopen(req) as resp:
+            raw = resp.read().decode()
+            return resp.status, (json.loads(raw) if raw else {})
+    except HTTPError as e:
+        raw = e.read().decode()
+        try:
+            return e.code, (json.loads(raw) if raw else {})
+        except json.JSONDecodeError:
+            return e.code, {"raw": raw}
+
+
+def _ensure_dev_statuses():
+    """Find-or-create the pipeline statuses globally. Returns {name: id}.
+
+    Reuses any existing global status whose name matches case-insensitively so
+    cross-project reporting stays coherent; only genuinely-missing statuses are
+    created."""
+    existing, start = {}, 0
+    while True:
+        _, d = _api_raw("GET", f"/statuses/search?maxResults=200&startAt={start}")
+        for s in d.get("values", []):
+            existing[s["name"].lower()] = s
+        if d.get("isLast", True):
+            break
+        start += 200
+    ids = {}
+    for name, cat in DEV_PIPELINE:
+        hit = existing.get(name.lower())
+        if hit:
+            ids[name] = hit["id"]
+            continue
+        st, d = _api_raw("POST", "/statuses", {
+            "scope": {"type": "GLOBAL"},
+            "statuses": [{"name": name, "statusCategory": cat,
+                          "description": f"{name} (SOS dev pipeline)"}],
+        })
+        if st not in (200, 201):
+            raise RuntimeError(f"could not create status {name!r}: {st} {d}")
+        ids[name] = d[0]["id"] if isinstance(d, list) else d["statuses"][0]["id"]
+    return ids
+
+
+def _ensure_dev_workflow(status_ids):
+    """Find-or-create the shared workflow. Returns the workflow name."""
+    import uuid
+
+    _, d = _api_raw("POST", "/workflows", {"workflowNames": [DEV_WORKFLOW_NAME]})
+    if any(w.get("name") == DEV_WORKFLOW_NAME for w in d.get("workflows", [])):
+        return DEV_WORKFLOW_NAME
+
+    # The create API links its statuses/transitions by a client-generated UUID
+    # (`statusReference`); existing global statuses are bound via their real id.
+    order = [n for n, _ in DEV_PIPELINE]
+    ref = {n: str(uuid.uuid4()) for n in order}
+    transitions = [{"id": "1", "name": "Create", "type": "INITIAL",
+                    "toStatusReference": ref["BACKLOG"]}]
+    for i, n in enumerate(order):
+        transitions.append({"id": str((i + 1) * 10 + 1), "name": n.title(),
+                            "type": "GLOBAL", "toStatusReference": ref[n]})
+    payload = {
+        "scope": {"type": "GLOBAL"},
+        "statuses": [{"id": status_ids[n], "statusReference": ref[n],
+                      "name": n, "statusCategory": cat} for n, cat in DEV_PIPELINE],
+        "workflows": [{
+            "name": DEV_WORKFLOW_NAME,
+            "description": ("Canonical SOS dev pipeline "
+                           "(Backlog -> Ready for Dev -> In Progress -> In Review "
+                           "-> In QA -> Done); open transitions."),
+            "statuses": [{"statusReference": ref[n],
+                          "layout": {"x": float(i * 180), "y": 0.0}}
+                         for i, n in enumerate(order)],
+            "transitions": transitions,
+        }],
+    }
+    st, d = _api_raw("POST", "/workflows/create", payload)
+    if st not in (200, 201):
+        raise RuntimeError(f"could not create workflow: {st} {d}")
+    return DEV_WORKFLOW_NAME
+
+
+def _ensure_dev_scheme(workflow_name):
+    """Find-or-create the workflow scheme. Returns its id."""
+    _, d = _api_raw("GET", "/workflowscheme?maxResults=200")
+    for s in d.get("values", []):
+        if s.get("name") == DEV_SCHEME_NAME:
+            return s["id"]
+    st, d = _api_raw("POST", "/workflowscheme", {
+        "name": DEV_SCHEME_NAME,
+        "description": "All issue types use SOS Dev Workflow.",
+        "defaultWorkflow": workflow_name,
+    })
+    if st not in (200, 201):
+        raise RuntimeError(f"could not create workflow scheme: {st} {d}")
+    return d["id"]
+
+
+def ensure_dev_workflow_scheme():
+    """Idempotently provision the canonical dev workflow scheme; return its id.
+
+    Set JIRA_DEV_WORKFLOW_SCHEME_ID to short-circuit the lookup/provisioning
+    (e.g. a different Jira instance with a pre-built scheme)."""
+    override = os.environ.get("JIRA_DEV_WORKFLOW_SCHEME_ID")
+    if override:
+        return override
+    status_ids = _ensure_dev_statuses()
+    workflow_name = _ensure_dev_workflow(status_ids)
+    return _ensure_dev_scheme(workflow_name)
+
+
+def assign_workflow_scheme(project_id, scheme_id):
+    """Assign a workflow scheme to a project. Non-fatal — warns and returns False
+    on failure. On a new (issue-less) project the change applies synchronously."""
+    st, d = _api_raw("PUT", "/workflowscheme/project",
+                     {"workflowSchemeId": str(scheme_id), "projectId": str(project_id)})
+    if st not in (200, 204):
+        print(f"Warning: could not assign workflow scheme {scheme_id} to project "
+              f"{project_id}: {st} {d}", file=sys.stderr)
+        return False
+    return True
 
 
 def get_base_url():

@@ -21,7 +21,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .env import load_env
-from .jira_api import api, agile_api, md_to_adf, get_project_key, set_project_key, get_base_url, get_issue_type_id, transition_ticket, create_project, get_status_name, move_issues_to_project
+from .jira_api import api, agile_api, md_to_adf, get_project_key, set_project_key, get_base_url, get_issue_type_id, transition_ticket, create_project, get_status_name, move_issues_to_project, ensure_dev_workflow_scheme, assign_workflow_scheme, DEV_SCHEME_NAME, DEV_WORKFLOW_NAME, DEV_PIPELINE
 
 
 def cmd_create(args):
@@ -245,6 +245,25 @@ def cmd_create_project(args):
     print(f"Created project {key} (id: {project_id}) — {get_base_url()}/projects/{key}")
 
 
+def cmd_provision_dev_workflow(args):
+    """Idempotently (re)provision the canonical dev workflow scheme, and
+    optionally assign it to an existing project with --assign KEY."""
+    pipeline = " → ".join(n for n, _ in DEV_PIPELINE)
+    print(f"Provisioning '{DEV_SCHEME_NAME}' → {pipeline}")
+    scheme_id = ensure_dev_workflow_scheme()
+    print(f"  scheme id: {scheme_id}  (workflow: '{DEV_WORKFLOW_NAME}')")
+    if args.assign:
+        key = args.assign.upper()
+        proj = api("GET", f"/project/{key}")
+        if assign_workflow_scheme(proj["id"], scheme_id):
+            print(f"  ✓ assigned to {key}")
+        else:
+            sys.exit(1)
+    else:
+        print("  (new projects created via `sos-jira create-project` get this "
+              "automatically; use --assign KEY to apply to an existing project)")
+
+
 def cmd_promote(args):
     """Move tickets from backlog to the 'ready' status (e.g., Selected for Development)."""
     target_status = get_status_name("ready")
@@ -394,9 +413,16 @@ Supported actions:
   delete            Delete an existing issue.
     ticket          (required) Ticket key to delete.
 
-  create-project    Provision a new Jira project.
+  create-project    Provision a new Jira project. Automatically assigned the
+                    canonical dev workflow scheme (BACKLOG → READY FOR DEV →
+                    IN PROGRESS → IN REVIEW → IN QA → DONE); set
+                    JIRA_SKIP_DEV_WORKFLOW=1 to opt out.
     key             (required) Project key (uppercase, 2-10 chars).
     name            (required) Human-readable project name.
+
+  provision-dev-workflow  (Re)provision the canonical dev workflow scheme
+                    (idempotent). --assign KEY also applies it to an existing
+                    project.
     type            (optional) "software" | "business" | "service_desk".
                     Defaults to "software".
     template        (optional) "scrum" | "kanban" | "basic".
@@ -475,6 +501,11 @@ malformed JSON, or a non-array root is a hard failure before any API calls.
     p.add_argument("--type", "-t", default="software", choices=["software", "business", "service_desk"])
     p.add_argument("--template", default="scrum", choices=["scrum", "kanban", "basic"])
 
+    p = sub.add_parser("provision-dev-workflow",
+                       help="Idempotently (re)provision the canonical BACKLOG→READY FOR DEV→IN PROGRESS→IN REVIEW→IN QA→DONE scheme")
+    p.add_argument("--assign", metavar="KEY", default=None,
+                   help="Also assign the scheme to an existing project (e.g. --assign INFRA)")
+
     args = parser.parse_args()
 
     # Apply project override before dispatching
@@ -487,6 +518,7 @@ malformed JSON, or a non-array root is a hard failure before any API calls.
         "view": cmd_view, "list": cmd_list, "comment": cmd_comment,
         "delete": cmd_delete, "sync": cmd_sync, "promote": cmd_promote,
         "sprint": cmd_sprint, "create-project": cmd_create_project,
+        "provision-dev-workflow": cmd_provision_dev_workflow,
     }[args.command](args)
 
 
