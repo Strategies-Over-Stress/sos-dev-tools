@@ -214,11 +214,13 @@ def _api_raw(method, path, data=None):
 
 
 def _ensure_dev_statuses():
-    """Find-or-create the pipeline statuses globally. Returns {name: id}.
+    """Find-or-create the pipeline statuses globally. Returns {name: (id, real_name)}.
 
     Reuses any existing global status whose name matches case-insensitively so
     cross-project reporting stays coherent; only genuinely-missing statuses are
-    created."""
+    created. Crucially, a reused status keeps its EXISTING display name — passing
+    a different-cased name to the workflow-create API renames the shared global
+    status instance-wide, which would leak into every other project."""
     existing, start = {}, 0
     while True:
         _, d = _api_raw("GET", f"/statuses/search?maxResults=200&startAt={start}")
@@ -227,11 +229,11 @@ def _ensure_dev_statuses():
         if d.get("isLast", True):
             break
         start += 200
-    ids = {}
+    resolved = {}   # canonical name -> (id, real display name)
     for name, cat in DEV_PIPELINE:
         hit = existing.get(name.lower())
         if hit:
-            ids[name] = hit["id"]
+            resolved[name] = (hit["id"], hit["name"])   # keep the real name
             continue
         st, d = _api_raw("POST", "/statuses", {
             "scope": {"type": "GLOBAL"},
@@ -240,12 +242,14 @@ def _ensure_dev_statuses():
         })
         if st not in (200, 201):
             raise RuntimeError(f"could not create status {name!r}: {st} {d}")
-        ids[name] = d[0]["id"] if isinstance(d, list) else d["statuses"][0]["id"]
-    return ids
+        sid = d[0]["id"] if isinstance(d, list) else d["statuses"][0]["id"]
+        resolved[name] = (sid, name)
+    return resolved
 
 
-def _ensure_dev_workflow(status_ids):
-    """Find-or-create the shared workflow. Returns the workflow name."""
+def _ensure_dev_workflow(statuses):
+    """Find-or-create the shared workflow. `statuses` maps canonical name ->
+    (id, real_name). Returns the workflow name."""
     import uuid
 
     _, d = _api_raw("POST", "/workflows", {"workflowNames": [DEV_WORKFLOW_NAME]})
@@ -253,7 +257,8 @@ def _ensure_dev_workflow(status_ids):
         return DEV_WORKFLOW_NAME
 
     # The create API links its statuses/transitions by a client-generated UUID
-    # (`statusReference`); existing global statuses are bound via their real id.
+    # (`statusReference`); existing global statuses are bound via their real id
+    # AND their real name (a mismatched name would rename the shared status).
     order = [n for n, _ in DEV_PIPELINE]
     ref = {n: str(uuid.uuid4()) for n in order}
     transitions = [{"id": "1", "name": "Create", "type": "INITIAL",
@@ -263,8 +268,9 @@ def _ensure_dev_workflow(status_ids):
                             "type": "GLOBAL", "toStatusReference": ref[n]})
     payload = {
         "scope": {"type": "GLOBAL"},
-        "statuses": [{"id": status_ids[n], "statusReference": ref[n],
-                      "name": n, "statusCategory": cat} for n, cat in DEV_PIPELINE],
+        "statuses": [{"id": statuses[n][0], "statusReference": ref[n],
+                      "name": statuses[n][1], "statusCategory": cat}
+                     for n, cat in DEV_PIPELINE],
         "workflows": [{
             "name": DEV_WORKFLOW_NAME,
             "description": ("Canonical SOS dev pipeline "

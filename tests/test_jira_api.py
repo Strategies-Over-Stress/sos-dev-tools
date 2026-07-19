@@ -479,6 +479,36 @@ class DevWorkflowSchemeTests(unittest.TestCase):
         ens.assert_not_called()
         asg.assert_not_called()
 
+    def test_ensure_statuses_reuse_keeps_real_name(self):
+        # An existing global status matched case-insensitively must be reused
+        # under its OWN display name — never renamed to our canonical casing
+        # (that would rename the shared status across every project).
+        existing = {"values": [
+            {"id": "3", "name": "In Progress", "statusCategory": "IN_PROGRESS"},
+            {"id": "10167", "name": "Backlog", "statusCategory": "TODO"},
+            {"id": "10006", "name": "Done", "statusCategory": "DONE"},
+            {"id": "10238", "name": "IN REVIEW", "statusCategory": "IN_PROGRESS"},
+        ], "isLast": True}
+        created = []
+
+        def fake(method, path, data=None):
+            if path.startswith("/statuses/search"):
+                return 200, existing
+            if method == "POST" and path == "/statuses":
+                created.append(data["statuses"][0]["name"])
+                return 200, [{"id": "999" + str(len(created))}]
+            raise AssertionError(f"unexpected {method} {path}")
+
+        with patch.object(jira_api, "_api_raw", side_effect=fake):
+            resolved = jira_api._ensure_dev_statuses()
+
+        # reused statuses keep their real (title-case) name
+        self.assertEqual(resolved["IN PROGRESS"], ("3", "In Progress"))
+        self.assertEqual(resolved["BACKLOG"], ("10167", "Backlog"))
+        self.assertEqual(resolved["DONE"], ("10006", "Done"))
+        # only the genuinely-missing ones are created, under the canonical name
+        self.assertEqual(sorted(created), ["IN QA", "READY FOR DEV"])
+
     def test_create_project_survives_scheme_error(self):
         with patch.object(jira_api, "api", return_value={"key": "NEW", "id": "999"}), \
              patch.object(jira_api, "ensure_dev_workflow_scheme",
