@@ -461,14 +461,33 @@ class DevWorkflowSchemeTests(unittest.TestCase):
 
     def test_create_project_assigns_scheme(self):
         with patch.object(jira_api, "api", return_value={"key": "NEW", "id": "999"}), \
-             patch.object(jira_api, "ensure_dev_workflow_scheme", return_value="10871") as ens, \
+             patch.object(jira_api, "ensure_workflow_scheme", return_value="10871") as ens, \
              patch.object(jira_api, "assign_workflow_scheme", return_value=True) as asg, \
+             patch.object(jira_api, "remap_board_columns", return_value=[(7, [])]) as remap, \
              patch.dict(os.environ, {}, clear=False):
             os.environ.pop("JIRA_SKIP_DEV_WORKFLOW", None)
             result = jira_api.create_project("NEW", "New Project")
         self.assertEqual(result["key"], "NEW")
-        ens.assert_called_once()
+        ens.assert_called_once_with(jira_api.WORKFLOW_SPECS["dev"])
         asg.assert_called_once_with("999", "10871")
+        # the template's board is remapped to the scheme's statuses, in pipeline order
+        remap.assert_called_once_with("NEW", [n for n, _ in jira_api.DEV_PIPELINE])
+
+    def test_create_project_batch_workflow(self):
+        with patch.object(jira_api, "api", return_value={"key": "GRX", "id": "5"}), \
+             patch.object(jira_api, "ensure_workflow_scheme", return_value="42") as ens, \
+             patch.object(jira_api, "assign_workflow_scheme", return_value=True), \
+             patch.object(jira_api, "remap_board_columns", return_value=[(9, [])]) as remap, \
+             patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("JIRA_SKIP_DEV_WORKFLOW", None)
+            jira_api.create_project("GRX", "Grooming X", template="kanban", workflow="batch")
+        ens.assert_called_once_with(jira_api.WORKFLOW_SPECS["batch"])
+        remap.assert_called_once_with("GRX", ["BACKLOG", "APPROVED", "SPIKED", "DONE"])
+
+    def test_batch_pipeline_shape(self):
+        self.assertEqual(jira_api.BATCH_PIPELINE, [("BACKLOG", "TODO"), ("APPROVED", "TODO"),
+                                                   ("SPIKED", "IN_PROGRESS"), ("DONE", "DONE")])
+        self.assertEqual(jira_api.WORKFLOW_SPECS["batch"]["scheme"], "SOS Batch Workflow Scheme")
 
     def test_create_project_skips_when_opted_out(self):
         with patch.object(jira_api, "api", return_value={"key": "NEW", "id": "999"}), \
@@ -511,13 +530,93 @@ class DevWorkflowSchemeTests(unittest.TestCase):
 
     def test_create_project_survives_scheme_error(self):
         with patch.object(jira_api, "api", return_value={"key": "NEW", "id": "999"}), \
-             patch.object(jira_api, "ensure_dev_workflow_scheme",
+             patch.object(jira_api, "ensure_workflow_scheme",
                           side_effect=RuntimeError("boom")), \
              patch.dict(os.environ, {}, clear=False):
             os.environ.pop("JIRA_SKIP_DEV_WORKFLOW", None)
             result = jira_api.create_project("NEW", "New Project")
         # scheme failure must not break project creation
         self.assertEqual(result["key"], "NEW")
+
+
+# The kanban template's board, as the board-config API returns it.
+TEMPLATE_COLUMNS = [
+    {"id": 1, "name": "Backlog", "isKanPlanColumn": True, "mappedStatuses": []},
+    {"id": 2, "name": "Backlog", "mappedStatuses": [{"id": "10167"}]},
+    {"id": 3, "name": "Selected for Development", "mappedStatuses": [{"id": "10168"}]},
+    {"id": 4, "name": "In Progress", "mappedStatuses": [{"id": "3"}]},
+    {"id": 5, "name": "Done", "mappedStatuses": [{"id": "10006"}]},
+]
+
+
+class BoardColumnTests(unittest.TestCase):
+    """A template board's columns remapped to the scheme's statuses."""
+
+    def cols(self, plan):
+        return [(c["name"], [s["id"] for s in c["mappedStatuses"]]) for c in plan]
+
+    def test_column_title(self):
+        self.assertEqual(jira_api.column_title("READY FOR REVIEW"), "Ready for Review")
+        self.assertEqual(jira_api.column_title("IN QA"), "In QA")
+        self.assertEqual(jira_api.column_title("IN PROGRESS"), "In Progress")
+
+    def test_batch_board_from_the_template(self):
+        statuses = [("10167", "BACKLOG"), ("20", "APPROVED"), ("21", "SPIKED"), ("10006", "DONE")]
+        plan = jira_api.plan_columns(TEMPLATE_COLUMNS, statuses)
+        self.assertEqual(self.cols(plan), [("Backlog", []), ("Backlog", ["10167"]), ("Approved", ["20"]),
+                                           ("Spiked", ["21"]), ("Done", ["10006"])])
+        self.assertTrue(plan[0]["isKanPlanColumn"])
+        self.assertEqual(plan[1]["id"], 2)          # an existing column keeps its id
+        self.assertNotIn("id", plan[2])              # a new column has none
+
+    def test_dev_board_from_the_template(self):
+        statuses = [("10167", "BACKLOG"), ("10239", "READY FOR DEV"), ("3", "IN PROGRESS"),
+                    ("10238", "IN REVIEW"), ("10240", "IN QA"), ("10006", "DONE")]
+        plan = jira_api.plan_columns(TEMPLATE_COLUMNS, statuses)
+        self.assertEqual([n for n, _ in self.cols(plan)],
+                         ["Backlog", "Backlog", "Ready for Dev", "In Progress", "In Review", "In QA", "Done"])
+        # planning over its own result changes nothing
+        self.assertEqual(self.cols(jira_api.plan_columns(plan, statuses)), self.cols(plan))
+
+    def _fake(self, stuck=False):
+        writes = []
+
+        def fake(method, path, data=None, prefix="/rest/api/3"):
+            if path == "/project/GRX/statuses":
+                return 200, [{"name": "Task", "statuses": [
+                    {"id": "10167", "name": "BACKLOG"}, {"id": "20", "name": "APPROVED"},
+                    {"id": "21", "name": "SPIKED"}, {"id": "10006", "name": "DONE"}]}]
+            if path.startswith("/board?projectKeyOrId=GRX"):
+                return 200, {"values": [{"id": 9, "location": {"projectKey": "GRX"}},
+                                        {"id": 10, "location": {"projectKey": "OTHER"}}]}
+            if path.startswith("/rapidviewconfig/editmodel.json"):
+                return 200, {"rapidListConfig": {"currentStatisticsField": {"id": "issueCount_"},
+                                                 "mappedColumns": TEMPLATE_COLUMNS}}
+            if method == "PUT" and path == "/rapidviewconfig/columns":
+                self.assertEqual(prefix, "/rest/greenhopper/1.0")
+                writes.append(data)
+                return 200, {}
+            if path == "/board/9/configuration":
+                self.assertEqual(prefix, "/rest/agile/1.0")
+                cols = TEMPLATE_COLUMNS if stuck else writes[-1]["mappedColumns"]
+                return 200, {"columnConfig": {"columns": [
+                    {"name": c["name"], "statuses": c["mappedStatuses"]} for c in cols]}}
+            raise AssertionError(f"unexpected {method} {prefix}{path}")
+        return fake, writes
+
+    def test_remap_writes_and_reads_back(self):
+        fake, writes = self._fake()
+        with patch.object(jira_api, "_api_raw", side_effect=fake):
+            out = jira_api.remap_board_columns("GRX", ["BACKLOG", "APPROVED", "SPIKED", "DONE"])
+        self.assertEqual(out, [(9, [])])            # the board in another project is untouched
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0]["rapidViewId"], 9)
+
+    def test_remap_reports_what_the_public_config_leaves_unmapped(self):
+        fake, _ = self._fake(stuck=True)             # the write "succeeds" and changes nothing
+        with patch.object(jira_api, "_api_raw", side_effect=fake):
+            out = jira_api.remap_board_columns("GRX", ["BACKLOG", "APPROVED", "SPIKED", "DONE"])
+        self.assertEqual(out, [(9, ["APPROVED", "SPIKED"])])
 
 
 if __name__ == "__main__":

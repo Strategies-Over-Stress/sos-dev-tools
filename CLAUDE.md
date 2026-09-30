@@ -28,7 +28,7 @@ No linter or formatter is configured.
 
 Two CLI entry points defined in `pyproject.toml [project.scripts]`:
 
-- **`sos-jira`** → `jira_cli.py:main` — CRUD operations on Jira tickets (create, edit, move, view, list, comment, delete, create-project)
+- **`sos-jira`** → `jira_cli.py:main` — CRUD operations on Jira tickets (create, edit, move, view, list, comment, delete, create-project, remap-columns)
 - **`sos-feature`** → `feature_cli.py:main` — Feature branch lifecycle that bridges Git/GitHub and Jira (create ticket+branch, start, switch, pr, status)
 
 Both CLIs call `env.load_env()` at startup, which walks up from CWD to find the nearest `.env` file and loads it via `os.environ.setdefault`. This means per-project Jira configs work by placing `.env` in each project root.

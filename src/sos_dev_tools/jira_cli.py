@@ -10,7 +10,8 @@ Usage:
     sos-jira comment TICKET "text"
     sos-jira delete TICKET
     sos-jira sync ops.json
-    sos-jira create-project -k KEY -n "Name" [-t software|business|service_desk] [--template scrum|kanban|basic]
+    sos-jira create-project -k KEY -n "Name" [-t software|business|service_desk] [--template scrum|kanban|basic] [--workflow dev|batch]
+    sos-jira remap-columns KEY [--workflow dev|batch]
 """
 
 import argparse
@@ -21,7 +22,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .env import load_env
-from .jira_api import api, agile_api, md_to_adf, get_project_key, set_project_key, get_base_url, get_issue_type_id, transition_ticket, create_project, get_status_name, move_issues_to_project, ensure_dev_workflow_scheme, assign_workflow_scheme, DEV_SCHEME_NAME, DEV_WORKFLOW_NAME, DEV_PIPELINE
+from .jira_api import api, agile_api, md_to_adf, get_project_key, set_project_key, get_base_url, get_issue_type_id, transition_ticket, create_project, get_status_name, move_issues_to_project, ensure_workflow_scheme, assign_workflow_scheme, remap_board_columns, WORKFLOW_SPECS
 
 
 def cmd_create(args):
@@ -209,6 +210,7 @@ def cmd_sync(args):
                     name=op["name"],
                     project_type=op.get("type", "software"),
                     template=op.get("template", "scrum"),
+                    workflow=op.get("workflow", "dev"),
                 )
                 succeeded.append(f"create-project {result.get('key', op['key'].upper())}")
 
@@ -239,19 +241,40 @@ def cmd_create_project(args):
         name=args.name,
         project_type=args.type,
         template=args.template,
+        workflow=args.workflow,
     )
     project_id = result.get("id", "")
     key = result.get("key", args.key.upper())
     print(f"Created project {key} (id: {project_id}) — {get_base_url()}/projects/{key}")
 
 
+def cmd_remap_columns(args):
+    """Remap an existing project's board columns so every status its workflows
+    define sits in a column (read back through the public board configuration)."""
+    key = args.key.upper()
+    order = [n for n, _ in WORKFLOW_SPECS[args.workflow]["pipeline"]]
+    results = remap_board_columns(key, order)
+    if not results:
+        print(f"No board is located in {key}", file=sys.stderr)
+        sys.exit(1)
+    bad = False
+    for board_id, unmapped in results:
+        if unmapped:
+            bad = True
+            print(f"  ✗ board {board_id} still leaves {', '.join(unmapped)} unmapped")
+        else:
+            print(f"  ✓ board {board_id}: every status is on a column (read back)")
+    sys.exit(1 if bad else 0)
+
+
 def cmd_provision_dev_workflow(args):
-    """Idempotently (re)provision the canonical dev workflow scheme, and
+    """Idempotently (re)provision a workflow scheme (dev by default), and
     optionally assign it to an existing project with --assign KEY."""
-    pipeline = " → ".join(n for n, _ in DEV_PIPELINE)
-    print(f"Provisioning '{DEV_SCHEME_NAME}' → {pipeline}")
-    scheme_id = ensure_dev_workflow_scheme()
-    print(f"  scheme id: {scheme_id}  (workflow: '{DEV_WORKFLOW_NAME}')")
+    spec = WORKFLOW_SPECS[args.workflow]
+    pipeline = " → ".join(n for n, _ in spec["pipeline"])
+    print(f"Provisioning '{spec['scheme']}' → {pipeline}")
+    scheme_id = ensure_workflow_scheme(spec)
+    print(f"  scheme id: {scheme_id}  (workflow: '{spec['workflow']}')")
     if args.assign:
         key = args.assign.upper()
         proj = api("GET", f"/project/{key}")
@@ -413,12 +436,21 @@ Supported actions:
   delete            Delete an existing issue.
     ticket          (required) Ticket key to delete.
 
-  create-project    Provision a new Jira project. Automatically assigned the
-                    canonical dev workflow scheme (BACKLOG → READY FOR DEV →
-                    IN PROGRESS → IN REVIEW → IN QA → DONE); set
-                    JIRA_SKIP_DEV_WORKFLOW=1 to opt out.
+  create-project    Provision a new Jira project. Automatically assigned a
+                    workflow scheme, and its board's columns are then remapped
+                    to that scheme's statuses (read back), so no status is left
+                    off the board. --workflow dev (default): BACKLOG → READY
+                    FOR DEV → IN PROGRESS → IN REVIEW → IN QA → DONE.
+                    --workflow batch (grooming/proposal boards): BACKLOG →
+                    APPROVED → SPIKED → DONE. Set JIRA_SKIP_DEV_WORKFLOW=1 to
+                    opt out of both.
     key             (required) Project key (uppercase, 2-10 chars).
     name            (required) Human-readable project name.
+
+  remap-columns     Remap an EXISTING project's board columns so every status
+                    its workflows define sits in one column; --workflow orders
+                    the pipeline's statuses first. Exits 1 if the read-back
+                    still shows a status unmapped.
 
   provision-dev-workflow  (Re)provision the canonical dev workflow scheme
                     (idempotent). --assign KEY also applies it to an existing
@@ -500,11 +532,22 @@ malformed JSON, or a non-array root is a hard failure before any API calls.
     p.add_argument("--name", "-n", required=True, help="Project name (e.g. Pilot Development)")
     p.add_argument("--type", "-t", default="software", choices=["software", "business", "service_desk"])
     p.add_argument("--template", default="scrum", choices=["scrum", "kanban", "basic"])
+    p.add_argument("--workflow", default="dev", choices=sorted(WORKFLOW_SPECS),
+                   help="dev (default): the canonical dev pipeline. batch: BACKLOG→APPROVED→SPIKED→DONE, "
+                        "for grooming/proposal boards. The board's columns are remapped to it either way.")
+
+    p = sub.add_parser("remap-columns",
+                       help="Map every status of a project's workflows onto its board's columns (read back)")
+    p.add_argument("key", help="Project key (e.g. GRWEG)")
+    p.add_argument("--workflow", default="dev", choices=sorted(WORKFLOW_SPECS),
+                   help="Whose pipeline order the columns follow (default: dev)")
 
     p = sub.add_parser("provision-dev-workflow",
                        help="Idempotently (re)provision the canonical BACKLOG→READY FOR DEV→IN PROGRESS→IN REVIEW→IN QA→DONE scheme")
     p.add_argument("--assign", metavar="KEY", default=None,
                    help="Also assign the scheme to an existing project (e.g. --assign INFRA)")
+    p.add_argument("--workflow", default="dev", choices=sorted(WORKFLOW_SPECS),
+                   help="Which scheme to provision (default: dev)")
 
     args = parser.parse_args()
 
@@ -519,6 +562,7 @@ malformed JSON, or a non-array root is a hard failure before any API calls.
         "delete": cmd_delete, "sync": cmd_sync, "promote": cmd_promote,
         "sprint": cmd_sprint, "create-project": cmd_create_project,
         "provision-dev-workflow": cmd_provision_dev_workflow,
+        "remap-columns": cmd_remap_columns,
     }[args.command](args)
 
 
