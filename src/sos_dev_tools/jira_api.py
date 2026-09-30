@@ -113,7 +113,7 @@ def get_status_name(alias):
     return _DEFAULT_STATUS_ALIASES.get(alias, alias)
 
 
-def create_project(key, name, project_type="software", template="scrum"):
+def create_project(key, name, project_type="software", template="scrum", workflow="dev"):
     """Create a new Jira project.
 
     Args:
@@ -121,6 +121,8 @@ def create_project(key, name, project_type="software", template="scrum"):
         name: Project name (e.g. "Pilot Development")
         project_type: "software", "business", or "service_desk"
         template: "scrum", "kanban", or "basic"
+        workflow: "dev" (the canonical dev pipeline) or "batch" (the spike
+            pipeline's batch buckets, for grooming/proposal boards)
     """
     # Get the current user's account ID to set as lead
     myself = api("GET", "/myself")
@@ -155,14 +157,25 @@ def create_project(key, name, project_type="software", template="scrum"):
     # shared canonical workflow scheme (idempotently provisioned). A brand-new
     # project has no issues, so the association applies cleanly and synchronously.
     # Opt out with JIRA_SKIP_DEV_WORKFLOW=1. Never fail creation over this.
+    # The board the template made keeps the TEMPLATE's columns, so after the
+    # scheme is assigned its columns are remapped to the scheme's statuses —
+    # otherwise every status the template lacks is invisible on the board.
     if os.environ.get("JIRA_SKIP_DEV_WORKFLOW") != "1" and result.get("id"):
+        spec = WORKFLOW_SPECS[workflow]
         try:
-            scheme_id = ensure_dev_workflow_scheme()
+            scheme_id = ensure_workflow_scheme(spec)
             if assign_workflow_scheme(result["id"], scheme_id):
-                print(f"  ✓ applied '{DEV_SCHEME_NAME}' "
-                      f"({' → '.join(n for n, _ in DEV_PIPELINE)})", file=sys.stderr)
+                print(f"  ✓ applied '{spec['scheme']}' "
+                      f"({' → '.join(n for n, _ in spec['pipeline'])})", file=sys.stderr)
+                for board_id, unmapped in remap_board_columns(data["key"], [n for n, _ in spec["pipeline"]]):
+                    if unmapped:
+                        print(f"Warning: board {board_id} still leaves {', '.join(unmapped)} unmapped",
+                              file=sys.stderr)
+                    else:
+                        print(f"  ✓ board {board_id} columns mapped to every status (read back)",
+                              file=sys.stderr)
         except Exception as e:  # noqa: BLE001 — scheme is best-effort
-            print(f"Warning: dev workflow scheme not applied to {data['key']}: {e}",
+            print(f"Warning: {spec['scheme']} not applied to {data['key']}: {e}",
                   file=sys.stderr)
 
     return result
@@ -188,19 +201,43 @@ DEV_PIPELINE = [
     ("DONE", "DONE"),
 ]
 
+# The spike pipeline's batch buckets, for grooming/proposal boards: a batch is
+# filed, approved by the operator, carried into a spike, and done. These names
+# are the ones the estate's pipeline configs provision (board-kit provision.mjs),
+# so whichever tool runs first creates them and the other reuses them.
+BATCH_WORKFLOW_NAME = "SOS Batch Workflow"
+BATCH_SCHEME_NAME = "SOS Batch Workflow Scheme"
+BATCH_PIPELINE = [
+    ("BACKLOG", "TODO"),
+    ("APPROVED", "TODO"),
+    ("SPIKED", "IN_PROGRESS"),
+    ("DONE", "DONE"),
+]
 
-def _api_raw(method, path, data=None):
+WORKFLOW_SPECS = {
+    "dev": {"workflow": DEV_WORKFLOW_NAME, "scheme": DEV_SCHEME_NAME, "pipeline": DEV_PIPELINE,
+            "about": "Canonical SOS dev pipeline (Backlog -> Ready for Dev -> In Progress -> In Review -> In QA -> Done); open transitions.",
+            "scheme_env": "JIRA_DEV_WORKFLOW_SCHEME_ID"},
+    "batch": {"workflow": BATCH_WORKFLOW_NAME, "scheme": BATCH_SCHEME_NAME, "pipeline": BATCH_PIPELINE,
+              "about": "Spike pipeline batch buckets (Backlog -> Approved -> Spiked -> Done); open transitions.",
+              "scheme_env": "JIRA_BATCH_WORKFLOW_SCHEME_ID"},
+}
+
+
+def _api_raw(method, path, data=None, prefix="/rest/api/3"):
     """Like api() but returns (status_code, parsed_body) and never sys.exit()s —
-    provisioning must inspect validation/error bodies rather than abort."""
+    provisioning must inspect validation/error bodies rather than abort.
+    `prefix` selects the API family (platform, agile, or the board-config API)."""
     base_url = os.environ.get("JIRA_BASE_URL", "")
     if not base_url:
         return 0, {"error": "JIRA_BASE_URL not set"}
-    url = f"{base_url}/rest/api/3{path}"
+    url = f"{base_url}{prefix}{path}"
     body = json.dumps(data).encode() if data is not None else None
     req = Request(url, data=body, method=method)
     req.add_header("Authorization", _auth_header())
     req.add_header("Content-Type", "application/json")
     req.add_header("Accept", "application/json")
+    req.add_header("X-Atlassian-Token", "no-check")
     try:
         with urlopen(req) as resp:
             raw = resp.read().decode()
@@ -213,7 +250,7 @@ def _api_raw(method, path, data=None):
             return e.code, {"raw": raw}
 
 
-def _ensure_dev_statuses():
+def _ensure_dev_statuses(pipeline=None):
     """Find-or-create the pipeline statuses globally. Returns {name: (id, real_name)}.
 
     Reuses any existing global status whose name matches case-insensitively so
@@ -230,7 +267,7 @@ def _ensure_dev_statuses():
             break
         start += 200
     resolved = {}   # canonical name -> (id, real display name)
-    for name, cat in DEV_PIPELINE:
+    for name, cat in (pipeline or DEV_PIPELINE):
         hit = existing.get(name.lower())
         if hit:
             resolved[name] = (hit["id"], hit["name"])   # keep the real name
@@ -238,7 +275,7 @@ def _ensure_dev_statuses():
         st, d = _api_raw("POST", "/statuses", {
             "scope": {"type": "GLOBAL"},
             "statuses": [{"name": name, "statusCategory": cat,
-                          "description": f"{name} (SOS dev pipeline)"}],
+                          "description": f"{name} (SOS pipeline status)"}],
         })
         if st not in (200, 201):
             raise RuntimeError(f"could not create status {name!r}: {st} {d}")
@@ -247,22 +284,24 @@ def _ensure_dev_statuses():
     return resolved
 
 
-def _ensure_dev_workflow(statuses):
-    """Find-or-create the shared workflow. `statuses` maps canonical name ->
-    (id, real_name). Returns the workflow name."""
+def _ensure_dev_workflow(statuses, spec=None):
+    """Find-or-create a spec's workflow (the dev one by default). `statuses`
+    maps canonical name -> (id, real_name). Returns the workflow name."""
     import uuid
 
-    _, d = _api_raw("POST", "/workflows", {"workflowNames": [DEV_WORKFLOW_NAME]})
-    if any(w.get("name") == DEV_WORKFLOW_NAME for w in d.get("workflows", [])):
-        return DEV_WORKFLOW_NAME
+    spec = spec or WORKFLOW_SPECS["dev"]
+    name, pipeline = spec["workflow"], spec["pipeline"]
+    _, d = _api_raw("POST", "/workflows", {"workflowNames": [name]})
+    if any(w.get("name") == name for w in d.get("workflows", [])):
+        return name
 
     # The create API links its statuses/transitions by a client-generated UUID
     # (`statusReference`); existing global statuses are bound via their real id
     # AND their real name (a mismatched name would rename the shared status).
-    order = [n for n, _ in DEV_PIPELINE]
+    order = [n for n, _ in pipeline]
     ref = {n: str(uuid.uuid4()) for n in order}
     transitions = [{"id": "1", "name": "Create", "type": "INITIAL",
-                    "toStatusReference": ref["BACKLOG"]}]
+                    "toStatusReference": ref[order[0]]}]
     for i, n in enumerate(order):
         transitions.append({"id": str((i + 1) * 10 + 1), "name": n.title(),
                             "type": "GLOBAL", "toStatusReference": ref[n]})
@@ -270,12 +309,10 @@ def _ensure_dev_workflow(statuses):
         "scope": {"type": "GLOBAL"},
         "statuses": [{"id": statuses[n][0], "statusReference": ref[n],
                       "name": statuses[n][1], "statusCategory": cat}
-                     for n, cat in DEV_PIPELINE],
+                     for n, cat in pipeline],
         "workflows": [{
-            "name": DEV_WORKFLOW_NAME,
-            "description": ("Canonical SOS dev pipeline "
-                           "(Backlog -> Ready for Dev -> In Progress -> In Review "
-                           "-> In QA -> Done); open transitions."),
+            "name": name,
+            "description": spec["about"],
             "statuses": [{"statusReference": ref[n],
                           "layout": {"x": float(i * 180), "y": 0.0}}
                          for i, n in enumerate(order)],
@@ -285,18 +322,19 @@ def _ensure_dev_workflow(statuses):
     st, d = _api_raw("POST", "/workflows/create", payload)
     if st not in (200, 201):
         raise RuntimeError(f"could not create workflow: {st} {d}")
-    return DEV_WORKFLOW_NAME
+    return name
 
 
-def _ensure_dev_scheme(workflow_name):
-    """Find-or-create the workflow scheme. Returns its id."""
+def _ensure_dev_scheme(workflow_name, spec=None):
+    """Find-or-create a spec's workflow scheme (the dev one by default). Returns its id."""
+    scheme_name = (spec or WORKFLOW_SPECS["dev"])["scheme"]
     _, d = _api_raw("GET", "/workflowscheme?maxResults=200")
     for s in d.get("values", []):
-        if s.get("name") == DEV_SCHEME_NAME:
+        if s.get("name") == scheme_name:
             return s["id"]
     st, d = _api_raw("POST", "/workflowscheme", {
-        "name": DEV_SCHEME_NAME,
-        "description": "All issue types use SOS Dev Workflow.",
+        "name": scheme_name,
+        "description": f"All issue types use {workflow_name}.",
         "defaultWorkflow": workflow_name,
     })
     if st not in (200, 201):
@@ -304,17 +342,24 @@ def _ensure_dev_scheme(workflow_name):
     return d["id"]
 
 
+def ensure_workflow_scheme(spec):
+    """Idempotently provision one of WORKFLOW_SPECS; return its scheme id.
+    The spec's `scheme_env` variable short-circuits the lookup (e.g. another
+    Jira instance with a pre-built scheme)."""
+    override = os.environ.get(spec["scheme_env"])
+    if override:
+        return override
+    status_ids = _ensure_dev_statuses(spec["pipeline"])
+    workflow_name = _ensure_dev_workflow(status_ids, spec)
+    return _ensure_dev_scheme(workflow_name, spec)
+
+
 def ensure_dev_workflow_scheme():
     """Idempotently provision the canonical dev workflow scheme; return its id.
 
     Set JIRA_DEV_WORKFLOW_SCHEME_ID to short-circuit the lookup/provisioning
     (e.g. a different Jira instance with a pre-built scheme)."""
-    override = os.environ.get("JIRA_DEV_WORKFLOW_SCHEME_ID")
-    if override:
-        return override
-    status_ids = _ensure_dev_statuses()
-    workflow_name = _ensure_dev_workflow(status_ids)
-    return _ensure_dev_scheme(workflow_name)
+    return ensure_workflow_scheme(WORKFLOW_SPECS["dev"])
 
 
 def assign_workflow_scheme(project_id, scheme_id):
@@ -327,6 +372,108 @@ def assign_workflow_scheme(project_id, scheme_id):
               f"{project_id}: {st} {d}", file=sys.stderr)
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Board columns
+# ---------------------------------------------------------------------------
+# A board made by a project template keeps the TEMPLATE's columns (Backlog,
+# Selected for Development, In Progress, Done), whatever scheme the project is
+# given afterwards, so a status the template lacks is on no column and its
+# issues are invisible on the board. There is no public API to edit columns:
+# the write goes through the board-config endpoint the board settings page
+# itself calls, and the result is read back through the PUBLIC board
+# configuration.
+
+_AGILE = "/rest/agile/1.0"
+_BOARD_CONFIG = "/rest/greenhopper/1.0"
+_SMALL = {"a", "an", "and", "at", "by", "for", "in", "of", "on", "or", "the", "to"}
+
+
+def column_title(status):
+    """"READY FOR REVIEW" -> "Ready for Review", "IN QA" -> "In QA"."""
+    out = []
+    for i, w in enumerate(status.split()):
+        low = w.lower()
+        if i > 0 and low in _SMALL:
+            out.append(low)
+        elif len(w) <= 2 and w.isupper() and low not in _SMALL:
+            out.append(w)
+        else:
+            out.append(low[:1].upper() + low[1:])
+    return " ".join(out)
+
+
+def plan_columns(mapped_columns, statuses):
+    """Columns that put every status in `statuses` ([(id, name)], in workflow
+    order) in exactly one column. Existing columns keep the statuses that still
+    exist; a column left empty is dropped (except the plan-mode backlog column);
+    each status no column holds gets its own column, right after the column of
+    its nearest predecessor. Returns the mappedColumns payload."""
+    ids = [str(i) for i, _ in statuses]
+    cols = []
+    for c in mapped_columns:
+        keep = [str(s["id"]) for s in c.get("mappedStatuses", []) if str(s["id"]) in ids]
+        if c.get("isKanPlanColumn") or keep:
+            cols.append({"id": c.get("id"), "name": c["name"], "min": c.get("min", ""),
+                         "max": c.get("max", ""), "isKanPlanColumn": bool(c.get("isKanPlanColumn")),
+                         "statuses": keep})
+    seen = set()
+    for c in cols:
+        c["statuses"] = [s for s in c["statuses"] if not (s in seen or seen.add(s))]
+    for i, (sid, name) in enumerate(statuses):
+        sid = str(sid)
+        if sid in seen:
+            continue
+        at = sum(1 for c in cols if c["isKanPlanColumn"])
+        for j in range(i - 1, -1, -1):
+            hit = next((k for k, c in enumerate(cols)
+                        if not c["isKanPlanColumn"] and str(statuses[j][0]) in c["statuses"]), None)
+            if hit is not None:
+                at = hit + 1
+                break
+        cols.insert(at, {"id": None, "name": column_title(name), "min": "", "max": "",
+                         "isKanPlanColumn": False, "statuses": [sid]})
+        seen.add(sid)
+    return [{**({"id": c["id"]} if c["id"] is not None else {}), "name": c["name"],
+             "min": c["min"], "max": c["max"], "isKanPlanColumn": c["isKanPlanColumn"],
+             "mappedStatuses": [{"id": s} for s in c["statuses"]]} for c in cols]
+
+
+def remap_board_columns(project_key, order):
+    """Remap every board located in `project_key` so each status the project's
+    workflows define sits in one column, `order` (status names) first. Returns
+    [(board_id, [status names the PUBLIC configuration still leaves unmapped])]."""
+    st, types = _api_raw("GET", f"/project/{project_key}/statuses")
+    if st != 200:
+        raise RuntimeError(f"could not read {project_key} statuses: {st} {types}")
+    by_name = {}
+    for t in types:
+        for s in t.get("statuses", []):
+            by_name.setdefault(s["name"].lower(), (str(s["id"]), s["name"]))
+    statuses = [by_name[n.lower()] for n in order if n.lower() in by_name]
+    statuses += [v for k, v in by_name.items() if v not in statuses]
+    st, boards = _api_raw("GET", f"/board?projectKeyOrId={project_key}", prefix=_AGILE)
+    out = []
+    for b in boards.get("values", []) if st == 200 else []:
+        if b.get("location", {}).get("projectKey") != project_key:
+            continue
+        st, model = _api_raw("GET", f"/rapidviewconfig/editmodel.json?rapidViewId={b['id']}",
+                             prefix=_BOARD_CONFIG)
+        if st != 200:
+            raise RuntimeError(f"could not read board {b['id']} columns: {st}")
+        cfg = model["rapidListConfig"]
+        cols = plan_columns(cfg["mappedColumns"], statuses)
+        st, d = _api_raw("PUT", "/rapidviewconfig/columns", {
+            "currentStatisticsField": {"id": (cfg.get("currentStatisticsField") or {}).get("id", "none_")},
+            "rapidViewId": b["id"], "mappedColumns": cols}, prefix=_BOARD_CONFIG)
+        if st not in (200, 204):
+            raise RuntimeError(f"board {b['id']} column write failed: {st} {d}")
+        st, conf = _api_raw("GET", f"/board/{b['id']}/configuration", prefix=_AGILE)
+        mapped = {str(s["id"]) for c in conf.get("columnConfig", {}).get("columns", [])
+                  for s in c.get("statuses", [])}
+        out.append((b["id"], [name for sid, name in statuses if sid not in mapped]))
+    return out
 
 
 def get_base_url():
